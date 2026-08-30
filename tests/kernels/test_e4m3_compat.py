@@ -246,7 +246,7 @@ def _child_env(tmp_path, **extra) -> dict:
 # 2. Forced-EMU vs native A/B across every wrapper.
 # ======================================================================================
 @pytest.mark.slow
-@pytest.mark.skipif(not torch.cuda.is_available() or not _native_cc(),
+@pytest.mark.skipif(torch.version.hip is not None or not torch.cuda.is_available() or not _native_cc(),
                     reason="needs native fp8 (sm_89+) as reference")
 def test_forced_emu_matches_native(tmp_path):
     native_pt = str(tmp_path / "native.pt")
@@ -271,6 +271,7 @@ def test_forced_emu_matches_native(tmp_path):
 # 3. Cross-arch compile gate (full wrapper->kernel paths, compile-only).
 # ======================================================================================
 @pytest.mark.slow
+@pytest.mark.skipif(torch.version.hip is not None, reason="foreign NVIDIA arch gate needs CUDA")
 @pytest.mark.parametrize("arch", [80, 86, 89, 120])
 def test_compile_gate_foreign_arch(arch, tmp_path):
     r = subprocess.run(
