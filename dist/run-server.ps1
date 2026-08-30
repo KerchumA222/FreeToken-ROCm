@@ -26,6 +26,13 @@ $ErrorActionPreference = "Stop"
 $REPO = Split-Path -Parent $PSScriptRoot
 $LogDir = "$env:TEMP\freetoken-logs"
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
+# Clear last run's logs up front: the redirect below only truncates them once cmd
+# reaches the `ft serve` line (after vcvarsall), and until then the readiness poll
+# is reading the PREVIOUS run - a stale traceback aborts this launch instantly.
+Remove-Item "$LogDir\serve.log", "$LogDir\serve_err.log" -ErrorAction SilentlyContinue
+if (Test-Path "$LogDir\serve.log") {
+    throw "$LogDir\serve.log is still locked by a previous run (a scheduler worker can outlive a failed server). Kill it, then retry - otherwise this launch would read the old log and report its error as this one's."
+}
 
 if (-not $RocmPath) {
     if ($env:HIP_PATH) { $RocmPath = $env:HIP_PATH }
@@ -37,8 +44,20 @@ if ($KVPages -gt 0) { $ExtraArgs += "--num-pages $KVPages" }
 $ft = Join-Path $REPO ".venv\Scripts\ft.exe"
 if (-not (Test-Path $ft)) { $ft = "ft" }
 
-$vcvars = Get-ChildItem "C:\Program Files\Microsoft Visual Studio" -Recurse -Filter vcvarsall.bat -ErrorAction SilentlyContinue |
-          Select-Object -First 1 -ExpandProperty FullName
+# vcvarsall lives under either Program Files root (Build Tools installs land in the
+# x86 one), so ask vswhere first and only then fall back to scanning both roots.
+$vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+$vcvars = $null
+if (Test-Path $vswhere) {
+    $vsRoot = & $vswhere -latest -products * -find "VC\Auxiliary\Build\vcvarsall.bat" 2>$null | Select-Object -First 1
+    if ($vsRoot) { $vcvars = $vsRoot }
+}
+if (-not $vcvars) {
+    $vcvars = Get-ChildItem "$env:ProgramFiles\Microsoft Visual Studio", "${env:ProgramFiles(x86)}\Microsoft Visual Studio" `
+                  -Recurse -Filter vcvarsall.bat -ErrorAction SilentlyContinue |
+              Select-Object -First 1 -ExpandProperty FullName
+}
+if (-not $vcvars) { Write-Warning "vcvarsall.bat not found - JIT DLL links may fail to find the MSVC CRT." }
 
 $cmd = @"
 $(if ($vcvars) { "call `"$vcvars`" x64 >nul" })
@@ -48,7 +67,7 @@ set TRITON_OVERRIDE_ARCH=$Arch
 set ROCM_SDK_TARGET_FAMILY=$Arch
 set "CC=$RocmPath\lib\llvm\bin\clang.EXE"
 cd /d %TEMP%
-"$ft" serve --model "$Model" --server-port $Port $($ExtraArgs -join ' ') > "$LogDir\serve.log" 2> "$LogDir\serve_err.log"
+"$ft" serve --model "$Model" --port $Port $($ExtraArgs -join ' ') > "$LogDir\serve.log" 2> "$LogDir\serve_err.log"
 "@
 $runner = Join-Path $env:TEMP "freetoken_serve.cmd"
 Set-Content $runner $cmd -Encoding ASCII

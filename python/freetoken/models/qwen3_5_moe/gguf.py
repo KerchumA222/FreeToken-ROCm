@@ -20,7 +20,8 @@ sampled tensors):
   at conversion time (values center on 1.0) -> load as-is; ``ssm_norm`` is a
   plain gated RMS norm weight (no +1).
 - ``ssm_a`` stores ``-exp(A_log)`` (all values negative) -> recover
-  ``A_log = log(-a)``; ``ssm_dt.bias`` is the fp32 ``dt_bias`` verbatim.
+  ``A_log = log(-a)``; ``ssm_dt`` (spelled ``ssm_dt.bias`` in some conversions) is
+  the fp32 ``dt_bias`` verbatim.
 - GDN geometry from the ssm KVs: num_key_heads = ``ssm.group_count``,
   num_value_heads = ``ssm.time_step_rank``, key_head_dim = ``ssm.state_size``,
   value_head_dim = ``ssm.inner_size // ssm.time_step_rank``.
@@ -82,6 +83,27 @@ def _is_full_attention(layer: int, interval: int) -> bool:
     return (layer + 1) % interval == 0
 
 
+def _head_count(value, what: str) -> int:
+    """Collapse a possibly per-layer head count to the model-wide one.
+
+    llama.cpp writes ``attention.head_count[_kv]`` as an array with one entry per
+    block for hybrid models, and stores 0 on the GDN linear-attention layers
+    (which have no attention heads at all). Real Qwen3.5/3.6 files therefore hand
+    us e.g. ``[0, 0, 0, 2, 0, 0, 0, 2, ...]`` where the synthetic fixtures had a
+    scalar. Take the value the full-attention layers agree on; a scalar passes
+    through unchanged.
+    """
+    if not isinstance(value, (list, tuple)):
+        return int(value)
+    counts = {int(v) for v in value if int(v)}
+    if len(counts) != 1:
+        raise ValueError(
+            f"qwen35moe GGUF: {what} = {list(value)} - FreeToken needs a single "
+            f"head count shared by every full-attention layer, got {sorted(counts)}"
+        )
+    return counts.pop()
+
+
 def _expert_types(model_path: str) -> tuple[dict[str, dict[int, int]], dict[str, int]]:
     """Per-layer ggml types of the routed expert tensors, and the resolved bank
     type per bank (uniform type, else Q8_0 promotion)."""
@@ -139,8 +161,8 @@ def parse_gguf_config(shim: "GgufConfigShim") -> "ModelConfig":
     # no text_config attr: parse_config's getattr then falls back to the namespace itself
     hf_like = SimpleNamespace(
         num_hidden_layers=num_layers,
-        num_attention_heads=int(g("attention.head_count")),
-        num_key_value_heads=int(g("attention.head_count_kv")),
+        num_attention_heads=_head_count(g("attention.head_count"), "attention.head_count"),
+        num_key_value_heads=_head_count(g("attention.head_count_kv"), "attention.head_count_kv"),
         head_dim=head_dim,
         hidden_size=int(g("embedding_length")),
         intermediate_size=int(g("feed_forward_length", 0)),
@@ -252,7 +274,10 @@ def iter_gguf_weights(
                 assert (a < 0).all(), f"{name}: expected -exp(A_log) (negative values)"
                 yield stem + "linear_attn.A_log", torch.log(-a)
                 continue
-            if suffix == "ssm_dt.bias":
+            # Real Qwen3.5/3.6 conversions name this bias bare `ssm_dt` (the way
+            # `ssm_a` is bare); other files spell it `ssm_dt.bias`. Either way it is
+            # the fp32 dt_bias vector, one entry per value head.
+            if suffix in ("ssm_dt.bias", "ssm_dt"):
                 yield stem + "linear_attn.dt_bias", dequant_any(t).to(torch.float32)
                 continue
             if suffix == "ssm_conv1d.weight":
