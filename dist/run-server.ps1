@@ -62,7 +62,17 @@ if (-not $vcvars) { Write-Warning "vcvarsall.bat not found - JIT DLL links may f
 $cmd = @"
 $(if ($vcvars) { "call `"$vcvars`" x64 >nul" })
 set HIP_PATH=$RocmPath
+rem tvm_ffi's JIT resolves the toolchain from ROCM_HOME (not HIP_PATH) and dies at
+rem the first kernel build without it -- long after the model has loaded.
+rem ROCM_HOME only: setting ROCM_PATH too makes clang look for the device bitcode
+rem at %ROCM_PATH%\amdgcn\bitcode, which is not the TheRock wheel layout (it lives
+rem under lib\llvm\), and every kernel build then fails to find it.
+set ROCM_HOME=$RocmPath
 set TVM_FFI_ROCM_ARCH_LIST=$Arch
+rem Without this torch's JIT compiles every extension for EVERY visible card --
+rem including the CPU's iGPU (gfx1036 on a 9800X3D), which is not the serving
+rem device and whose build failure kills the backend worker after a full load.
+set PYTORCH_ROCM_ARCH=$Arch
 set TRITON_OVERRIDE_ARCH=$Arch
 set ROCM_SDK_TARGET_FAMILY=$Arch
 set "CC=$RocmPath\lib\llvm\bin\clang.EXE"

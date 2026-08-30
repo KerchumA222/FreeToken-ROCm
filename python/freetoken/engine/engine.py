@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import math
 import os
+import sys
 from datetime import timedelta
 from typing import Any, Dict, Iterable, NamedTuple, Tuple
 
@@ -320,8 +321,12 @@ class Engine:
         set_rope_device(self.device)
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
+        from freetoken.moe.host_banks import host_mem_summary
+
+        logger.info_rank0(f"Host memory before loading weights: {host_mem_summary()}")
         self.model.load_state_dict(self._load_weight_state_dict(config))
         post_weights_free = self._sync_get_memory()[0]
+        logger.info_rank0(f"Host memory after loading weights:  {host_mem_summary()}")
         self._weights_bytes = self._baseline_free - post_weights_free
         # Pool-budget baseline for the desktop cache sliders: free VRAM after the weights are
         # resident but before ANY runtime cache pool (MoE expert cache below, KV pages, GDN
@@ -976,6 +981,19 @@ def _ensure_expandable_segments() -> None:
     is respected and left untouched.
     """
     if os.environ.get("PYTORCH_ALLOC_CONF") or os.environ.get("PYTORCH_CUDA_ALLOC_CONF"):
+        return
+    # ROCm on Windows backs an expandable segment with HOST memory: creating the segment,
+    # and every later growth of it, mirrors the VRAM heap into the process working set
+    # (measured ~18 GiB per event on a 16 GiB card). On an offload MoE run host RAM is
+    # exactly the resource the design is spending, so this silently eats tens of GiB
+    # before a single weight is read and the expert-bank pin then fails with availPhys
+    # at zero -- a fragmentation guard that costs more than the fragmentation. Opt back
+    # in with PYTORCH_ALLOC_CONF=expandable_segments:True.
+    if sys.platform == "win32" and getattr(torch.version, "hip", None) is not None:
+        logger.info_rank0(
+            "expandable_segments left OFF: on ROCm/Windows the segment is host-backed "
+            "(set PYTORCH_ALLOC_CONF=expandable_segments:True to override)"
+        )
         return
     try:
         torch.cuda.memory._set_allocator_settings("expandable_segments:True")

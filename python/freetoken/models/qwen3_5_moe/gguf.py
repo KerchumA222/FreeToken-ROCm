@@ -53,6 +53,7 @@ from freetoken.models.gguf.dequant import (
 )
 from freetoken.models.gguf.reader import (
     GgufTensor,
+    PageReleaser,
     iter_gguf_tensors,
     load_gguf_metadata,
 )
@@ -375,6 +376,10 @@ def load_q4_0_expert_sources(
     def _load(sink) -> None:
         # 3 writes/layer: gate half, up half, down
         tracker = LayerCompletionTracker(3, hb, sink) if sink is not None else None
+        # Every expert byte is copied out of the mapping, so the mapped source pages
+        # would otherwise sit resident alongside the banks -- the whole checkpoint,
+        # twice, in host RAM. Give each consumed region back as we go.
+        releaser = PageReleaser(model_path)
         for t in iter_gguf_tensors(model_path):
             if not t.name.startswith("blk."):
                 continue
@@ -395,6 +400,7 @@ def load_q4_0_expert_sources(
                     _packed_as(t, types["down"]).reshape(E, H, dn_bytes)
                 )
             seen[suffix].add(layer)
+            releaser.note(t.rows * t.row_bytes)
             if tracker is not None:
                 tracker.note(layer)
 
