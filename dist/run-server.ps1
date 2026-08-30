@@ -26,6 +26,16 @@ $ErrorActionPreference = "Stop"
 $REPO = Split-Path -Parent $PSScriptRoot
 $LogDir = "$env:TEMP\freetoken-logs"
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
+"$LogDir\serve.log", "$LogDir\serve_err.log" | ForEach-Object {
+    if (Test-Path $_) {
+        try {
+            Remove-Item $_ -Force -ErrorAction Stop
+        } catch {
+            # The desktop app may tail the log with delete sharing disabled.
+            Clear-Content $_ -Force -ErrorAction Stop
+        }
+    }
+}
 
 if (-not $RocmPath) {
     if ($env:HIP_PATH) { $RocmPath = $env:HIP_PATH }
@@ -37,18 +47,29 @@ if ($KVPages -gt 0) { $ExtraArgs += "--num-pages $KVPages" }
 $ft = Join-Path $REPO ".venv\Scripts\ft.exe"
 if (-not (Test-Path $ft)) { $ft = "ft" }
 
-$vcvars = Get-ChildItem "C:\Program Files\Microsoft Visual Studio" -Recurse -Filter vcvarsall.bat -ErrorAction SilentlyContinue |
+$vcvars = @("${env:ProgramFiles(x86)}\Microsoft Visual Studio", "$env:ProgramFiles\Microsoft Visual Studio") |
+          Where-Object { Test-Path $_ } |
+          ForEach-Object { Get-ChildItem $_ -Recurse -Filter vcvarsall.bat -ErrorAction SilentlyContinue } |
           Select-Object -First 1 -ExpandProperty FullName
+if (-not $vcvars) {
+    throw "Visual Studio Build Tools with the C++ workload and Windows SDK are required (vcvarsall.bat not found)."
+}
 
 $cmd = @"
-$(if ($vcvars) { "call `"$vcvars`" x64 >nul" })
+call `"$vcvars`" x64 >nul
 set HIP_PATH=$RocmPath
 set TVM_FFI_ROCM_ARCH_LIST=$Arch
 set TRITON_OVERRIDE_ARCH=$Arch
 set ROCM_SDK_TARGET_FAMILY=$Arch
-set "CC=$RocmPath\lib\llvm\bin\clang.EXE"
+set PYTORCH_ROCM_ARCH=$Arch
+set HIP_DEVICE_LIB_PATH=$RocmPath\lib\llvm\amdgcn\bitcode
+set ROCM_HOME=$RocmPath
+set ROCM_PATH=$RocmPath
+set TVM_FFI_CACHE_DIR=$REPO\.tvm-ffi-cache
+set PATH=$RocmPath\bin;%PATH%
+set "CC=$RocmPath\lib\llvm\bin\clang-cl.exe"
 cd /d %TEMP%
-"$ft" serve --model "$Model" --server-port $Port $($ExtraArgs -join ' ') > "$LogDir\serve.log" 2> "$LogDir\serve_err.log"
+"$ft" serve --model-path "$Model" --port $Port $($ExtraArgs -join ' ') > "$LogDir\serve.log" 2> "$LogDir\serve_err.log"
 "@
 $runner = Join-Path $env:TEMP "freetoken_serve.cmd"
 Set-Content $runner $cmd -Encoding ASCII
