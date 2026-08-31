@@ -16,6 +16,8 @@ sampled tensors):
 - Linear layers store the GDN in_proj split as ``attn_qkv`` (conv_dim),
   ``attn_gate`` (value_dim), ``ssm_beta``/``ssm_alpha`` (num_v_heads each);
   FreeToken's fused ``in_proj`` concat order is qkv | z | b | a.
+- Every value-head-indexed axis is stored in llama.cpp's **tiled** order, not HF's
+  grouped one, and has to be un-tiled at load -- see :func:`_untile_v_heads`.
 - Gemma-style ``+1`` is already baked into attn/post/output norms and q/k norms
   at conversion time (values center on 1.0) -> load as-is; ``ssm_norm`` is a
   plain gated RMS norm weight (no +1).
@@ -202,6 +204,39 @@ def parse_gguf_config(shim: "GgufConfigShim") -> "ModelConfig":
     return config
 
 
+def _untile_v_heads(
+    t: torch.Tensor, dim: int, num_k_heads: int, num_v_per_k: int, head_dim: int
+) -> torch.Tensor:
+    """GGUF *tiled* value-head order -> HF *grouped* order along ``dim``.
+
+    GDN has fewer key heads than value heads (16 vs 32 here), so every value-head-indexed
+    axis needs a convention for which key head a value head belongs to. HF groups them --
+    ``[G0_v0..v(r-1), G1_v0..v(r-1), ...]``, value head ``h`` under key head ``h // r`` --
+    but llama.cpp's qwen35/qwen35moe converter (``_LinearAttentionVReorderBase``) rewrites
+    them tiled, ``[G0_v0, G1_v0, ..., G0_v1, G1_v1, ...]``, so a plain ggml broadcast can
+    stand in for an interleaved repeat.
+
+    FreeToken's fla kernels use the HF convention on both paths -- chunk prefill
+    (``fla/chunk_o.py``: ``i_h // (H // Hg)``) and fused decode
+    (``fla/fused_sigmoid_gating_recurrent.py``: ``i_hv // (HV // H)``) -- so leaving the
+    GGUF order in place pairs *every* value head with the wrong key head, on 30 of this
+    model's 40 layers. Output stays fluent-shaped and is semantically dead. This is the
+    inverse of the converter's permutation; it applies to every affected tensor (qkv's v
+    rows, z, b, a, A_log, dt_bias, conv1d's v channels, out_proj's columns) or to none.
+    """
+    shape = list(t.shape)
+    if dim < 0:
+        dim += len(shape)
+    assert shape[dim] == num_k_heads * num_v_per_k * head_dim, (
+        f"axis {dim} of {tuple(shape)} is not "
+        f"{num_k_heads} x {num_v_per_k} x {head_dim} value-head rows"
+    )
+    t = t.reshape(*shape[:dim], num_v_per_k, num_k_heads, head_dim, *shape[dim + 1 :])
+    perm = list(range(t.dim()))
+    perm[dim], perm[dim + 1] = perm[dim + 1], perm[dim]
+    return t.permute(*perm).contiguous().reshape(*shape)
+
+
 def _to_bf16(t: GgufTensor) -> torch.Tensor:
     return dequant_any(t).to(torch.bfloat16)
 
@@ -213,8 +248,7 @@ _SUFFIX_MAP = {
     "attn_output.weight": "self_attn.o_proj.weight",
     "attn_q_norm.weight": "self_attn.q_norm.weight",  # +1 baked at conversion
     "attn_k_norm.weight": "self_attn.k_norm.weight",
-    "ssm_norm.weight": "linear_attn.norm.weight",
-    "ssm_out.weight": "linear_attn.out_proj.weight",
+    "ssm_norm.weight": "linear_attn.norm.weight",  # per-head-dim: no value-head order
     "ffn_gate_inp.weight": "mlp.gate.weight",
     "ffn_down_shexp.weight": "mlp.shared_expert.down_proj.weight",
 }
@@ -240,9 +274,29 @@ def iter_gguf_weights(
     assert include_non_moe
     _require_tp1("weights")
 
-    interval = int(load_gguf_metadata(model_path).get(
-        "qwen35moe.full_attention_interval", 4
-    ))
+    md = load_gguf_metadata(model_path)
+    arch = str(md.get("general.architecture", "qwen35moe"))
+    interval = int(md.get(f"{arch}.full_attention_interval", 4))
+
+    # GDN value-head order (see _untile_v_heads). llama.cpp's converter always reorders
+    # when num_k_heads != num_v_heads and does not record that it did, so un-tiling is the
+    # default; a file that explicitly says it did not reorder is honoured.
+    num_k = int(md.get(f"{arch}.ssm.group_count", 0))
+    num_v = int(md.get(f"{arch}.ssm.time_step_rank", 0))
+    untile = (
+        num_k > 0
+        and num_v > num_k
+        and num_v % num_k == 0
+        and bool(md.get(f"{arch}.ssm.v_head_reordered", True))
+    )
+    v_per_k = num_v // num_k if untile else 1
+    head_v = int(md[f"{arch}.ssm.inner_size"]) // num_v if untile else 0
+    key_dim = num_k * int(md[f"{arch}.ssm.state_size"]) if untile else 0
+
+    def untile_v(w: torch.Tensor, dim: int = 0, head_dim: int | None = None) -> torch.Tensor:
+        if not untile:
+            return w
+        return _untile_v_heads(w, dim, num_k, v_per_k, head_v if head_dim is None else head_dim)
 
     fuse: dict[tuple[int, str], dict[str, torch.Tensor]] = {}
 
@@ -273,17 +327,27 @@ def iter_gguf_weights(
                 # stored as -exp(A_log); FreeToken keeps A_log (fp32)
                 a = dequant_any(t).to(torch.float32)
                 assert (a < 0).all(), f"{name}: expected -exp(A_log) (negative values)"
-                yield stem + "linear_attn.A_log", torch.log(-a)
+                yield stem + "linear_attn.A_log", untile_v(torch.log(-a), head_dim=1)
                 continue
             # Real Qwen3.5/3.6 conversions name this bias bare `ssm_dt` (the way
             # `ssm_a` is bare); other files spell it `ssm_dt.bias`. Either way it is
             # the fp32 dt_bias vector, one entry per value head.
             if suffix in ("ssm_dt.bias", "ssm_dt"):
-                yield stem + "linear_attn.dt_bias", dequant_any(t).to(torch.float32)
+                yield stem + "linear_attn.dt_bias", untile_v(
+                    dequant_any(t).to(torch.float32), head_dim=1
+                )
                 continue
             if suffix == "ssm_conv1d.weight":
-                # ggml [K, conv_dim] -> torch (conv_dim, K) -> module [conv_dim, 1, K]
-                yield stem + "linear_attn.conv1d.weight", _to_bf16(t).unsqueeze(1).contiguous()
+                # ggml [K, conv_dim] -> torch (conv_dim, K) -> module [conv_dim, 1, K].
+                # Channels run q | k | v; only the v block carries value-head order.
+                w = _to_bf16(t)
+                if untile:
+                    w = torch.cat([w[: 2 * key_dim], untile_v(w[2 * key_dim :])], dim=0)
+                yield stem + "linear_attn.conv1d.weight", w.unsqueeze(1).contiguous()
+                continue
+            if suffix == "ssm_out.weight":
+                # [hidden, value_dim]: the INPUT columns are value-head ordered.
+                yield stem + "linear_attn.out_proj.weight", untile_v(_to_bf16(t), dim=1)
                 continue
             if suffix == "ffn_gate_inp_shexp.weight":
                 yield stem + "mlp.shared_expert_gate.weight", _to_bf16(t).reshape(1, -1)
@@ -296,8 +360,16 @@ def iter_gguf_weights(
                 )
                 continue
             if proj in _IN_PROJ_SLOTS and not _is_full_attention(layer, interval):
+                w = _to_bf16(t)
+                if untile:
+                    if proj == "attn_qkv":  # rows q | k | v; only v is value-head ordered
+                        w = torch.cat([w[: 2 * key_dim], untile_v(w[2 * key_dim :])], dim=0)
+                    elif proj == "attn_gate":  # z, one row block per value head
+                        w = untile_v(w)
+                    else:  # ssm_beta / ssm_alpha: one scalar row per value head
+                        w = untile_v(w, head_dim=1)
                 yield from feed_fused(
-                    layer, "in_proj", _IN_PROJ_SLOTS, proj, _to_bf16(t),
+                    layer, "in_proj", _IN_PROJ_SLOTS, proj, w,
                     stem + "linear_attn.in_proj.weight",
                 )
                 continue
