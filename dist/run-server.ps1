@@ -10,7 +10,11 @@
 #                           (not needed if HIP_PATH is already set)
 #    -Port 1919             API port
 #    -KVPages 4096          cap KV cache (needed for big dense models)
-#    -ExtraArgs "--flag"    anything else for `ft serve`
+#    -ExtraArgs "..."       anything else for `ft serve`, as ONE space-separated
+#                           string:  -ExtraArgs "--moe-backend offload --num-pages 4096"
+#                           (`powershell -File` does no PowerShell parsing, so the
+#                           array form "--a","b" arrives as the literal string
+#                           "--a,b" -- both are split apart below)
 #
 #  When it says READY, open http://localhost:1420 and chat.
 # ============================================================
@@ -31,14 +35,34 @@ New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 # is reading the PREVIOUS run - a stale traceback aborts this launch instantly.
 Remove-Item "$LogDir\serve.log", "$LogDir\serve_err.log" -ErrorAction SilentlyContinue
 if (Test-Path "$LogDir\serve.log") {
-    throw "$LogDir\serve.log is still locked by a previous run (a scheduler worker can outlive a failed server). Kill it, then retry - otherwise this launch would read the old log and report its error as this one's."
+    throw "$LogDir\serve.log is still locked by a previous run, so this launch would read the old log and report its error as this one's. A scheduler worker outlived a failed server and still holds the inherited handle: it is a python.exe running ``multiprocessing.spawn``, NOT anything matching ``freetoken``. Run dist\stop-server.ps1 - it sweeps those - then retry."
 }
 
 if (-not $RocmPath) {
     if ($env:HIP_PATH) { $RocmPath = $env:HIP_PATH }
-    else { throw "Where is the AMD ROCm runtime? Pass -RocmPath or set HIP_PATH once:`n       [Environment]::SetEnvironmentVariable('HIP_PATH','C:\\ROCm\\...','User')" }
+    else {
+        # The ROCm runtime ships INSIDE the venv install.ps1 built -- the TheRock wheels
+        # unpack it to site-packages\_rocm_sdk_core (lib\llvm\..., the layout the env vars
+        # below assume). Ask Python where that is before telling the user to go find a
+        # system ROCm install they never had to make; HIP_PATH is set by nothing here.
+        $pyExe = Join-Path $REPO ".venv\Scripts\python.exe"
+        if (-not (Test-Path $pyExe)) { $pyExe = "python" }
+        $found = & $pyExe -c "import _rocm_sdk_core, os; print(os.path.dirname(_rocm_sdk_core.__file__))" 2>$null
+        if ($found) { $found = ([string]$found).Trim() }
+        if ($found -and (Test-Path (Join-Path $found "lib\llvm\bin\clang.exe"))) {
+            $RocmPath = $found
+            Write-Host "ROCm runtime: $RocmPath (from the venv)" -ForegroundColor DarkGray
+        }
+    }
+    if (-not $RocmPath) { throw "Where is the AMD ROCm runtime? It is not in this repo's .venv and HIP_PATH is unset. Pass -RocmPath, or re-run dist\install.ps1 to build the venv." }
 }
-if ($KVPages -gt 0) { $ExtraArgs += "--num-pages $KVPages" }
+# `powershell -File` hands every argument through as a literal string -- there is no
+# PowerShell parser on that path -- so -ExtraArgs "--moe-backend","offload" arrives as
+# the single element "--moe-backend,offload", which `ft serve` rejects as one
+# unrecognized argument. Split every element on commas and whitespace so the array form
+# (dot-sourced, or -Command) and the string form (-File) both reach ft the same way.
+$ExtraArgs = @($ExtraArgs | ForEach-Object { $_ -split '[,\s]+' } | Where-Object { $_ })
+if ($KVPages -gt 0) { $ExtraArgs += "--num-pages", "$KVPages" }
 
 # engine binary: prefer the repo venv this installer created, fall back to PATH
 $ft = Join-Path $REPO ".venv\Scripts\ft.exe"
@@ -95,7 +119,14 @@ for ($i = 1; $i -le 120; $i++) {
         Write-Host "  Logs: $LogDir\serve.log / serve_err.log"
         exit 0
     }
-    if (Select-String -Path "$LogDir\serve.log","$LogDir\serve_err.log" -Pattern "AssertionError|Traceback|exited during load" -ErrorAction SilentlyContinue) {
+    # torch LOGS tracebacks as warnings and keeps going -- cpp_extension's
+    # "Error checking compiler version" probe prints a full Traceback on every ROCm
+    # start, and matching it aborted a load that went on to serve fine. Warning lines
+    # carry torch's rank/severity stamp ("[rank0]:W0830 ..."); a real crash does not.
+    $fatal = Select-String -Path "$LogDir\serve.log","$LogDir\serve_err.log" `
+                 -Pattern "AssertionError|Traceback|exited during load" -ErrorAction SilentlyContinue |
+             Where-Object { $_.Line -notmatch '\]:[WI]\d{4} ' }
+    if ($fatal) {
         Write-Host "`n  The server hit an error while loading. Last lines:" -ForegroundColor Red
         Get-Content "$LogDir\serve_err.log","$LogDir\serve.log" -Tail 6 -ErrorAction SilentlyContinue
         exit 1
