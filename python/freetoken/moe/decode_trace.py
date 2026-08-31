@@ -42,6 +42,10 @@ class _HostMappingStatus:
     device_ptr: str
     failed_bank: str
     reason: str
+    # Which mechanism resolved the host->device translation: "extension" (the packaged
+    # _pinned_tensor C++ extension), "hip_runtime" (hipHostGetDevicePointer by ctypes),
+    # "host_ptr_identity" (mapped at its own host VA), or "none".
+    mapping_source: str = "none"
 
 
 def trace_enabled() -> bool:
@@ -203,10 +207,62 @@ def cache_hit_miss_counts(
     return active, hits, active - hits
 
 
+def _host_mapping_resolver() -> tuple[Any, str, bool]:
+    """``(resolve, source_label, extension_loaded)``; ``resolve`` is None if nothing can.
+
+    The probe must accept the same evidence the fast path actually runs on. It used to
+    demand the packaged ``_pinned_tensor`` C++ extension and nothing else, but the
+    ROCm/Windows port never builds it (``ext_modules = []``), so every bank read as
+    unmapped, ``should_use_safe_offload_copy`` was permanently true, and decode took the
+    staged safe-copy path -- which calls ``.item()``, which is illegal under CUDA-graph
+    capture. Graphs therefore could not be captured at all on this port, and eager decode
+    is where the whole 12 vs 62-73 tok/s gap lives.
+
+    The branches mirror :func:`freetoken.kernel.pinned.device_ptr`, which is what
+    ``OffloadMoeCache`` builds ``_copy_src_ptrs`` from -- so the safety check and the
+    pointers the gather kernel dereferences now come from the same place -- but they are
+    spelled out here so the trace can report which one answered.
+    """
+    from freetoken.kernel import pinned
+
+    extension = pinned._load_pinned_extension()
+    if extension is not None:
+        host_device_ptr = getattr(extension, "host_device_ptr", None)
+        if not callable(host_device_ptr):
+            return None, "host_device_ptr_unavailable", True
+        return (lambda t: int(host_device_ptr(int(t.data_ptr())))), "extension", True
+
+    hip = pinned._hip_runtime()
+    if hip is None:
+        # No extension and no HIP runtime: a CUDA build without the extension, or a
+        # CPU-only box. Nothing to translate with.
+        return None, "pinned_extension_missing", False
+
+    if pinned._host_ptr_identity():
+        # Registered host memory is device-visible at its own VA (Linux/UVA, and any
+        # ROCm build where the probe says so): data_ptr() already IS the device pointer.
+        return (lambda t: int(t.data_ptr())), "host_ptr_identity", False
+
+    import ctypes
+
+    def _via_hip_runtime(t: torch.Tensor) -> int:
+        dev = ctypes.c_void_p()
+        status = hip.hipHostGetDevicePointer(
+            ctypes.byref(dev), ctypes.c_void_p(t.data_ptr()), ctypes.c_uint(0)
+        )
+        if status != 0:
+            raise RuntimeError(f"hipHostGetDevicePointer failed with hipError {status}")
+        return int(dev.value or 0)
+
+    return _via_hip_runtime, "hip_runtime", False
+
+
 def _inspect_host_mapping(
     cache: Any,
     layer_id: int,
-    extension: Any | None,
+    resolver: Any | None,
+    mapping_source: str = "none",
+    extension_loaded: bool = False,
 ) -> _HostMappingStatus:
     """Prove that each current host bank has a HIP-visible device mapping."""
 
@@ -237,86 +293,49 @@ def _inspect_host_mapping(
             reason = "host_pointer_unavailable"
             failed_bank = sources[0][0]
 
-    if extension is None:
+    def _fail(why: str, bank: str, mapped: int = 0, dev: str = "unavailable"):
         return _HostMappingStatus(
             False,
-            False,
+            extension_loaded,
             residency,
             len(bank_names),
-            0,
+            mapped,
             first_host_ptr,
-            "unavailable",
-            failed_bank if failed_bank != "none" else (sources[0][0] if sources else "none"),
-            "pinned_extension_missing",
+            dev,
+            bank,
+            why,
+            mapping_source,
         )
 
-    host_device_ptr = getattr(extension, "host_device_ptr", None)
-    if not callable(host_device_ptr):
-        return _HostMappingStatus(
-            False,
-            True,
-            residency,
-            len(bank_names),
-            0,
-            first_host_ptr,
-            "unavailable",
+    # Fail closed: no way to translate a host VA is not evidence that one is safe to
+    # dereference from the GPU.
+    if resolver is None:
+        return _fail(
+            mapping_source if mapping_source != "none" else "host_device_ptr_unavailable",
             failed_bank if failed_bank != "none" else (sources[0][0] if sources else "none"),
-            "host_device_ptr_unavailable",
         )
 
     if reason != "ok" or len(sources) != len(bank_names) or not sources:
-        return _HostMappingStatus(
-            False,
-            True,
-            residency,
-            len(bank_names),
-            0,
-            first_host_ptr,
-            "unavailable",
-            failed_bank,
-            reason if reason != "ok" else "host_bank_source_unavailable",
+        return _fail(
+            reason if reason != "ok" else "host_bank_source_unavailable", failed_bank
         )
 
     mapped_bank_count = 0
     first_device_ptr = "unavailable"
     for name, source in sources:
         if not isinstance(source, torch.Tensor) or source.device.type != "cpu":
-            return _HostMappingStatus(
-                False,
-                True,
-                residency,
-                len(bank_names),
-                mapped_bank_count,
-                first_host_ptr,
-                first_device_ptr,
-                name,
-                "host_bank_source_not_cpu",
+            return _fail(
+                "host_bank_source_not_cpu", name, mapped_bank_count, first_device_ptr
             )
         try:
-            mapped_ptr = int(host_device_ptr(int(source.data_ptr())))
+            mapped_ptr = int(resolver(source))
         except Exception:
-            return _HostMappingStatus(
-                False,
-                True,
-                residency,
-                len(bank_names),
-                mapped_bank_count,
-                first_host_ptr,
-                first_device_ptr,
-                name,
-                "host_device_mapping_failed",
+            return _fail(
+                "host_device_mapping_failed", name, mapped_bank_count, first_device_ptr
             )
         if mapped_ptr == 0:
-            return _HostMappingStatus(
-                False,
-                True,
-                residency,
-                len(bank_names),
-                mapped_bank_count,
-                first_host_ptr,
-                first_device_ptr,
-                name,
-                "host_device_pointer_zero",
+            return _fail(
+                "host_device_pointer_zero", name, mapped_bank_count, first_device_ptr
             )
         mapped_bank_count += 1
         if first_device_ptr == "unavailable":
@@ -324,7 +343,7 @@ def _inspect_host_mapping(
 
     return _HostMappingStatus(
         True,
-        True,
+        extension_loaded,
         residency,
         len(bank_names),
         mapped_bank_count,
@@ -332,24 +351,23 @@ def _inspect_host_mapping(
         first_device_ptr,
         "none",
         "ok",
+        mapping_source,
     )
 
 
 def inspect_host_mapping(cache: Any, layer_id: int) -> _HostMappingStatus:
-    """Inspect current bank mappings using the packaged pinned-memory extension."""
-
-    from freetoken.kernel.pinned import _load_pinned_extension
+    """Inspect current bank mappings through whatever can resolve a host->device VA."""
 
     try:
-        extension = _load_pinned_extension()
+        resolver, source, extension_loaded = _host_mapping_resolver()
     except Exception:
-        # Capability detection must fail closed: a broken/unloadable extension is not
-        # evidence that a Windows host VA is safe for direct GPU dereference.
+        # Capability detection must fail closed: a broken loader is not evidence that a
+        # Windows host VA is safe for direct GPU dereference.
         return replace(
             _inspect_host_mapping(cache, layer_id, None),
-            reason="pinned_extension_load_failed",
+            reason="host_mapping_probe_failed",
         )
-    return _inspect_host_mapping(cache, layer_id, extension)
+    return _inspect_host_mapping(cache, layer_id, resolver, source, extension_loaded)
 
 
 def preflight_windows_rocm_host_mapping(
@@ -376,6 +394,7 @@ def preflight_windows_rocm_host_mapping(
         device_ptr=status.device_ptr,
         failed_bank=status.failed_bank,
         safe_for_gpu_deref=str(status.safe_for_gpu_deref).lower(),
+        mapping_source=status.mapping_source,
         reason=status.reason,
         layer=layer_id,
         safe_copy_selected=str(allow_unmapped_safe_copy).lower(),

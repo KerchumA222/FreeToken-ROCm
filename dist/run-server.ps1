@@ -16,6 +16,10 @@
 #                           array form "--a","b" arrives as the literal string
 #                           "--a,b" -- both are split apart below)
 #
+#  Pass --cuda-graph-max-bs 0 in -ExtraArgs. On gfx1201 CUDA graphs are a large
+#  LOSS, not a win: measured on Gemma-4-26B-A4B QAT q4_0 with identical settings,
+#  eager decodes at 37.9 tok/s and graph replay at 10.4.
+#
 #  When it says READY, open http://localhost:1420 and chat.
 # ============================================================
 param(
@@ -63,6 +67,20 @@ if (-not $RocmPath) {
 # (dot-sourced, or -Command) and the string form (-File) both reach ft the same way.
 $ExtraArgs = @($ExtraArgs | ForEach-Object { $_ -split '[,\s]+' } | Where-Object { $_ })
 if ($KVPages -gt 0) { $ExtraArgs += "--num-pages", "$KVPages" }
+
+# The generated runner does `cd /d %TEMP%` before calling ft, so a relative -Model
+# (the form the README and every note use: modelsoo.gguf) resolves against %TEMP%,
+# misses, and transformers then treats it as a HUGGING FACE REPO ID -- the error names
+# repo-id character rules and never mentions the path. Resolve it here, against the
+# caller's cwd and then the repo, before it can turn into a download attempt.
+if (-not [System.IO.Path]::IsPathRooted($Model)) {
+    $candidate = Join-Path (Get-Location) $Model
+    if (-not (Test-Path $candidate)) { $candidate = Join-Path $REPO $Model }
+    if (-not (Test-Path $candidate)) {
+        throw "Model not found: '$Model' (looked in $(Get-Location) and $REPO). Pass a full path."
+    }
+    $Model = (Resolve-Path $candidate).Path
+}
 
 # engine binary: prefer the repo venv this installer created, fall back to PATH
 $ft = Join-Path $REPO ".venv\Scripts\ft.exe"

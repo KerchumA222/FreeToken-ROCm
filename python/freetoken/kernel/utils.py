@@ -18,10 +18,31 @@ DISABLE_JIT_ENV = "FREETOKEN_DISABLE_JIT"
 _TRUE_VALUES = {"1", "true", "yes", "on"}
 DEFAULT_INCLUDE = [str(KERNEL_PATH / "include")]
 DEFAULT_CFLAGS = ["-std=c++20", "-O3"]
+def _is_hip_toolchain() -> bool:
+    """Do device kernels compile with hipcc/clang (which rejects nvcc-only flags)?
+
+    This used to ask whether ``HIP_PATH`` was set -- i.e. whether one launcher happened
+    to export an environment variable, not which toolchain the build actually uses. Only
+    ``dist
+un-server.ps1`` exports it, so every other entry point (the test suite,
+    ``ft serve`` run directly, anything started from a plain shell) handed clang
+    ``--expt-relaxed-constexpr`` and the JIT died with "unknown argument" -- a failure
+    that surfaces only for kernels that had not already been built and cached. Ask torch
+    what it was built against, and keep the env var as a fallback for the AOT cache build
+    where importing torch is not wanted.
+    """
+    try:
+        import torch
+
+        return bool(getattr(torch.version, "hip", None))
+    except Exception:
+        return bool(os.environ.get("HIP_PATH"))
+
+
 # patched: hipcc/clang rejects nvcc-only flags; MSVC-style args break on Windows HIP builds
 DEFAULT_CUDA_CFLAGS = (
     ["-std=c++20", "-O3"]
-    if os.environ.get("HIP_PATH")
+    if _is_hip_toolchain()
     else ["-std=c++20", "-O3", "--expt-relaxed-constexpr"]
 )
 DEFAULT_LDFLAGS = []
@@ -206,8 +227,9 @@ def load_aot(
         return prebuilt
 
     if cuda_files:
-        from freetoken.kernel._toolchain import check_nvcc_matches_torch
+        from freetoken.kernel._toolchain import check_nvcc_matches_torch, ensure_rocm_env
 
+        ensure_rocm_env()
         check_nvcc_matches_torch()
 
     from tvm_ffi.cpp import load
@@ -252,8 +274,9 @@ def load_jit(
         return prebuilt
 
     if cuda_files or cuda_wrappers:
-        from freetoken.kernel._toolchain import check_nvcc_matches_torch
+        from freetoken.kernel._toolchain import check_nvcc_matches_torch, ensure_rocm_env
 
+        ensure_rocm_env()
         check_nvcc_matches_torch()
 
     from tvm_ffi.cpp import load_inline

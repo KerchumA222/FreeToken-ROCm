@@ -863,6 +863,13 @@ class OffloadMoeCache:
         # without a working host_device_ptr translation, fast_index_copy would hand the
         # GPU an unregistered CPU VA and can trigger a driver TDR. Fail over to ordinary
         # PyTorch H2D copies unless every current bank has a demonstrated HIP mapping.
+        #
+        # Note this decides more than which copy runs: the fallback reads num_indices on
+        # the HOST (_safe_copy_plan), which is illegal under CUDA-graph capture, so a
+        # false "unsafe" here disables graphs entirely and pins decode to eager mode.
+        # inspect_host_mapping therefore accepts any mechanism that can translate a host
+        # VA -- the same one _copy_src_ptrs is built from -- not just the C++ extension,
+        # which this port does not build.
         mapping_safe = self._host_mapping_safe[layer_id]
         if mapping_safe is None:
             mapping_safe = inspect_host_mapping(self, layer_id).safe_for_gpu_deref
