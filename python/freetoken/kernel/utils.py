@@ -18,46 +18,34 @@ DISABLE_JIT_ENV = "FREETOKEN_DISABLE_JIT"
 _TRUE_VALUES = {"1", "true", "yes", "on"}
 DEFAULT_INCLUDE = [str(KERNEL_PATH / "include")]
 DEFAULT_CFLAGS = ["-std=c++20", "-O3"]
-def _is_hip_toolchain() -> bool:
-    """Do device kernels compile with hipcc/clang (which rejects nvcc-only flags)?
+DEFAULT_LDFLAGS = []
 
-    This used to ask whether ``HIP_PATH`` was set -- i.e. whether one launcher happened
-    to export an environment variable, not which toolchain the build actually uses. Only
-    ``dist
-un-server.ps1`` exports it, so every other entry point (the test suite,
-    ``ft serve`` run directly, anything started from a plain shell) handed clang
-    ``--expt-relaxed-constexpr`` and the JIT died with "unknown argument" -- a failure
-    that surfaces only for kernels that had not already been built and cached. Ask torch
-    what it was built against, and keep the env var as a fallback for the AOT cache build
-    where importing torch is not wanted.
+
+def _is_hip_build() -> bool:
+    """Whether device kernels compile through hipcc/clang rather than nvcc.
+
+    ``HIP_PATH`` is the Windows/TheRock convention and is normally unset on Linux
+    ROCm, so gating on it alone silently fed nvcc-only flags to hipcc there (every
+    tvm-ffi kernel then died on ``unknown argument: '--expt-relaxed-constexpr'``).
+    ``torch.version.hip`` is the platform-independent signal; the env vars stay as
+    a fallback for the ahead-of-time cache build, which runs without importing torch.
     """
     try:
         import torch
 
-        return bool(getattr(torch.version, "hip", None))
+        if getattr(torch.version, "hip", None) is not None:
+            return True
     except Exception:
-        return bool(os.environ.get("HIP_PATH"))
+        pass
+    return any(os.environ.get(v) for v in ("HIP_PATH", "ROCM_HOME", "ROCM_PATH"))
 
 
-# patched: hipcc/clang rejects nvcc-only flags; MSVC-style args break on Windows HIP builds
-def _is_rocm_build() -> bool:
-    # HIP_PATH is unset for a wheel-installed ROCm, and setting it makes torch's
-    # cpp_extension think it is on Windows (clang++.EXE). Ask torch instead.
-    try:
-        import torch
-
-        return torch.version.hip is not None
-    except Exception:
-        return bool(os.environ.get("HIP_PATH"))
-
-
-DEFAULT_CUDA_CFLAGS = (
-    ["-std=c++20", "-O3"]
-    if _is_hip_toolchain()
-    if _is_rocm_build()
-    else ["-std=c++20", "-O3", "--expt-relaxed-constexpr"]
-)
-DEFAULT_LDFLAGS = []
+def _default_cuda_cflags() -> List[str]:
+    """Device-compiler flags. hipcc/clang rejects nvcc-only options outright."""
+    flags = ["-std=c++20", "-O3"]
+    if not _is_hip_build():
+        flags.append("--expt-relaxed-constexpr")
+    return flags
 
 
 def _cuda_cflags(extra: List[str]) -> List[str]:
@@ -68,7 +56,7 @@ def _cuda_cflags(extra: List[str]) -> List[str]:
     PTXâ†’SASS JIT (driver-only, no CUDA toolkit). One top PTX suffices: the loader always
     JIT-forwards from the highest compatible PTX. When the env is unset (runtime JIT), this is a
     no-op and tvm-ffi targets only the local GPU."""
-    flags = DEFAULT_CUDA_CFLAGS + extra
+    flags = _default_cuda_cflags() + extra
     arch_list = os.getenv("TVM_FFI_CUDA_ARCH_LIST", "").split()
     if arch_list:
         def _rank(a: str) -> int:

@@ -23,6 +23,21 @@
 
 namespace host {
 
+// DLPack device codes for "the GPU this translation unit is built for".
+// A ROCm build reports tensors as rocm / rocm_host, a CUDA build as cuda /
+// cuda_host, so a matcher hard-coded to kDLCUDA rejects every tensor on ROCm
+// ("Device value [rocm[0]] not in the allowed options"). tvm-ffi's HIP backend
+// and torch's cpp_extension both define __HIP_PLATFORM_AMD__ / USE_ROCM.
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIP_PLATFORM_HCC__) ||          \
+    defined(USE_ROCM)
+inline constexpr auto kFTDeviceGPU = DLDeviceType::kDLROCM;
+inline constexpr auto kFTDeviceGPUHost = DLDeviceType::kDLROCMHost;
+#else
+inline constexpr auto kFTDeviceGPU = DLDeviceType::kDLCUDA;
+inline constexpr auto kFTDeviceGPUHost = DLDeviceType::kDLCUDAHost;
+#endif
+
+
 namespace stdr = std::ranges;
 namespace stdv = std::views;
 

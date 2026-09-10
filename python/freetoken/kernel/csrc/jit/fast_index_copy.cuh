@@ -175,7 +175,7 @@ inline bool host_ptr_identity() {
 }
 
 inline void* device_alias(void* ptr, DLDevice dev) {
-    if (dev.device_type == kDLCUDA || host_ptr_identity()) {
+    if (dev.device_type == host::kFTDeviceGPU || host_ptr_identity()) {
         return ptr;
     }
     void* mapped = nullptr;
@@ -372,12 +372,12 @@ struct FastIndexCopyKernel {
 
         TensorMatcher({-1, D})
         .with_dtype(data_dtype)
-        .with_device<kDLCUDA, kDLCUDAHost, kDLCPU>()
+        .with_device<host::kFTDeviceGPU, host::kFTDeviceGPUHost, kDLCPU>()
         .verify(src);
 
         TensorMatcher({-1, D})
         .with_dtype(data_dtype)
-        .with_device<kDLCUDA, kDLCUDAHost, kDLCPU>()
+        .with_device<host::kFTDeviceGPU, host::kFTDeviceGPUHost, kDLCPU>()
         .verify(dst);
 
         TensorMatcher({L})

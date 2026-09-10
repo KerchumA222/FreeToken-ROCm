@@ -234,3 +234,10 @@ benchmarks/cross_framework
 /models/
 *.gguf
 /.tvm-ffi-cache/
+
+# torch cpp_extension hipify output (generated in-tree next to the .cu/.cuh sources)
+python/freetoken/kernel/csrc/**/*_hip.cuh
+python/freetoken/kernel/csrc/**/ggml-common_hip.h
+python/freetoken/kernel/csrc/**/*.hip
+python/freetoken/kernel/csrc/**/jit_shim/hip*.h
+python/freetoken/kernel/csrc/**/jit_shim/c10/hip/
