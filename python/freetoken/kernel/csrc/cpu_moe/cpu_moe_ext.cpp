@@ -38,11 +38,7 @@
 #include <thread>
 #include <vector>
 
-#if defined(__HIP_PLATFORM_AMD__) || defined(USE_ROCM)
-#include <freetoken/hip_compat.cuh>
-#else
-#include <cuda_runtime_api.h>
-#endif
+#include <freetoken/gpu_runtime.h>  // CUDA runtime API, or its hip* twin on ROCm
 #include <torch/extension.h>
 
 #if defined(_WIN32)

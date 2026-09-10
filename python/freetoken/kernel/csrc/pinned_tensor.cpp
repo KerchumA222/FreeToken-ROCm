@@ -1,5 +1,5 @@
 #include <cstdint>
-#include <cuda_runtime_api.h>
+#include <freetoken/gpu_runtime.h>  // CUDA runtime API, or its hip* twin on ROCm
 #include <torch/extension.h>
 
 namespace {

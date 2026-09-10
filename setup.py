@@ -25,6 +25,7 @@ def _check_toolchain() -> None:
 
 
 def _is_rocm() -> bool:
+    """ROCm torch, i.e. the extensions link amdhip64 rather than cudart."""
     import torch
 
     return getattr(torch.version, "hip", None) is not None
@@ -113,9 +114,10 @@ def _cpu_moe_extensions(
             stacklevel=2,
         )
         return []
-    compile_args = extra_compile + thread_compile_args
-    if _is_rocm():
-        compile_args = compile_args + ["-D__HIP_PLATFORM_AMD__=1", "-DUSE_ROCM=1"]
+    # CPU-compute MoE executor for --moe-backend cpu. Links the GPU runtime for the
+    # cudaLaunchHostFunc/hipLaunchHostFunc submit/sync graph nodes; the GEMV
+    # microkernels use per-function target attributes + a runtime
+    # __builtin_cpu_supports dispatch, so the single binary stays portable.
     return [
         CppExtension(
             name="freetoken.kernel._cpu_moe",
@@ -125,7 +127,7 @@ def _cpu_moe_extensions(
             include_dirs=[KERNEL_INCLUDE, *runtime_include_dirs],
             library_dirs=runtime_library_dirs,
             libraries=[runtime_lib],
-            extra_compile_args=compile_args,
+            extra_compile_args=extra_compile + thread_compile_args,
             extra_link_args=runtime_link_args + _clang_rt_builtins(),
         )
     ]
@@ -136,39 +138,41 @@ if IS_WINDOWS:
     extra_compile = ["/O2", "/std:c++17"]
     thread_compile_args: list[str] = []
 else:
-    extra_compile = ["-O3", "-std:c++17"]
+    extra_compile = ["-O3", "-std=c++17"]
     thread_compile_args = ["-pthread"]
 
 if IS_ROCM:
     runtime_include_dirs, runtime_library_dirs, runtime_lib = _rocm_paths()
     runtime_link_args = [] if IS_WINDOWS else [f"-Wl,-rpath,{runtime_library_dirs[0]}"]
+    # _pinned_tensor and _cpu_moe are plain C++ -- no __global__ kernels -- so torch
+    # never hipifies them; freetoken/gpu_runtime.h aliases the cuda* runtime calls onto
+    # their hip* twins, keyed on __HIP_PLATFORM_AMD__.
+    extra_compile = extra_compile + ["-D__HIP_PLATFORM_AMD__=1", "-DUSE_ROCM=1"]
 else:
     runtime_include_dirs, runtime_library_dirs = _cuda_runtime_paths() if CUDA_HOME else ([], [])
     runtime_lib = "cudart"
     runtime_link_args = []
 
-# CUDA-only _pinned_tensor is optional; skip it when no CUDA toolchain is present
-# (ROCm builds use torch's own pinned-memory path instead).
+# The extensions are optional: skip them when there is no GPU toolchain to build
+# against (FREETOKEN_SKIP_CUDA_EXT=1, or a CPU-only torch). Without them the engine
+# falls back to torch's own pinned-memory path and loses --moe-backend cpu.
 ext_modules: list[CppExtension] = []
-if os.environ.get("FREETOKEN_SKIP_CUDA_EXT") != "1" and CUDA_HOME is not None and not IS_ROCM:
-    _check_toolchain()
-    cuda_include_dirs, cuda_library_dirs = _cuda_runtime_paths()
+if os.environ.get("FREETOKEN_SKIP_CUDA_EXT") != "1" and (IS_ROCM or CUDA_HOME is not None):
+    if not IS_ROCM:
+        _check_toolchain()
     ext_modules.append(
         CppExtension(
             name="freetoken.kernel._pinned_tensor",
             sources=[
                 "python/freetoken/kernel/csrc/pinned_tensor.cpp",
             ],
-            include_dirs=[KERNEL_INCLUDE, *cuda_include_dirs],
-            library_dirs=cuda_library_dirs,
-            libraries=["cudart"],
+            include_dirs=[KERNEL_INCLUDE, *runtime_include_dirs],
+            library_dirs=runtime_library_dirs,
+            libraries=[runtime_lib],
             extra_compile_args=extra_compile,
+            extra_link_args=runtime_link_args,
         )
     )
-
-if IS_ROCM or CUDA_HOME is not None:
-    if not IS_ROCM and CUDA_HOME is not None:
-        _check_toolchain()
     ext_modules.extend(
         _cpu_moe_extensions(
             extra_compile,
