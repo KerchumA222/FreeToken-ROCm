@@ -46,6 +46,29 @@ if FORCE_EMU and "TRITON_CACHE_DIR" not in os.environ:
 _native: bool | None = None
 
 
+def _device_has_native_e4m3(index: int | None = None) -> bool:
+    """Whether kernels on this device may take fp8e4nv tensors directly.
+
+    On CUDA that is the sm_89 floor. On ROCm ``get_device_capability`` reports the
+    *gfx* version instead -- (10, 3) on gfx1030, (11, 0) on gfx1100, (12, 0) on
+    RDNA4 -- and every one of those compares ``>= (8, 9)`` as True, so the plain
+    tuple test claimed native fp8 on hardware that has none. Worse, it disagreed
+    with the device-side twin: ``target_info.cuda_capability_geq`` returns False
+    for the ``hip`` backend, so the kernel compiled its *emulated* uint8 branch
+    while the host handed it real fp8 tensors, and every such launch died with
+    "cannot cast int32[...] to fp8e4nv".
+
+    Triton's AMD backend has no fp8e4nv lowering for any RDNA target, so ROCm
+    always takes the emulated path -- which is what the device side already
+    assumed. Keep host and device in agreement by answering False there.
+    """
+    if getattr(torch.version, "hip", None) is not None:
+        return False
+    cap = (torch.cuda.get_device_capability(index) if index is not None
+           else torch.cuda.get_device_capability())
+    return cap >= (8, 9)
+
+
 def e4m3_native() -> bool:
     """Host-side twin of :func:`e4m3_native_cx`: True when kernels take fp8e4nv
     tensors directly. False: pass ``.view(torch.uint8)`` and bf16 act buffers."""
@@ -60,14 +83,14 @@ def e4m3_native() -> bool:
         if FORCE_EMU:
             _native = False
         else:
-            native = {torch.cuda.get_device_capability(i) >= (8, 9)
+            native = {_device_has_native_e4m3(i)
                       for i in range(torch.cuda.device_count())}
             if len(native) > 1:
                 raise NotImplementedError(
                     "GPUs on both sides of the sm_89 fp8 boundary in one process: "
                     "the host-side e4m3 convention is process-global"
                 )
-            _native = native.pop() if native else torch.cuda.get_device_capability() >= (8, 9)
+            _native = native.pop() if native else _device_has_native_e4m3()
     return _native
 
 
