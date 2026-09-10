@@ -314,6 +314,39 @@ _QKV_SLOTS = ("attn_q", "attn_k", "attn_v")  # full-attention fuse order
 _IN_PROJ_SLOTS = ("attn_qkv", "attn_gate", "ssm_beta", "ssm_alpha")  # qkv|z|b|a
 
 
+def _v_head_permutation(num_v_heads: int, num_k_heads: int) -> torch.Tensor | None:
+    """Reorder value heads from the checkpoint's grouped layout into the kernel's.
+
+    The vendored fla kernels pair value head ``j`` with key head ``j // (HV // HK)``
+    -- consecutive value heads share a key head. llama.cpp's qwen35moe graph instead
+    pairs value head ``j`` with key head ``j % HK``, i.e. value heads ``i`` and
+    ``i + HK`` share key head ``i``. Feeding a GGUF straight into the kernel therefore
+    pairs the wrong query/key head with every value head in all 30 linear-attention
+    layers, which produces fluent-looking shapes and incoherent tokens.
+
+    Verified against llama.cpp's own layer-0 activations on Qwen3.6-35B-A3B: with this
+    permutation ``attn_output`` sums 72.12 vs llama.cpp's 72.48 and the recurrent state
+    864.16 vs 866.14 (bf16 tolerance); without it, 59.12 and 794.05.
+
+    Returns ``None`` when there is nothing to do (no GQA, or an uneven split).
+    """
+    if num_k_heads <= 0 or num_v_heads == num_k_heads:
+        return None
+    rep, rem = divmod(num_v_heads, num_k_heads)
+    if rem or rep < 2:
+        return None
+    return torch.tensor(
+        [i + r * num_k_heads for i in range(num_k_heads) for r in range(rep)],
+        dtype=torch.long,
+    )
+
+
+def _permute_head_rows(t: torch.Tensor, perm: torch.Tensor, head_dim: int) -> torch.Tensor:
+    """Reorder ``t``'s leading axis by whole heads of ``head_dim`` rows."""
+    rows = (perm[:, None] * head_dim + torch.arange(head_dim)).reshape(-1)
+    return t[rows].contiguous()
+
+
 def iter_gguf_weights(
     model_path: str,
     device,
@@ -332,30 +365,25 @@ def iter_gguf_weights(
     _require_tp1("weights")
 
     md = load_gguf_metadata(model_path)
-    arch = str(md.get("general.architecture", "qwen35moe"))
-    interval = int(md.get(f"{arch}.full_attention_interval", 4))
-    num_layers = _num_model_layers(md, arch)
-    layer_types = _layer_types(model_path, num_layers, interval)
+    interval = int(md.get("qwen35moe.full_attention_interval", 4))
 
-    # GDN value-head order (see _untile_v_heads). llama.cpp's converter always reorders
-    # when num_k_heads != num_v_heads and does not record that it did, so un-tiling is the
-    # default; a file that explicitly says it did not reorder is honoured.
-    num_k = int(md.get(f"{arch}.ssm.group_count", 0))
-    num_v = int(md.get(f"{arch}.ssm.time_step_rank", 0))
-    untile = (
-        num_k > 0
-        and num_v > num_k
-        and num_v % num_k == 0
-        and bool(md.get(f"{arch}.ssm.v_head_reordered", True))
-    )
-    v_per_k = num_v // num_k if untile else 1
-    head_v = int(md[f"{arch}.ssm.inner_size"]) // num_v if untile else 0
-    key_dim = num_k * int(md[f"{arch}.ssm.state_size"]) if untile else 0
+    # GQA head-order fix for the linear-attention (GDN) layers -- see
+    # _v_head_permutation. Everything indexed by value head moves together: the v part
+    # of the fused in_proj and of the depthwise conv, the z gate, the per-head beta/
+    # alpha/A_log/dt_bias, and out_proj's input columns.
+    n_v = int(md["qwen35moe.ssm.time_step_rank"])
+    n_k = int(md["qwen35moe.ssm.group_count"])
+    d_v = int(md["qwen35moe.ssm.inner_size"]) // n_v
+    d_k = int(md["qwen35moe.ssm.state_size"])
+    v_perm = _v_head_permutation(n_v, n_k)
+    key_dim = n_k * d_k
 
-    def untile_v(w: torch.Tensor, dim: int = 0, head_dim: int | None = None) -> torch.Tensor:
-        if not untile:
-            return w
-        return _untile_v_heads(w, dim, num_k, v_per_k, head_v if head_dim is None else head_dim)
+    def _fix_v_rows(t: torch.Tensor) -> torch.Tensor:
+        """Permute the value-head rows of a [q | k | v] conv-dim tensor."""
+        if v_perm is None:
+            return t
+        head, tail = t[: 2 * key_dim], t[2 * key_dim :]
+        return torch.cat([head, _permute_head_rows(tail, v_perm, d_v)], dim=0).contiguous()
 
     fuse: dict[tuple[int, str], dict[str, torch.Tensor]] = {}
     # Anything in the model stack that matches no rule below. Dropping such a tensor in
@@ -393,27 +421,19 @@ def iter_gguf_weights(
                 # stored as -exp(A_log); FreeToken keeps A_log (fp32)
                 a = dequant_any(t).to(torch.float32)
                 assert (a < 0).all(), f"{name}: expected -exp(A_log) (negative values)"
-                yield stem + "linear_attn.A_log", untile_v(torch.log(-a), head_dim=1)
+                if v_perm is not None:
+                    a = a[v_perm]
+                yield stem + "linear_attn.A_log", torch.log(-a)
                 continue
-            # Real Qwen3.5/3.6 conversions name this bias bare `ssm_dt` (the way
-            # `ssm_a` is bare); other files spell it `ssm_dt.bias`. Either way it is
-            # the fp32 dt_bias vector, one entry per value head.
-            if suffix in ("ssm_dt.bias", "ssm_dt"):
-                yield stem + "linear_attn.dt_bias", untile_v(
-                    dequant_any(t).to(torch.float32), head_dim=1
-                )
+            if suffix == "ssm_dt.bias":
+                dtb = dequant_any(t).to(torch.float32)
+                yield stem + "linear_attn.dt_bias", dtb if v_perm is None else dtb[v_perm]
                 continue
             if suffix == "ssm_conv1d.weight":
-                # ggml [K, conv_dim] -> torch (conv_dim, K) -> module [conv_dim, 1, K].
-                # Channels run q | k | v; only the v block carries value-head order.
-                w = _to_bf16(t)
-                if untile:
-                    w = torch.cat([w[: 2 * key_dim], untile_v(w[2 * key_dim :])], dim=0)
-                yield stem + "linear_attn.conv1d.weight", w.unsqueeze(1).contiguous()
-                continue
-            if suffix == "ssm_out.weight":
-                # [hidden, value_dim]: the INPUT columns are value-head ordered.
-                yield stem + "linear_attn.out_proj.weight", untile_v(_to_bf16(t), dim=1)
+                # ggml [K, conv_dim] -> torch (conv_dim, K) -> module [conv_dim, 1, K]
+                yield stem + "linear_attn.conv1d.weight", _fix_v_rows(
+                    _to_bf16(t)
+                ).unsqueeze(1).contiguous()
                 continue
             if suffix == "ffn_gate_inp_shexp.weight":
                 yield stem + "mlp.shared_expert_gate.weight", _to_bf16(t).reshape(1, -1)
@@ -425,19 +445,24 @@ def iter_gguf_weights(
                     stem + "self_attn.qkv_proj.weight",
                 )
                 continue
-            if proj in _IN_PROJ_SLOTS and layer_types[layer] == "linear_attention":
-                w = _to_bf16(t)
-                if untile:
-                    if proj == "attn_qkv":  # rows q | k | v; only v is value-head ordered
-                        w = torch.cat([w[: 2 * key_dim], untile_v(w[2 * key_dim :])], dim=0)
-                    elif proj == "attn_gate":  # z, one row block per value head
-                        w = untile_v(w)
-                    else:  # ssm_beta / ssm_alpha: one scalar row per value head
-                        w = untile_v(w, head_dim=1)
+            if proj in _IN_PROJ_SLOTS and not _is_full_attention(layer, interval):
+                val = _to_bf16(t)
+                if v_perm is not None:
+                    if proj == "attn_qkv":
+                        val = _fix_v_rows(val)            # [q | k | v]
+                    elif proj == "attn_gate":
+                        val = _permute_head_rows(val, v_perm, d_v)   # z, per value head
+                    else:
+                        val = val[v_perm]                 # ssm_beta / ssm_alpha
                 yield from feed_fused(
-                    layer, "in_proj", _IN_PROJ_SLOTS, proj, w,
+                    layer, "in_proj", _IN_PROJ_SLOTS, proj, val,
                     stem + "linear_attn.in_proj.weight",
                 )
+                continue
+            if suffix == "ssm_out.weight" and v_perm is not None:
+                # [hidden, value_dim]: reorder the input columns to match
+                cols = (v_perm[:, None] * d_v + torch.arange(d_v)).reshape(-1)
+                yield stem + "linear_attn.out_proj.weight", _to_bf16(t)[:, cols].contiguous()
                 continue
             if proj in ("ffn_gate_shexp", "ffn_up_shexp"):
                 yield from feed_fused(
