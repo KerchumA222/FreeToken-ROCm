@@ -16,6 +16,7 @@ import functools
 import os
 import pathlib
 import shutil
+import sys
 
 import torch
 
@@ -46,6 +47,39 @@ def _c_compiler_for(cxx: str) -> str:
         return shutil.which("clang") or "clang"
     cc = base.replace("g++", "gcc")
     return shutil.which(cc) or cc
+
+def _retarget_rocm_home() -> None:
+    """Keep ``/usr/include`` off the HIP JIT's ``-isystem`` list.
+
+    torch derives ``ROCM_HOME`` from wherever ``hipcc`` lives; with a distro-packaged
+    ROCm (Ubuntu's ``/usr/bin/hipcc``) that resolves to ``/usr``, and cpp_extension
+    then compiles every TU with ``-isystem /usr/include``. Marking ``/usr/include`` as
+    a *system* directory reorders clang's system-header search, so libstdc++'s
+    ``cmath`` walks off the end of its ``#include_next <math.h>`` chain and the build
+    dies in the standard headers before reaching our code::
+
+        cmath:55:15: fatal error: 'math.h' file not found
+
+    The versioned tree (``/opt/rocm``) holds the same headers without that side
+    effect, so point torch at it when one is present. Nothing to do when ROCM_HOME
+    already names a real ROCm prefix.
+    """
+    import torch.utils.cpp_extension as cpp_ext
+
+    if cpp_ext.ROCM_HOME is None:
+        return
+    inc = os.path.realpath(os.path.join(cpp_ext.ROCM_HOME, "include"))
+    if inc not in ("/usr/include", "/usr/local/include"):
+        return
+    candidates = [os.environ.get("ROCM_PATH"), "/opt/rocm"]
+    candidates += sorted((str(d) for d in pathlib.Path("/opt").glob("rocm-*")), reverse=True)
+    for cand in candidates:
+        if cand and os.path.isfile(
+            os.path.join(cand, "include", "hip", "hip_runtime.h")
+        ):
+            cpp_ext.ROCM_HOME = cand
+            return
+
 
 def _default_rocm_arch() -> str | None:
     """The local GPU's gfx target, e.g. ``gfx1100``.
@@ -83,6 +117,8 @@ def _module():
             extra_cuda_cflags += ["-ccbin", cxx_path]
             os.environ["CXX"] = cxx_path
             os.environ["CC"] = _c_compiler_for(cxx_path)
+    elif sys.platform != "win32":
+        _retarget_rocm_home()
     elif os.environ.get("PYTORCH_NVCC") is None:
         # HIP toolchain: prefer TheRock's clang so JIT builds match the engine build.
         llvm_bin = pathlib.Path(os.environ.get("HIP_PATH", "")) / "lib" / "llvm" / "bin"
