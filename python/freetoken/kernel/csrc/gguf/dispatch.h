@@ -11,12 +11,16 @@
 #endif
 
 // Warp-shuffle wrappers the donor pulls from sgl-kernel's utils.h (CUDA variants).
+// All call sites pass a 32-bit mask literal (uint32_t(-1)); CUDA's __shfl_xor_sync
+// accepts that, but ROCm's __shfl_xor_sync static_asserts the mask is a genuine
+// 64-bit type (AMD wavefronts can be 64 lanes) -- widen it here so every caller is
+// covered without touching each one.
 #ifndef SGLANG_SHFL_XOR_SYNC
-#define SGLANG_SHFL_XOR_SYNC(mask, var, lane_mask) __shfl_xor_sync((mask), (var), (lane_mask))
+#define SGLANG_SHFL_XOR_SYNC(mask, var, lane_mask) __shfl_xor_sync((uint64_t)(mask), (var), (lane_mask))
 #endif
 #ifndef SGLANG_SHFL_XOR_SYNC_WIDTH
 #define SGLANG_SHFL_XOR_SYNC_WIDTH(mask, var, lane_mask, width) \
-  __shfl_xor_sync((mask), (var), (lane_mask), (width))
+  __shfl_xor_sync((uint64_t)(mask), (var), (lane_mask), (width))
 #endif
 
 #define DISPATCH_CASE_FLOAT_TYPES(...)                 \

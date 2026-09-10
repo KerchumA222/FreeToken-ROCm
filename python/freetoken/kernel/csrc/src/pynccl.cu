@@ -92,8 +92,8 @@ public:
 
   auto all_reduce(tvm::ffi::TensorView t, std::string op) const -> void {
     using namespace host;
-    RuntimeCheck(t.device().device_type == kDLCUDA,
-                 "Tensor must be on CUDA device");
+    RuntimeCheck(t.device().device_type == kFTDeviceGPU,
+                 "Tensor must be on the GPU device");
     RuntimeCheck(t.is_contiguous(), "Tensor must be contiguous");
     const auto size_dim = static_cast<size_t>(t.shape().Product());
     const auto dtype = kNCCLDtypeMap.at(t.dtype());
@@ -136,11 +136,11 @@ public:
   auto all_gather(tvm::ffi::TensorView dst, tvm::ffi::TensorView src) const
       -> void {
     using namespace host;
-    RuntimeCheck(src.device().device_type == kDLCUDA,
-                 "Tensor must be on CUDA device");
+    RuntimeCheck(src.device().device_type == kFTDeviceGPU,
+                 "Tensor must be on the GPU device");
     RuntimeCheck(src.is_contiguous(), "Tensor must be contiguous");
-    RuntimeCheck(dst.device().device_type == kDLCUDA,
-                 "Tensor must be on CUDA device");
+    RuntimeCheck(dst.device().device_type == kFTDeviceGPU,
+                 "Tensor must be on the GPU device");
     RuntimeCheck(dst.is_contiguous(), "Tensor must be contiguous");
     RuntimeCheck(dst.size(0) == src.size(0) * m_world_size,
                  "Destination tensor has incorrect size");

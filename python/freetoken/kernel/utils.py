@@ -18,13 +18,34 @@ DISABLE_JIT_ENV = "FREETOKEN_DISABLE_JIT"
 _TRUE_VALUES = {"1", "true", "yes", "on"}
 DEFAULT_INCLUDE = [str(KERNEL_PATH / "include")]
 DEFAULT_CFLAGS = ["-std=c++20", "-O3"]
-# patched: hipcc/clang rejects nvcc-only flags; MSVC-style args break on Windows HIP builds
-DEFAULT_CUDA_CFLAGS = (
-    ["-std=c++20", "-O3"]
-    if os.environ.get("HIP_PATH")
-    else ["-std=c++20", "-O3", "--expt-relaxed-constexpr"]
-)
 DEFAULT_LDFLAGS = []
+
+
+def _is_hip_build() -> bool:
+    """Whether device kernels compile through hipcc/clang rather than nvcc.
+
+    ``HIP_PATH`` is the Windows/TheRock convention and is normally unset on Linux
+    ROCm, so gating on it alone silently fed nvcc-only flags to hipcc there (every
+    tvm-ffi kernel then died on ``unknown argument: '--expt-relaxed-constexpr'``).
+    ``torch.version.hip`` is the platform-independent signal; the env vars stay as
+    a fallback for the ahead-of-time cache build, which runs without importing torch.
+    """
+    try:
+        import torch
+
+        if getattr(torch.version, "hip", None) is not None:
+            return True
+    except Exception:
+        pass
+    return any(os.environ.get(v) for v in ("HIP_PATH", "ROCM_HOME", "ROCM_PATH"))
+
+
+def _default_cuda_cflags() -> List[str]:
+    """Device-compiler flags. hipcc/clang rejects nvcc-only options outright."""
+    flags = ["-std=c++20", "-O3"]
+    if not _is_hip_build():
+        flags.append("--expt-relaxed-constexpr")
+    return flags
 
 
 def _cuda_cflags(extra: List[str]) -> List[str]:
@@ -35,7 +56,7 @@ def _cuda_cflags(extra: List[str]) -> List[str]:
     PTXâ†’SASS JIT (driver-only, no CUDA toolkit). One top PTX suffices: the loader always
     JIT-forwards from the highest compatible PTX. When the env is unset (runtime JIT), this is a
     no-op and tvm-ffi targets only the local GPU."""
-    flags = DEFAULT_CUDA_CFLAGS + extra
+    flags = _default_cuda_cflags() + extra
     arch_list = os.getenv("TVM_FFI_CUDA_ARCH_LIST", "").split()
     if arch_list:
         def _rank(a: str) -> int:
