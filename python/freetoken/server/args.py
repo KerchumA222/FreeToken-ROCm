@@ -2,6 +2,7 @@
 
 import argparse
 import os
+import re
 from dataclasses import dataclass
 from typing import List, Tuple
 
@@ -83,6 +84,27 @@ class ServerArgs(SchedulerConfig):
     @property
     def distributed_addr(self) -> str:
         return f"tcp://127.0.0.1:{self.server_port + 1}"
+
+
+
+def _gpu_lacks_bf16_hardware() -> bool:
+    """True on a GPU where bf16 exists only in software.
+
+    RDNA1/RDNA2 (gfx10xx) have no bf16 ALU -- no conversion, no dot, no packed
+    math. Nothing announces this: torch reports bf16 as available, the Triton and
+    HIP kernels all compile, and the results are correct; the compiler just
+    open-codes every bf16 operation. Measured on an RX 6800 (gfx1030) serving
+    Qwen3.6-35B-A3B with offloaded experts, that costs ~4.8x end to end -- 5.1 tok/s
+    in bf16 against 24.1 tok/s in fp16, with the GPU pegged at 99% both times.
+    gfx11/gfx12 (RDNA3/4) and gfx90a+ (CDNA2+) all have the instructions.
+    """
+    if getattr(torch.version, "hip", None) is None:
+        return False
+    try:
+        arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+    except Exception:
+        return False
+    return re.fullmatch(r"gfx10\d\d", arch) is not None
 
 
 def parse_args(
@@ -682,6 +704,15 @@ def parse_args(
             cfg.get("torch_dtype") or cfg.get("dtype")
             or text_cfg.get("torch_dtype") or text_cfg.get("dtype") or "bfloat16"
         )
+        # Only "auto" is redirected -- an explicit --dtype bfloat16 is still honored,
+        # which is the escape hatch if a checkpoint needs bf16's exponent range.
+        if dtype_str == "bfloat16" and _gpu_lacks_bf16_hardware():
+            init_logger(__name__).warning(
+                "This GPU has no bf16 hardware, so bf16 would run emulated (~5x "
+                "slower). Resolving --dtype auto to float16; pass --dtype bfloat16 "
+                "to override."
+            )
+            dtype_str = "float16"
 
     DTYPE_MAP = {
         "float16": torch.float16,
