@@ -156,6 +156,11 @@ def _causal_conv1d_fwd_tiled_kernel(
 
     # Left context (< 0) comes from conv_states (chunk_offset==0, load_init) else zero;
     # chunk>0 always reads x.
+    # The taps are cast to fp32 before the multiply, not just accumulated into an fp32
+    # acc: left in bf16, LLVM's AMDGPU backend pairs two products into a bf16
+    # v_dot2_bf16_bf16, which only exists on gfx11+ and makes the kernel fail codegen on
+    # RDNA2 ("Cannot select: intrinsic %llvm.amdgcn.fdot2.bf16.bf16"). fp32 products are
+    # also what the reference op computes.
     for j in tl.static_range(KERNEL_WIDTH):
         if j == 0:
             w_j = w_col0
@@ -174,7 +179,7 @@ def _causal_conv1d_fwd_tiled_kernel(
         )
         mask_x = (src_local >= 0)[:, None] & (src_local < seqlen)[:, None] & mfc
         xj = tl.load(x_ptrs, mask_x, 0.0)
-        acc += w_j[None, :] * xj
+        acc += w_j[None, :].to(tl.float32) * xj.to(tl.float32)
         if HAS_INITIAL_STATES:
             if load_init_state:
                 st_idx = state_len + src_local        # 0..state_len-1 where src_local<0
@@ -184,7 +189,7 @@ def _causal_conv1d_fwd_tiled_kernel(
                 )
                 mask_s = (src_local < 0)[:, None] & mfc
                 sj = tl.load(s_ptrs, mask_s, 0.0)
-                acc += w_j[None, :] * sj
+                acc += w_j[None, :].to(tl.float32) * sj.to(tl.float32)
 
     if SILU_ACTIVATION:
         # silu(x)=x/(1+exp(-x)); exp2 lowers to the native ex2.approx SFU op (faster than the
@@ -392,7 +397,7 @@ def _causal_conv1d_update_kernel(
                 elif j == 3:
                     matrix_w = w_col3
                     matrix_x = tl.load(x_base_1d + idx_token * stride_x_token, mask=mask_x_1d)
-            acc += matrix_x * matrix_w
+            acc += matrix_x.to(tl.float32) * matrix_w.to(tl.float32)
 
         if KERNEL_WIDTH == 2:
             col0 = matrix_x
