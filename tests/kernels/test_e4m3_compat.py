@@ -38,7 +38,17 @@ _MMA_TOL = dict(rtol=5e-2, atol=0.5)
 
 
 def _native_cc() -> bool:
-    return torch.cuda.get_device_capability() >= (8, 9)
+    """Does this device have a real fp8 unit to use as the reference?
+
+    Reuses the production predicate rather than re-testing get_device_capability()
+    here: on ROCm that call reports the gfx version -- (11, 0) on gfx1100 -- which
+    compares >= (8, 9) as True, so a local tuple test would let these tests run on
+    hardware with no fp8 at all. test_forced_emu_matches_native then blocks for its
+    full 1200 s subprocess timeout instead of skipping.
+    """
+    from freetoken.kernel.triton.e4m3_compat import _device_has_native_e4m3
+
+    return _device_has_native_e4m3()
 
 
 # ======================================================================================
