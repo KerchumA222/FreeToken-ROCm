@@ -29,7 +29,7 @@
 #include <thread>
 #include <vector>
 
-#include <cuda_runtime_api.h>
+#include <freetoken/gpu_runtime.h>  // CUDA runtime API, or its hip* twin on ROCm
 #include <torch/extension.h>
 
 #if defined(__linux__)

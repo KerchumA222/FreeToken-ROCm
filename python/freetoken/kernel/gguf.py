@@ -47,11 +47,30 @@ def _c_compiler_for(cxx: str) -> str:
     cc = base.replace("g++", "gcc")
     return shutil.which(cc) or cc
 
+def _default_rocm_arch() -> str | None:
+    """The local GPU's gfx target, e.g. ``gfx1100``.
+
+    torch's cpp_extension JIT does not autodetect the arch the way tvm-ffi and
+    Triton do on Linux: with ``PYTORCH_ROCM_ARCH`` unset it builds a fat binary
+    covering every gfx target torch knows about, which turned a ~50 s single-arch
+    build of these kernels into a multi-minute one and a 50 MB .so. Default it to
+    the device actually present; an explicit env var still wins.
+    """
+    try:
+        return torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+    except Exception:
+        return None
+
+
 @functools.cache
 def _module():
     from torch.utils.cpp_extension import load
 
     is_hip = getattr(torch.version, "hip", None) is not None
+    if is_hip and not os.environ.get("PYTORCH_ROCM_ARCH"):
+        arch = _default_rocm_arch()
+        if arch:
+            os.environ["PYTORCH_ROCM_ARCH"] = arch
     # --expt-relaxed-constexpr / -ccbin are nvcc-only; HIP's clang++ rejects them.
     extra_cuda_cflags = ["-O3"] + ([] if is_hip else ["--expt-relaxed-constexpr"])
     if not is_hip:
