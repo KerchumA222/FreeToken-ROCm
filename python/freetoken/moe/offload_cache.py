@@ -724,24 +724,34 @@ class OffloadMoeCache:
         With a bounded pool this is the number that governs TTFT: prefill needs every
         expert of every layer, so it reads (1 - hit rate) of the model's expert bytes.
         """
-        if self.host_tier is None or not self.prefill_total_rows:
+        if not self.prefill_total_rows:
+            return
+        if self.host_tier is None and not self._prefill_hit_d2d_active:
             return
         hit = self.prefill_hit_rows / self.prefill_total_rows
-        logger.info(
-            "disk tier prefill: %.1f%% of expert rows from the host pool, "
-            "%.2f GiB read from disk",
-            hit * 100.0,
-            (self.prefill_total_rows - self.prefill_hit_rows)
-            * sum(self.disk_store.expert_bytes(b) for b in self.bank_schema)
-            / (1 << 30),
-        )
+        if self.host_tier is not None:
+            logger.info(
+                "disk tier prefill: %.1f%% of expert rows from the host pool, "
+                "%.2f GiB read from disk",
+                hit * 100.0,
+                (self.prefill_total_rows - self.prefill_hit_rows)
+                * sum(self.disk_store.expert_bytes(b) for b in self.bank_schema)
+                / (1 << 30),
+            )
+        else:
+            per_expert = sum(self._copy_feat_bytes_host)
+            logger.info(
+                "prefill hit-D2D: %.1f%% of expert rows already resident (gathered "
+                "device-side), %.2f GiB crossed PCIe",
+                hit * 100.0,
+                (self.prefill_total_rows - self.prefill_hit_rows) * per_expert / (1 << 30),
+            )
 
     def begin_prefill(self) -> None:
         if not self.prefill_overlap:
             return
-        if self.host_tier is not None:
-            self.prefill_hit_rows = 0
-            self.prefill_total_rows = 0
+        self.prefill_hit_rows = 0
+        self.prefill_total_rows = 0
         self._prefill_buffer_layer = [None, None]
         self._prefill_buffer_released = [True, True]
         if self.prefill_copy_stream is not None:
@@ -826,8 +836,8 @@ class OffloadMoeCache:
                 f"cache_size {self.cache_size} leaves no hit region "
                 f"(needs > {2 * self.num_experts} slots)"
             )
-        elif not self._resolve_batch_memcpy():
-            reason = "cudaMemcpyBatchAsync is unavailable"  # resolve logged the specifics
+        elif not (self._resolve_batch_memcpy() or self._copy_fused_ok):
+            reason = "neither cudaMemcpyBatchAsync nor the fused index copy is available"
         else:
             return True
         if not self._hit_d2d_fallback_logged:
@@ -844,8 +854,14 @@ class OffloadMoeCache:
                 from freetoken.kernel.batch_memcpy import load_batch_memcpy
 
                 self._batch_memcpy = load_batch_memcpy()
-            except Exception as exc:  # noqa: BLE001 -- any build/runtime gap => legacy path
-                logger.warning(f"MoE prefill hit-D2D disabled ({exc}); using full-layer copies")
+            except Exception as exc:  # noqa: BLE001 -- any build/runtime gap
+                # Not fatal to hit-D2D: the miss half falls back to the fused index
+                # copy (_prefetch_miss_index_copy), which is what happens on ROCm,
+                # where this entry point does not exist at all.
+                logger.info(
+                    f"cudaMemcpyBatchAsync unavailable ({exc}); MoE prefill misses "
+                    "will cross PCIe through the fused index copy"
+                )
                 self._batch_memcpy = False
         return self._batch_memcpy is not False
 
@@ -899,6 +915,10 @@ class OffloadMoeCache:
                 run_starts = np.concatenate(([0], np.nonzero(np.diff(miss) != 1)[0] + 1))
                 starts = miss[run_starts]
                 lengths = np.diff(np.concatenate((run_starts, [miss.size])))
+            if not self._resolve_batch_memcpy():
+                self._prefetch_miss_index_copy(layer_id, buffer_id, miss)
+                self.prefill_ready_events[buffer_id].record(self.prefill_copy_stream)
+                return
             dst, src, nbytes = [], [], []
             for b, feat in enumerate(self._copy_feat_bytes_host):
                 if feat < _SMALL_BANK_FEAT_BYTES:
@@ -920,6 +940,35 @@ class OffloadMoeCache:
                     torch.cuda.current_stream(self.device).cuda_stream,
                 )
             self.prefill_ready_events[buffer_id].record(self.prefill_copy_stream)
+
+    def _prefetch_miss_index_copy(self, layer_id: int, buffer_id: int, miss) -> None:
+        """Cross PCIe with the fused index copy instead of cudaMemcpyBatchAsync.
+
+        The batch API is a CUDA >= 12.8 driver entry point and has no ROCm
+        equivalent, so hit-D2D was unreachable on AMD and every prefill streamed
+        whole layers -- all of the model's expert bytes, on every prefill, however
+        much of the layer the slot cache already held. The miss rows are exactly the
+        gather ``copy_missing`` already performs each decode step (host bank ->
+        slot cache, indexed), so the same kernel serves here with the buffer's slot
+        range as the destination. It needs no coalescing into runs: the kernel
+        indexes rows directly, which is why this path drops the small-bank
+        whole-layer special case the batch API's async floor required.
+        """
+        from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
+
+        if miss.size == 0:
+            return
+        src_idx = torch.as_tensor(miss, dtype=torch.int32).to(self.device, non_blocking=True)
+        dst_idx = src_idx + buffer_id * self.num_experts
+        n = torch.tensor([miss.size], dtype=torch.int64, device=self.device)
+        fast_index_copy_multi_jit(
+            self._copy_dst_ptrs,
+            self._copy_src_ptrs[layer_id],
+            self._copy_feat_bytes,
+            dst_idx,
+            src_idx,
+            n,
+        )
 
     def wait_prefill_layer(self, layer_id: int) -> tuple[torch.Tensor, ...]:
         """Full-layer ``[num_experts, ...]`` bank views for ``layer_id``, one per
@@ -945,7 +994,7 @@ class OffloadMoeCache:
             self.prefill_release_events[buffer_id].record(torch.cuda.current_stream(self.device))
             self._prefill_buffer_has_release_event[buffer_id] = True
         self._prefill_buffer_released[buffer_id] = True
-        if self.host_tier is not None and layer_id == self.num_layers - 1:
+        if layer_id == self.num_layers - 1:
             self.log_prefill_split()
 
     def ensure_experts(self, layer_id: int, expert_ids: torch.Tensor) -> None:
