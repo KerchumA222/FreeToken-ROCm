@@ -266,9 +266,41 @@ def bank_bytes_estimate(model_config, method=None) -> int | None:
     experts = getattr(model_config, "num_experts", None)
     hidden = getattr(model_config, "hidden_size", None)
     inter = getattr(model_config, "moe_intermediate_size", None)
-    if per_expert is None or not all((layers, experts, hidden, inter)):
+    if not all((layers, experts, hidden, inter)):
+        return None
+    if fmt == "q4_0":
+        # "q4_0" tags native GGUF block bytes generally, not the Q4_0 type: the real
+        # per-bank ggml type rides the quant dialect. The table's 18-bytes-per-32 is
+        # exact for Q4_0 and Q4_K alike, but a Q8_0 checkpoint packs 34, so sizing it
+        # from the tag alone would under-budget the banks by 1.9x.
+        exact = _gguf_bytes_per_expert(model_config, hidden, inter)
+        if exact is not None:
+            return layers * experts * exact
+    if per_expert is None:
         return None
     return layers * experts * per_expert(hidden, inter)
+
+
+def _gguf_bytes_per_expert(model_config, hidden: int, inter: int) -> int | None:
+    """Host bytes of one expert's GGUF banks, from the dialect's resolved bank types.
+    ``None`` when the config carries neither (a pre-dialect caller), leaving the
+    format-tag estimate in place."""
+    from freetoken.models.gguf.dequant import GGML_NAME, row_bytes
+
+    quant = getattr(model_config, "quant", None)
+    scheme = quant.scheme_for("model.layers.0.mlp.experts") if quant is not None else None
+    if scheme is not None:
+        by_name = {name: t for t, name in GGML_NAME.items()}
+        names = scheme.weight.elem.split("+")
+        gate_up, down = (names * 2)[:2] if len(names) == 1 else names[:2]
+        types = {"gate_up": by_name[gate_up], "down": by_name[down]}
+    else:
+        types = getattr(model_config, "gguf_expert_bank_types", None)
+        if types is None:
+            return None
+    return 2 * inter * row_bytes(hidden, types["gate_up"]) + hidden * row_bytes(
+        inter, types["down"]
+    )
 
 
 def load_expert_banks(

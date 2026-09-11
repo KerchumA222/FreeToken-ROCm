@@ -25,7 +25,30 @@ from .weight import (
 
 # Official FP8 checkpoints share qwen3_5_moe's block-fp8 expert layout (same
 # model.language_model.layers.* keys), so reuse its expert reader.
-from freetoken.models.qwen3_5_moe.weight import iter_expert_pieces
+from freetoken.models.qwen3_5_moe.weight import iter_expert_pieces as _iter_expert_pieces_hf
+
+# The GGUF routed experts are stored under the same ``blk.N.ffn_*_exps.weight`` names
+# and read through the same per-layer banks as qwen3_5_moe's, and those readers key on
+# nothing model-specific (the tensor names, the config's dims, and the bank types off
+# the quant dialect), so they are reused rather than restated.
+from freetoken.models.qwen3_5_moe.gguf import (
+    dummy_q4_0_expert_sources,
+    iter_gguf_expert_pieces,
+    load_q4_0_expert_sources,
+)
+
+
+def iter_expert_pieces(model_path, config, kind, **kwargs):
+    """Routed-expert pieces for every storage form this family reads.
+
+    GGUF keeps its experts in llama.cpp's block layout, which upstream's readers do
+    not cover; every other kind falls through to them unchanged.
+    """
+    from freetoken.layers.quantization import QuantKind
+
+    if kind is QuantKind.GGUF:
+        return iter_gguf_expert_pieces(model_path, config, **kwargs)
+    return _iter_expert_pieces_hf(model_path, config, kind, **kwargs)
 
 __all__ = [
     "ftw_side_files",
@@ -39,4 +62,6 @@ __all__ = [
     "parse_gguf_config",
     "gguf_module_types",
     "iter_gguf_weights",
+    "load_q4_0_expert_sources",
+    "dummy_q4_0_expert_sources",
 ]

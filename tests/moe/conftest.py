@@ -63,3 +63,35 @@ def expected_expert(tiny_gguf):
         return d[e].reshape(-1)
 
     return get
+
+
+@pytest.fixture(scope="session")
+def split_gguf(tmp_path_factory):
+    """The same model as :func:`tiny_gguf`, written as a llama.cpp split set.
+
+    One file per layer, named with the ``-00001-of-0000N.gguf`` convention the reader
+    resolves. Every shard carries its own tensor table with its own ``data_offset``
+    base, which is what makes a split set able to catch address arithmetic that
+    conflates "the offset" with "the file the offset is in".
+    """
+    d = tmp_path_factory.mktemp("gguf_split")
+    payload = {}
+    for layer in range(L):
+        path = d / f"experts-{layer + 1:05d}-of-{L:05d}.gguf"
+        w = gguf.GGUFWriter(str(path), "qwen35moe")
+        if layer == 0:  # shard 1 carries the model KV
+            w.add_uint32("qwen35moe.expert_count", E)
+        for i, (suffix, rows, n_fast) in enumerate((
+            ("ffn_gate_exps.weight", E * I, H),
+            ("ffn_up_exps.weight", E * I, H),
+            ("ffn_down_exps.weight", E * H, I),
+        )):
+            data = _blocks(rows, n_fast, seed=100 + layer * 10 + i)
+            name = f"blk.{layer}.{suffix}"
+            payload[name] = data
+            w.add_tensor(name, data, raw_dtype=gguf.GGMLQuantizationType.Q4_0)
+        w.write_header_to_file()
+        w.write_kv_data_to_file()
+        w.write_tensors_to_file()
+        w.close()
+    return str(d / f"experts-00001-of-{L:05d}.gguf"), payload
