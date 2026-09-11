@@ -399,6 +399,13 @@ def iter_gguf_weights(
     n_k = int(md[f"{_ARCH}.ssm.group_count"])
     d_v = int(md[f"{_ARCH}.ssm.inner_size"]) // n_v
     d_k = int(md[f"{_ARCH}.ssm.state_size"])
+    # Confirmed against llama.cpp's converter rather than inferred from the ratio:
+    # qwen4exp's Qwen4ExpTextModel derives from _LinearAttentionVReorderBase, the same
+    # base qwen35moe uses, which rewrites the V heads from HF's grouped order
+    # [G0_v0..v{r-1}, G1_v0..] into ggml's tiled order [G0_v0, G1_v0, .., G0_v1, ..] so
+    # that ggml_repeat can pair them. It reorders exactly the tensors permuted below --
+    # in_proj_qkv (V rows only), in_proj_z, in_proj_a/b, A_log, dt_bias, conv1d (V
+    # channels only) and out_proj (columns) -- and this permutation is its inverse.
     v_perm = _v_head_permutation(n_v, n_k)
     key_dim = n_k * d_k
 
