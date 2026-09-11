@@ -76,6 +76,19 @@ _EXPERT_SUFFIXES = ("ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps
 # does here (Q4_K: 273 MiB packed against 970 MiB dequantized).
 _PACKABLE_DENSE = ("output.weight", "token_embd.weight")
 
+# Per-layer projections servable from their packed blocks. Deliberately excludes
+# everything the GDN head-order fix touches: a row permutation is fine on packed
+# data (rows are whole quant blocks) but ssm_out needs its *columns* reordered, and
+# columns live inside a block. Those stay on the bf16 path until the permutation
+# moves out of the weight and into the kernel output. See _v_head_permutation.
+_PACKABLE_LAYER = (
+    "attn_q", "attn_k", "attn_v", "attn_output",
+    "ffn_gate_shexp", "ffn_up_shexp", "ffn_down_shexp",
+)
+# fused module -> (slot name, gguf tensor) in concat order
+_PACKED_QKV = (("q", "attn_q"), ("k", "attn_k"), ("v", "attn_v"))
+_PACKED_SHEXP = (("gate", "ffn_gate_shexp"), ("up", "ffn_up_shexp"))
+
 
 def _is_packable(ggml_type: int) -> bool:
     """Whether the vendored kernels can multiply this type without dequantizing.
@@ -213,8 +226,13 @@ def _dense_types(model_path: str) -> dict[str, int]:
     """
     out: dict[str, int] = {}
     for t in iter_gguf_tensors(model_path):
-        if t.name in _PACKABLE_DENSE and _is_packable(t.ggml_type):
+        if not _is_packable(t.ggml_type):
+            continue
+        if t.name in _PACKABLE_DENSE:
             out[t.name] = t.ggml_type
+        elif t.name.startswith("blk."):
+            if t.name.split(".", 2)[2].rsplit(".weight", 1)[0] in _PACKABLE_LAYER:
+                out[t.name] = t.ggml_type
     return out
 
 
@@ -291,6 +309,13 @@ def iter_gguf_weights(
 
     md = load_gguf_metadata(model_path)
     interval = int(md.get("qwen35moe.full_attention_interval", 4))
+    # Which tensors this checkpoint lets us hand over packed. A fused module is only
+    # packed when *every* slot is (GgufColSplits holds one GGUFLinear per slot), so
+    # the decision is per group, not per tensor.
+    dtypes = _dense_types(model_path)
+
+    def packed_group(layer: int, slots) -> bool:
+        return all(f"blk.{layer}.{g}.weight" in dtypes for _, g in slots)
 
     # GQA head-order fix for the linear-attention (GDN) layers -- see
     # _v_head_permutation. Everything indexed by value head moves together: the v part
@@ -364,10 +389,14 @@ def iter_gguf_weights(
                 continue
             proj = suffix.rsplit(".weight", 1)[0]
             if proj in _QKV_SLOTS and _is_full_attention(layer, interval):
-                yield from feed_fused(
-                    layer, "qkv", _QKV_SLOTS, proj, _to_bf16(t),
-                    stem + "self_attn.qkv_proj.weight",
-                )
+                if packed_group(layer, _PACKED_QKV):
+                    slot = next(n for n, g in _PACKED_QKV if g == proj)
+                    yield f"{stem}self_attn.qkv_proj.{slot}.qweight", t.packed()
+                else:
+                    yield from feed_fused(
+                        layer, "qkv", _QKV_SLOTS, proj, _to_bf16(t),
+                        stem + "self_attn.qkv_proj.weight",
+                    )
                 continue
             if proj in _IN_PROJ_SLOTS and not _is_full_attention(layer, interval):
                 val = _to_bf16(t)
@@ -389,14 +418,21 @@ def iter_gguf_weights(
                 yield stem + "linear_attn.out_proj.weight", _to_bf16(t)[:, cols].contiguous()
                 continue
             if proj in ("ffn_gate_shexp", "ffn_up_shexp"):
-                yield from feed_fused(
-                    layer, "shexp", ("ffn_gate_shexp", "ffn_up_shexp"), proj, _to_bf16(t),
-                    stem + "mlp.shared_expert.gate_up_proj.weight",
-                )
+                if packed_group(layer, _PACKED_SHEXP):
+                    slot = next(n for n, g in _PACKED_SHEXP if g == proj)
+                    yield f"{stem}mlp.shared_expert.gate_up_proj.{slot}.qweight", t.packed()
+                else:
+                    yield from feed_fused(
+                        layer, "shexp", ("ffn_gate_shexp", "ffn_up_shexp"), proj, _to_bf16(t),
+                        stem + "mlp.shared_expert.gate_up_proj.weight",
+                    )
                 continue
             rel = _SUFFIX_MAP.get(suffix)
             if rel is not None:
-                yield stem + rel, _to_bf16(t)
+                if name in dtypes and proj in _PACKABLE_LAYER:
+                    yield stem + rel.rsplit(".weight", 1)[0] + ".qweight", t.packed()
+                else:
+                    yield stem + rel, _to_bf16(t)
 
     leftovers = sorted(fuse)
     assert not leftovers, f"incomplete fused groups: {leftovers}"
@@ -519,3 +555,55 @@ __all__ = [
     "load_q4_0_expert_sources",
     "dummy_q4_0_expert_sources",
 ]
+
+
+def convert_dense_to_gguf(model, config) -> None:
+    """In place: swap the dense projections this checkpoint stores quantized for
+    modules that read the packed blocks directly.
+
+    Only the projections listed in ``_PACKABLE_LAYER`` are touched -- the GDN fused
+    ``in_proj`` and ``ssm_out`` keep their bf16 modules because the head-order fix
+    permutes them (see ``_PACKABLE_LAYER``). Anything the checkpoint left
+    unquantized, or a fused group whose slots are not all quantized, keeps its dense
+    module and the loader keeps feeding it bf16, so this degrades per tensor rather
+    than all-or-nothing.
+    """
+    from freetoken.layers.gguf import GGUFLinear, GgufColSplits
+
+    types = getattr(config, "gguf_dense_types", None)
+    if not types:
+        return
+    _require_tp1("packed dense projections")
+    interval = int(getattr(config, "full_attention_interval", 4) or 4)
+
+    def qt(layer: int, gguf_name: str) -> int | None:
+        return types.get(f"blk.{layer}.{gguf_name}.weight")
+
+    def swap_single(owner, attr, layer: int, gguf_name: str) -> None:
+        t = qt(layer, gguf_name)
+        if t is None or owner is None or not hasattr(owner, attr):
+            return
+        lin = getattr(owner, attr)
+        out_features, in_features = lin.weight.shape
+        setattr(owner, attr, GGUFLinear(in_features, out_features, t))
+
+    def swap_fused(owner, attr, layer: int, slots, out_sizes) -> None:
+        if owner is None or not hasattr(owner, attr):
+            return
+        ts = [qt(layer, g) for _, g in slots]
+        if any(t is None for t in ts):
+            return                      # mixed group: keep the fused bf16 module
+        in_features = getattr(owner, attr).weight.shape[1]
+        parts = [(n, o, t) for (n, _), o, t in zip(slots, out_sizes, ts)]
+        setattr(owner, attr, GgufColSplits(in_features, parts))
+
+    shexp_i = int(config.shared_expert_intermediate_size)
+    for lid, layer in enumerate(model.model.layers.op_list):
+        if _is_full_attention(lid, interval):
+            attn = getattr(layer, "self_attn", None)
+            if attn is not None:
+                swap_fused(attn, "qkv_proj", lid, _PACKED_QKV, attn._qkv_split)
+                swap_single(attn, "o_proj", lid, "attn_output")
+        shexp = getattr(getattr(layer, "mlp", None), "shared_expert", None)
+        swap_fused(shexp, "gate_up_proj", lid, _PACKED_SHEXP, [shexp_i, shexp_i])
+        swap_single(shexp, "down_proj", lid, "ffn_down_shexp")
