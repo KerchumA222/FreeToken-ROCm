@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import functools
+
 import torch
 import triton
 import triton.language as tl
@@ -224,6 +226,25 @@ def _qsa_merge_splitk_kernel(
     )
 
 
+_MIN_BLOCK_N = 16
+
+
+@functools.lru_cache(maxsize=None)
+def _smem_budget(device_index: int | None) -> int:
+    """Per-block shared-memory budget in bytes, 0 when unknown.
+
+    CUDA exposes an opt-in ceiling above the default 48 KB; ROCm reports only
+    ``shared_memory_per_block`` (64 KB of LDS on RDNA), so take whichever the
+    platform offers.
+    """
+    props = torch.cuda.get_device_properties(device_index)
+    for attr in ("shared_memory_per_block_optin", "shared_memory_per_block"):
+        value = int(getattr(props, attr, 0) or 0)
+        if value:
+            return value
+    return 0
+
+
 def qsa_sparse_paged_attention(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -276,6 +297,20 @@ def qsa_sparse_paged_attention(
         block_n, target_splits, partial_warps = 64, 4, 2
     else:
         block_n, target_splits, partial_warps = 64, 1, 2
+
+    # Those profiles were tuned on GB300, which has 228 KB of shared memory per SM.
+    # The kernel stages q and the k/v tiles, roughly (block_m + 2 * block_n) *
+    # head_dim * 2 bytes, so the 64-wide tile over this model's head_dim of 256 asks
+    # for 66 KB -- past RDNA's 64 KB of LDS, and the launch fails outright rather than
+    # spilling. Narrow the tile until it fits; the split count is a scheduling choice
+    # and is left alone.
+    budget = _smem_budget(q.device.index) * 0.8  # headroom for scores/acc/scratch
+    if budget:
+        while (
+            block_n > _MIN_BLOCK_N
+            and (block_m + 2 * block_n) * head_dim * 2 > budget
+        ):
+            block_n //= 2
 
     num_tiles = triton.cdiv(logical_indices.shape[1], block_n)
     # Avoid empty splits when the selection width is smaller than the profile.
