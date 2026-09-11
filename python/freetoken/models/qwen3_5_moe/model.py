@@ -154,6 +154,10 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
                 tie_word_embeddings=config.tie_word_embeddings,
                 tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
             )
+        if getattr(config, "gguf_dense_types", None):
+            from .gguf import convert_dense_to_gguf
+
+            convert_dense_to_gguf(self, config)
         super().__init__()
 
     def forward(self) -> torch.Tensor:
