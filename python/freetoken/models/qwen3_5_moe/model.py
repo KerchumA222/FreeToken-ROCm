@@ -88,6 +88,13 @@ class Qwen3_5Model(BaseOP):
         return x
 
 
+def _gguf_lm_head_type(config) -> int | None:
+    """The lm head's ggml type when the GGUF loader can serve it packed, else None."""
+    if config.tie_word_embeddings:
+        return None
+    return (getattr(config, "gguf_dense_types", None) or {}).get("output.weight")
+
+
 class Qwen3_5MoEForCausalLM(BaseLLMModel):
     def __init__(self, config: ModelConfig):
         self.model = Qwen3_5Model(config)
@@ -99,6 +106,23 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
             assert not config.tie_word_embeddings, "NVFP4 lm_head assumes untied embeddings"
             self.lm_head = Nvfp4LMHead(
                 num_embeddings=config.vocab_size, embedding_dim=config.hidden_size
+            )
+        elif _gguf_lm_head_type(config) is not None:
+            # Same reasoning as the NVFP4 branch, for a GGUF checkpoint: keep the
+            # [vocab, hidden] matrix in its packed blocks and dequantize inside the
+            # MMVQ kernel. Measured on an RX 6800 it is 9.23 ms/token as an fp16
+            # rocBLAS GEMV against 1.09 ms packed -- the largest single dense kernel
+            # in the model by a wide margin.
+            from freetoken.layers.gguf import GgufLMHead
+
+            assert not config.tie_word_embeddings, (
+                "packed-GGUF lm_head assumes untied embeddings (a tied head shares "
+                "embed_tokens, which stays on the bf16 embedding path)"
+            )
+            self.lm_head = GgufLMHead(
+                num_embeddings=config.vocab_size,
+                embedding_dim=config.hidden_size,
+                quant_type=_gguf_lm_head_type(config),
             )
         else:
             self.lm_head = ParallelLMHead(
