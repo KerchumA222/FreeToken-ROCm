@@ -114,3 +114,82 @@ def test_single_threaded_path_matches_the_pooled_one(store, expected_expert):
     with HostExpertCache(store, E, capacity=E * L, pin=False, workers=1) as c:
         experts = list(range(E))
         _check(c, expected_expert, 2, experts, c.ensure(2, experts))
+
+
+def test_residency_split_reports_what_prefill_can_reuse(store):
+    with HostExpertCache(store, E, capacity=E * L, pin=False) as c:
+        c.ensure(1, [0, 2])
+        hit_e, hit_s, miss = c.residency_split(1, E)
+        assert hit_e == [0, 2]
+        assert hit_s == [c.slot_of(1, 0), c.slot_of(1, 2)]
+        assert miss == [1, 3]
+        # a different layer shares nothing
+        assert c.residency_split(0, E) == ([], [], list(range(E)))
+
+
+def test_residency_split_does_not_change_recency(store):
+    """It answers what prefill *could* take, which is not a use of those entries --
+    if it bumped recency, a prefill scan would reorder the whole decode LRU."""
+    with HostExpertCache(store, E, capacity=2, pin=False) as c:
+        c.ensure(0, [0])
+        c.ensure(0, [1])          # 1 is the most recent
+        c.residency_split(0, E)   # must not promote 0
+        c.ensure(0, [2])          # evicts the LRU, which should still be 0
+        assert c.slot_of(0, 0) == MISS
+        assert c.slot_of(0, 1) != MISS
+
+
+def test_read_into_bypasses_the_pool(store, expected_expert):
+    """Prefill reads through the tier without admitting: admitting a whole layer
+    would evict everything decode depends on and leave only the last layer."""
+    import torch
+
+    with HostExpertCache(store, E, capacity=E * L, pin=False) as c:
+        c.ensure(0, [0])
+        before = c.resident
+        experts = [1, 2, 3]
+        dst = {
+            name: torch.empty((len(experts), *c.banks[name].shape[1:]), dtype=torch.uint8)
+            for name in c.banks
+        }
+        c.read_into(0, experts, dst)
+        assert c.resident == before                      # nothing admitted
+        for name in c.banks:
+            for i, e in enumerate(experts):
+                assert np.array_equal(
+                    dst[name][i].numpy().reshape(-1), expected_expert(name, 0, e)
+                )
+                assert c.slot_of(0, e) == MISS
+
+
+def test_admit_free_fills_a_cold_pool(store, expected_expert):
+    with HostExpertCache(store, E, capacity=E * L, pin=False) as c:
+        admitted = c.admit_free(0, list(range(E)))
+        assert [e for e, _ in admitted] == list(range(E))
+        for e, slot in admitted:
+            assert c.slot_of(0, e) == slot
+            for bank in ("gate_up", "down"):
+                assert np.array_equal(
+                    c.banks[bank][slot].numpy().reshape(-1), expected_expert(bank, 0, e)
+                )
+
+
+def test_admit_free_never_evicts(store):
+    """A warm pool must survive a prefill scan: admitting with eviction would churn
+    what decode just warmed, on every turn of a conversation."""
+    with HostExpertCache(store, E, capacity=2, pin=False) as c:
+        c.ensure(0, [0, 1])                     # pool is now full
+        before = {(0, 0): c.slot_of(0, 0), (0, 1): c.slot_of(0, 1)}
+        admitted = c.admit_free(1, list(range(E)))
+        assert admitted == []                   # nothing free, so nothing admitted
+        assert c.slot_of(0, 0) == before[(0, 0)]
+        assert c.slot_of(0, 1) == before[(0, 1)]
+        assert c.stats.evictions == 0
+
+
+def test_admit_free_takes_only_what_is_free(store):
+    with HostExpertCache(store, E, capacity=3, pin=False) as c:
+        c.ensure(0, [0])                        # 1 used, 2 free
+        admitted = c.admit_free(1, [5 % E, 2, 3])
+        assert len(admitted) == 2
+        assert c.resident == 3

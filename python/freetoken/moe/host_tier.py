@@ -192,6 +192,89 @@ class HostExpertCache:
             self.stats.reads += len(self.banks)
         return slots
 
+    def read_into(self, layer: int, experts: Sequence[int], dst: dict) -> None:
+        """Read these experts straight into ``dst[bank][i]``, bypassing the pool.
+
+        Prefill streams a whole layer. Admitting all of it would evict everything the
+        pool holds for decode and leave only the last layer behind, so prefill reads
+        *through* the tier without disturbing residency. Reads are issued concurrently
+        for the same reason :meth:`ensure` does -- the cost is round trips, not bytes.
+        """
+        jobs = [
+            (i, int(e), name)
+            for i, e in enumerate(experts)
+            for name in self.banks
+        ]
+        if not jobs:
+            return
+
+        def fill(job: tuple[int, int, str]) -> None:
+            i, expert, name = job
+            self.store.read_expert(name, layer, expert, dst[name][i].numpy())
+
+        if self._pool is not None and len(jobs) > 1:
+            list(self._pool.map(fill, jobs))
+        else:
+            for job in jobs:
+                fill(job)
+        self.stats.reads += len(jobs)
+
+    def admit_free(self, layer: int, experts: Sequence[int]) -> list[tuple[int, int]]:
+        """Admit as many of ``experts`` as there are FREE slots, never evicting.
+
+        Prefill touches every expert of every layer, so admitting it with eviction
+        would churn the pool decode just warmed -- on every turn of a conversation.
+        Filling only free slots gets the opposite of both bad outcomes: a cold pool is
+        warmed by the first prefill (which otherwise reads 100% from disk however big
+        the pool is), and a warm pool is left exactly as decode left it.
+
+        Returns the ``(expert, slot)`` pairs admitted, in claim order.
+        """
+        claims: list[tuple[int, int]] = []
+        for e in experts:
+            if not self._free:
+                break
+            claims.append((int(e), self._free.pop()))
+        if not claims:
+            return []
+
+        jobs = [(e, slot, name) for e, slot in claims for name in self.banks]
+
+        def fill(job: tuple[int, int, str]) -> None:
+            expert, slot, name = job
+            self.store.read_expert(name, layer, expert, self.banks[name][slot].numpy())
+
+        if self._pool is not None and len(jobs) > 1:
+            list(self._pool.map(fill, jobs))
+        else:
+            for job in jobs:
+                fill(job)
+
+        for e, slot in claims:
+            fid = self._fid(layer, e)
+            self._lru[fid] = slot
+            self._id_of_slot[slot] = fid
+        self.stats.reads += len(jobs)
+        return claims
+
+    def residency_split(self, layer: int, num_experts: int) -> tuple[list[int], list[int], list[int]]:
+        """``(hit_experts, hit_slots, missing_experts)`` for a whole layer.
+
+        Lookups do not change recency: this is a query about what prefill can take
+        from the pool, not a use of those entries.
+        """
+        hit_e: list[int] = []
+        hit_s: list[int] = []
+        miss: list[int] = []
+        for e in range(num_experts):
+            slot = self._lru.get(self._fid(layer, e), MISS)
+            if slot == MISS:
+                miss.append(e)
+            else:
+                hit_e.append(e)
+                hit_s.append(slot)
+        return hit_e, hit_s, miss
+
     # ---- lifecycle ------------------------------------------------------------
 
     def reset(self) -> None:

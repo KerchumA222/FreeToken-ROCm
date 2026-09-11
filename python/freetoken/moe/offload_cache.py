@@ -142,6 +142,7 @@ class OffloadMoeCache:
         self.host_tier = None
         self.disk_store = None
         self._stage: dict[str, list[torch.Tensor]] = {}
+        self._stage_idx: list[dict] = []
         # MoE layer ids whose decode runs on the CPU executor; the rest use the GPU
         # offload/PCIe path. Set by the engine after construction (empty = all-GPU,
         # all layers = the plain --moe-backend cpu case).
@@ -391,17 +392,86 @@ class OffloadMoeCache:
                 alloc_pinned_tensor(self.num_experts, rows, row_bytes, dtype=head.dtype)
                 for _ in range(2)
             ]
+        # Index tensors for the hit/miss gathers, per buffer: the kernel reads them
+        # asynchronously, so buffer N's indices must not be rewritten while buffer N's
+        # copy is still in flight. Same lifetime rule as the staging buffers.
+        self._stage_idx = [
+            {
+                "hit_dst": torch.empty(self.num_experts, dtype=torch.int32, device=self.device),
+                "hit_src": torch.empty(self.num_experts, dtype=torch.int32, device=self.device),
+                "miss_dst": torch.empty(self.num_experts, dtype=torch.int32, device=self.device),
+                "miss_src": torch.arange(self.num_experts, dtype=torch.int32, device=self.device),
+                "n_hit": torch.zeros(1, dtype=torch.int64, device=self.device),
+                "n_miss": torch.zeros(1, dtype=torch.int64, device=self.device),
+            }
+            for _ in range(2)
+        ]
         total = sum(t.numel() for ts in self._stage.values() for t in ts)
         logger.info(
             "disk tier: prefill staging %.2f GiB (2 layers x %d banks)",
             total / (1 << 30), len(self.bank_schema),
         )
 
-    def _stage_prefill_layer(self, name: str, layer_id: int, buffer_id: int) -> torch.Tensor:
-        """Read a whole layer of ``name`` off disk into staging and return the buffer."""
-        stage = self._stage[name][buffer_id]
-        self.disk_store.read_layer(name, layer_id, stage.numpy())
-        return stage
+    def _fill_prefill_buffer_from_tier(self, layer_id: int, buffer_id: int) -> None:
+        """Fill this layer's prefill double buffer from the host tier plus disk.
+
+        Prefill wants a whole layer, but the pool already holds a good fraction of it,
+        and re-reading those experts is the single largest cost of a disk-backed tier
+        (a naive whole-layer stage re-reads every expert in the model on every
+        prefill). So split it: gather the resident experts out of the pool and read
+        only the remainder off disk. Both halves land in the buffer through the same
+        indexed-copy kernel decode uses, one launch per bank per half, so the scatter
+        costs no more than the contiguous copy it replaces.
+        """
+        from freetoken.kernel import fast_index_copy_jit
+
+        tier, idx = self.host_tier, self._stage_idx[buffer_id]
+        hit_e, hit_s, miss = tier.residency_split(layer_id, self.num_experts)
+        # Park what we are about to read in any free slots rather than throwing it
+        # away: an unadmitted prefill leaves a cold pool cold, so the first requests
+        # read 100% from disk no matter how large the pool is. Free slots only -- see
+        # admit_free.
+        admitted = tier.admit_free(layer_id, miss)
+        if admitted:
+            taken = {e for e, _ in admitted}
+            hit_e += [e for e, _ in admitted]
+            hit_s += [slot for _, slot in admitted]
+            miss = [e for e in miss if e not in taken]
+        n_hit, n_miss = len(hit_e), len(miss)
+        # Same counters the GPU-tier hit/miss split reports through
+        # decode_miss_stats: rows served without re-fetching, over rows needed.
+        self.prefill_hit_rows += n_hit
+        self.prefill_total_rows += self.num_experts
+
+        if n_miss:
+            tier.read_into(
+                layer_id, miss, {n: self._stage[n][buffer_id] for n in self.bank_schema}
+            )
+            idx["miss_dst"][:n_miss].copy_(
+                torch.tensor(miss, dtype=torch.int32), non_blocking=False
+            )
+        if n_hit:
+            idx["hit_dst"][:n_hit].copy_(
+                torch.tensor(hit_e, dtype=torch.int32), non_blocking=False
+            )
+            idx["hit_src"][:n_hit].copy_(
+                torch.tensor(hit_s, dtype=torch.int32), non_blocking=False
+            )
+        idx["n_hit"].fill_(n_hit)
+        idx["n_miss"].fill_(n_miss)
+
+        for name, buffer in zip(self.bank_schema, self.prefill_bank_buffers):
+            dst = buffer[buffer_id]
+            if n_hit:
+                fast_index_copy_jit(
+                    dst, idx["hit_dst"], self.bank_sources[name][0], idx["hit_src"],
+                    idx["n_hit"],
+                )
+            if n_miss:
+                fast_index_copy_jit(
+                    dst, idx["miss_dst"], self._stage[name][buffer_id], idx["miss_src"],
+                    idx["n_miss"],
+                )
 
     def _build_copy_plan(self) -> None:
         """Precompute the fused multi-bank copy descriptor (base addrs + per-row bytes).
@@ -648,9 +718,30 @@ class OffloadMoeCache:
         # ensure_experts evicts them first.
         self.usage[slot_start:slot_end].zero_()
 
+    def log_prefill_split(self) -> None:
+        """Report how much of prefill came from the pool rather than disk.
+
+        With a bounded pool this is the number that governs TTFT: prefill needs every
+        expert of every layer, so it reads (1 - hit rate) of the model's expert bytes.
+        """
+        if self.host_tier is None or not self.prefill_total_rows:
+            return
+        hit = self.prefill_hit_rows / self.prefill_total_rows
+        logger.info(
+            "disk tier prefill: %.1f%% of expert rows from the host pool, "
+            "%.2f GiB read from disk",
+            hit * 100.0,
+            (self.prefill_total_rows - self.prefill_hit_rows)
+            * sum(self.disk_store.expert_bytes(b) for b in self.bank_schema)
+            / (1 << 30),
+        )
+
     def begin_prefill(self) -> None:
         if not self.prefill_overlap:
             return
+        if self.host_tier is not None:
+            self.prefill_hit_rows = 0
+            self.prefill_total_rows = 0
         self._prefill_buffer_layer = [None, None]
         self._prefill_buffer_released = [True, True]
         if self.prefill_copy_stream is not None:
@@ -689,13 +780,11 @@ class OffloadMoeCache:
 
         def copy() -> None:
             self._invalidate_prefill_buffer(buffer_id)
-            for name, (per_layer, _), buffer in zip(
-                self.bank_schema, self.banks, self.prefill_bank_buffers
-            ):
-                src = per_layer[layer_id]
-                if self.host_tier is not None:
-                    src = self._stage_prefill_layer(name, layer_id, buffer_id)
-                buffer[buffer_id].copy_(src, non_blocking=True)
+            if self.host_tier is not None:
+                self._fill_prefill_buffer_from_tier(layer_id, buffer_id)
+                return
+            for (per_layer, _), buffer in zip(self.banks, self.prefill_bank_buffers):
+                buffer[buffer_id].copy_(per_layer[layer_id], non_blocking=True)
 
         if self._prefill_hit_d2d_active:
             self._prefetch_split(layer_id, buffer_id)
@@ -856,6 +945,8 @@ class OffloadMoeCache:
             self.prefill_release_events[buffer_id].record(torch.cuda.current_stream(self.device))
             self._prefill_buffer_has_release_event[buffer_id] = True
         self._prefill_buffer_released[buffer_id] = True
+        if self.host_tier is not None and layer_id == self.num_layers - 1:
+            self.log_prefill_split()
 
     def ensure_experts(self, layer_id: int, expert_ids: torch.Tensor) -> None:
         from freetoken.moe.offload_kernels import ensure_experts
