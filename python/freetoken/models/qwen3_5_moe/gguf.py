@@ -236,6 +236,57 @@ def _dense_types(model_path: str) -> dict[str, int]:
     return out
 
 
+def gguf_module_types(model_path: str) -> dict[str, tuple[str, ...]]:
+    """FreeToken module prefix -> ggml type per fused slot, for the modules we serve packed.
+
+    This is the GGUF side of the ``gguf`` quant dialect: it is the only place that
+    knows both namings, so it resolves ggml tensor names into FreeToken module paths
+    here rather than expressing the translation as NameMap rules.
+
+    A fused module is only listed when *every* slot is a type the kernels implement --
+    there is no kernel for half a packed fusion, so a partial group stays bf16.
+    """
+    from freetoken.models.gguf.dequant import GGML_NAME
+
+    interval = int(load_gguf_metadata(model_path).get("qwen35moe.full_attention_interval", 4))
+    by_layer: dict[int, dict[str, int]] = {}
+    globals_: dict[str, int] = {}
+    for t in iter_gguf_tensors(model_path):
+        if not _is_packable(t.ggml_type):
+            continue
+        if t.name in ("output.weight", "token_embd.weight"):
+            globals_[t.name] = t.ggml_type
+        elif t.name.startswith("blk."):
+            layer = int(t.name.split(".")[1])
+            by_layer.setdefault(layer, {})[t.name.split(".", 2)[2]] = t.ggml_type
+
+    name = GGML_NAME.__getitem__
+    out: dict[str, tuple[str, ...]] = {}
+    if "output.weight" in globals_:
+        out["lm_head"] = (name(globals_["output.weight"]),)
+    if "token_embd.weight" in globals_:
+        out["model.embed_tokens"] = (name(globals_["token_embd.weight"]),)
+
+    def add(prefix: str, types: list[int | None]) -> None:
+        if types and all(t is not None for t in types):
+            out[prefix] = tuple(name(t) for t in types)
+
+    for layer, types in by_layer.items():
+        stem = f"model.layers.{layer}."
+        g = types.get
+        if _is_full_attention(layer, interval):
+            add(stem + "self_attn.qkv_proj",
+                [g("attn_q.weight"), g("attn_k.weight"), g("attn_v.weight")])
+            add(stem + "self_attn.o_proj", [g("attn_output.weight")])
+        add(stem + "mlp.shared_expert.gate_up_proj",
+            [g("ffn_gate_shexp.weight"), g("ffn_up_shexp.weight")])
+        add(stem + "mlp.shared_expert.down_proj", [g("ffn_down_shexp.weight")])
+        # The routed experts are one module; gate_up and down may differ in type.
+        add(stem + "mlp.experts",
+            [g("ffn_gate_exps.weight"), g("ffn_down_exps.weight")])
+    return out
+
+
 def _to_bf16(t: GgufTensor) -> torch.Tensor:
     return dequant_any(t).to(torch.bfloat16)
 
@@ -357,7 +408,7 @@ def iter_gguf_weights(
             yield "model.norm.weight", _to_bf16(t)
         elif name == "output.weight":
             if _is_packable(t.ggml_type):
-                yield "lm_head.qweight", t.packed()
+                yield "lm_head.weight", t.packed()
             else:
                 yield "lm_head.weight", _to_bf16(t)
         elif name.startswith("blk."):
@@ -390,8 +441,8 @@ def iter_gguf_weights(
             proj = suffix.rsplit(".weight", 1)[0]
             if proj in _QKV_SLOTS and _is_full_attention(layer, interval):
                 if packed_group(layer, _PACKED_QKV):
-                    slot = next(n for n, g in _PACKED_QKV if g == proj)
-                    yield f"{stem}self_attn.qkv_proj.{slot}.qweight", t.packed()
+                    i = [g for _, g in _PACKED_QKV].index(proj)
+                    yield f"{stem}self_attn.qkv_proj.weight_{i}", t.packed()
                 else:
                     yield from feed_fused(
                         layer, "qkv", _QKV_SLOTS, proj, _to_bf16(t),
@@ -419,8 +470,8 @@ def iter_gguf_weights(
                 continue
             if proj in ("ffn_gate_shexp", "ffn_up_shexp"):
                 if packed_group(layer, _PACKED_SHEXP):
-                    slot = next(n for n, g in _PACKED_SHEXP if g == proj)
-                    yield f"{stem}mlp.shared_expert.gate_up_proj.{slot}.qweight", t.packed()
+                    i = [g for _, g in _PACKED_SHEXP].index(proj)
+                    yield f"{stem}mlp.shared_expert.gate_up_proj.weight_{i}", t.packed()
                 else:
                     yield from feed_fused(
                         layer, "shexp", ("ffn_gate_shexp", "ffn_up_shexp"), proj, _to_bf16(t),
@@ -429,10 +480,11 @@ def iter_gguf_weights(
                 continue
             rel = _SUFFIX_MAP.get(suffix)
             if rel is not None:
-                if name in dtypes and proj in _PACKABLE_LAYER:
-                    yield stem + rel.rsplit(".weight", 1)[0] + ".qweight", t.packed()
-                else:
-                    yield stem + rel, _to_bf16(t)
+                # The dialect's tensors are named `weight` whatever their element
+                # type, so a packed module differs only in what the bytes are.
+                yield stem + rel, (
+                    t.packed() if name in dtypes and proj in _PACKABLE_LAYER else _to_bf16(t)
+                )
 
     leftovers = sorted(fuse)
     assert not leftovers, f"incomplete fused groups: {leftovers}"
@@ -444,8 +496,26 @@ def iter_gguf_weights(
 
 
 def _bank_types(config: "ModelConfig") -> dict[str, int]:
+    """The resolved ggml type of each expert bank.
+
+    Read from the QuantConfig rather than an attribute stashed on the config by
+    ``parse_gguf_config``: the engine rebuilds the ModelConfig with
+    ``dataclasses.replace`` to attach ``quant``, and that keeps only declared fields,
+    so anything set through ``object.__setattr__`` does not survive. ``quant`` is a
+    declared field, which makes the dialect the only durable carrier.
+    """
+    from freetoken.models.gguf.dequant import GGML_NAME
+
+    quant = getattr(config, "quant", None)
+    scheme = quant.scheme_for("model.layers.0.mlp.experts") if quant is not None else None
+    if scheme is not None:
+        by_name = {name: t for t, name in GGML_NAME.items()}
+        names = scheme.weight.elem.split("+")
+        gate_up, down = (names * 2)[:2] if len(names) == 1 else names[:2]
+        return {"gate_up": by_name[gate_up], "down": by_name[down]}
+    # parse_gguf_config's own pass, before the engine attaches the QuantConfig
     types = getattr(config, "gguf_expert_bank_types", None)
-    assert types is not None, "config was not built by qwen35moe parse_gguf_config"
+    assert types is not None, "config carries neither a gguf QuantConfig nor bank types"
     return types
 
 
@@ -607,3 +677,50 @@ def convert_dense_to_gguf(model, config) -> None:
         shexp = getattr(getattr(layer, "mlp", None), "shared_expert", None)
         swap_fused(shexp, "gate_up_proj", lid, _PACKED_SHEXP, [shexp_i, shexp_i])
         swap_single(shexp, "down_proj", lid, "ffn_down_shexp")
+
+
+def iter_gguf_expert_pieces(model_path: str, config, *, parallel: bool = False,
+                            workers: int = 8, chunk: int = 8 << 20):
+    """Routed-expert pieces straight from the GGUF tensor table, one per MoE layer.
+
+    llama.cpp stores gate and up as separate tensors while the bank wants them stacked
+    (gate rows then up rows, the order ``silu_and_mul`` reads), so a layer is complete
+    only once all three of its expert tensors have been seen -- which is why this
+    buffers per layer rather than streaming per tensor.
+
+    Layers whose stored type differs from the bank type are requantized here, exactly
+    as the complete-bank loader does; that is also what makes them unreadable by the
+    disk tier, which needs the file bytes to *be* the bank bytes.
+    """
+    L, E = config.num_layers, config.num_experts
+    H, I = config.hidden_size, config.moe_intermediate_size
+    types = _bank_types(config)
+    gu_bytes = row_bytes(H, types["gate_up"])
+    dn_bytes = row_bytes(I, types["down"])
+
+    pending: dict[int, dict[str, torch.Tensor]] = {}
+    for t in iter_gguf_tensors(model_path):
+        if not t.name.startswith("blk."):
+            continue
+        suffix = t.name.split(".", 2)[2]
+        if suffix not in _EXPERT_SUFFIXES:
+            continue
+        layer = int(t.name.split(".")[1])
+        buf = pending.setdefault(layer, {})
+        if suffix == "ffn_down_exps.weight":
+            buf["down"] = _packed_as(t, types["down"]).reshape(E, H, dn_bytes)
+        else:
+            half = _packed_as(t, types["gate_up"]).reshape(E, I, gu_bytes)
+            buf["gate" if suffix == "ffn_gate_exps.weight" else "up"] = half
+        if len(buf) == 3:
+            del pending[layer]
+            yield (
+                layer,
+                0,
+                E,
+                {
+                    "gate_up": torch.cat([buf["gate"], buf["up"]], dim=1).contiguous(),
+                    "down": buf["down"],
+                },
+            )
+    assert not pending, f"incomplete expert layers: {sorted(pending)}"

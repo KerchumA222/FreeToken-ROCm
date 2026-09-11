@@ -42,35 +42,45 @@ class GgufConfig(QuantConfig):
     def __init__(self, q: dict[str, Any], hf_config: Any = None, *, name_map: NameMap | None = None,
                  unquantized: tuple[str, ...] = ()):
         super().__init__(name_map, unquantized)
-        # checkpoint tensor name -> ggml type name, for the types we can serve packed.
-        # A tensor absent from this map is served bf16 (F32/F16 tensors, and any type
-        # the vendored kernels do not implement -- the shim filters those out).
-        self.types: dict[str, str] = dict(q.get("types") or {})
+        # FreeToken module prefix -> the ggml type name per fused slot, in output order.
+        #
+        # Keyed on the *module* rather than the checkpoint tensor, which is the one
+        # place this dialect departs from the others. A NameMap translates attribute
+        # paths into checkpoint names within one namespace; ggml's names are a
+        # different namespace entirely (``blk.0.attn_q.weight`` for
+        # ``model.layers.0.self_attn.qkv_proj``), and the per-family GGUF adapters
+        # already own that translation. Duplicating it as NameMap rules would put the
+        # same knowledge in two places and let them drift.
+        self.module_types: dict[str, tuple[str, ...]] = {
+            k: tuple(v) for k, v in (q.get("module_types") or {}).items()
+        }
 
     def scheme_for_name(self, name: str) -> QuantScheme | None:
-        ggml_type = self.types.get(name)
-        return gguf_scheme((ggml_type,)) if ggml_type else None
+        types = self.module_types.get(name)
+        return gguf_scheme(types) if types else None
 
     def scheme_for(self, prefix: str) -> QuantScheme | None:
-        """One scheme per module, carrying a type per slot in checkpoint order.
+        """The module's scheme, carrying one ggml type per fused slot in output order.
 
-        The base implementation requires every name of a fused module to agree; for a
-        k-quant checkpoint they routinely do not, and that mix is exactly what
-        ``GgufColSplits`` exists to serve. Partly-quantized fusions still fall back to
-        bf16: there is no kernel for half a packed module.
+        A k-quant checkpoint mixes types across a fusion's slots (Q4_K_M puts Q6_K on
+        attn_v and ffn_down over a Q4_K body), which the base ``scheme_for`` treats as
+        an error; here it is the normal case. The adapter resolves the mix when it
+        builds the map, and omits any module it cannot serve whole -- there is no
+        kernel for half a packed fusion.
         """
-        if prefix in self._schemes:
-            return self._schemes[prefix]
-        names = self.name_map.to_checkpoint(prefix)
-        types = [None if self.unquantized(n) else self.types.get(n) for n in names]
-        scheme = gguf_scheme(types) if types and all(t is not None for t in types) else None
-        self._schemes[prefix] = scheme
-        return scheme
+        if prefix not in self._schemes:
+            self._schemes[prefix] = (
+                None if self.unquantized(prefix) else self.scheme_for_name(prefix)
+            )
+        return self._schemes[prefix]
 
 
-def gguf_quantization_config(types: dict[str, str]) -> dict[str, Any]:
-    """The synthetic ``quantization_config`` a GGUF shim hands to ``QuantConfig.from_hf``."""
-    return {"quant_method": GgufConfig.dialect, "types": types}
+def gguf_quantization_config(module_types: dict[str, tuple[str, ...]]) -> dict[str, Any]:
+    """The synthetic ``quantization_config`` a GGUF adapter hands to ``QuantConfig.from_hf``.
+
+    ``module_types`` maps a FreeToken module prefix to its ggml type per fused slot.
+    """
+    return {"quant_method": GgufConfig.dialect, "module_types": module_types}
 
 
 __all__ = ["GgufConfig", "gguf_quantization_config"]

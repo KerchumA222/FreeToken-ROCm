@@ -34,6 +34,9 @@ LEGACY_FORMAT = {
     (QuantKind.NVFP4, "b12x"): "nvfp4_b12x",
     (QuantKind.MXFP4, "triton_gptoss"): "mxfp4_triton",
     (QuantKind.MXFP4, "triton"): "ds_fp4",
+    # the GGUF banks' tag predates the dialect and names the classic type the gemma4
+    # provider shipped; it now covers every MMVQ type the kernels implement
+    (QuantKind.GGUF, "mmvq"): "q4_0",
 }
 _KIND_KERNEL = {fmt: kk for kk, fmt in LEGACY_FORMAT.items()}
 
