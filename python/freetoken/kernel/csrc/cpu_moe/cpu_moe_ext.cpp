@@ -590,8 +590,40 @@ static cuMemOp64_fn g_cu_wait64 = nullptr;
 static constexpr unsigned int kCuWaitValueGeq = 0x0;   // CU_STREAM_WAIT_VALUE_GEQ
 static constexpr unsigned int kCuWriteDefault = 0x0;   // CU_STREAM_WRITE_VALUE_DEFAULT
 
+// ROCm has the same capability under different names, and the extension already
+// links amdhip64 -- so resolve it at link time rather than dlopen'ing anything.
+// Without this the probe fails on every ROCm box (libcuda.so.1 is a CUDA driver
+// library and simply is not there), and cpu/hybrid decode silently falls back to
+// the cudaLaunchHostFunc path at ~30-50us per call, twice per MoE layer per step.
+// hipStreamWaitValue64 takes a trailing mask that the CUDA entry point does not, so
+// it needs its own thunk rather than a straight function-pointer assignment.
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIP_PLATFORM_HCC__) || defined(USE_ROCM)
+#define FT_HIP_STREAM_MEMOPS 1
+static int ft_hip_write64(void* stream, unsigned long long addr, unsigned long long value,
+                          unsigned int flags) {
+  return static_cast<int>(hipStreamWriteValue64(
+      static_cast<hipStream_t>(stream), reinterpret_cast<void*>(addr),
+      static_cast<uint64_t>(value), flags));
+}
+static int ft_hip_wait64(void* stream, unsigned long long addr, unsigned long long value,
+                         unsigned int flags) {
+  return static_cast<int>(hipStreamWaitValue64(
+      static_cast<hipStream_t>(stream), reinterpret_cast<void*>(addr),
+      static_cast<uint64_t>(value), flags, ~0ULL));
+}
+// hipStreamWaitValueGte == CU_STREAM_WAIT_VALUE_GEQ == 0x0 and
+// hipStreamWriteValueDefault == CU_STREAM_WRITE_VALUE_DEFAULT == 0x0, so the flag
+// constants above carry over unchanged.
+static_assert(hipStreamWaitValueGte == 0x0, "unexpected hipStreamWaitValueGte");
+#endif
+
 static bool cumemop_resolve() {
   static bool resolved = [] {
+#ifdef FT_HIP_STREAM_MEMOPS
+    g_cu_write64 = &ft_hip_write64;
+    g_cu_wait64 = &ft_hip_wait64;
+    return true;
+#else
     void* h = cumemop_dlopen();
     if (h == nullptr) return false;
     // 11.7+ made the v2 entry points the default; older drivers export only the v1
@@ -603,6 +635,7 @@ static bool cumemop_resolve() {
     if (g_cu_wait64 == nullptr)
       g_cu_wait64 = reinterpret_cast<cuMemOp64_fn>(cumemop_dlsym(h, "cuStreamWaitValue64"));
     return g_cu_write64 != nullptr && g_cu_wait64 != nullptr;
+#endif
   }();
   return resolved;
 }
