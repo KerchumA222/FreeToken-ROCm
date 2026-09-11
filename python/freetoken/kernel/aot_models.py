@@ -199,6 +199,9 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         # carry the residual, so the embedding row indexing() sees is still hidden_size.
         name="RadixArk/Qwen3.8-Flash-Next-NVFP4",
         architecture="Qwen4ExpForConditionalGeneration",
+        # The GGUF release (Qwen4ExpGGUFForCausalLM) is the same graph: the expert
+        # banks change layout, nothing the AOT variants key on does.
+        arch_aliases=("Qwen4ExpGGUFForCausalLM",),
         hidden_size=2560,
         kv_groups=((2, 256),),
         top_k=10,

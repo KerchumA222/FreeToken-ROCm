@@ -248,6 +248,15 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         parse_config="parse_gguf_config",
         iter_weights="iter_gguf_weights",
     ),
+    # GGUF Qwen3.8-Flash-Next (llama.cpp arch qwen4exp): experts stay in native GGUF
+    # quant banks (offload backends), the PLE n-gram table streams from the file, and
+    # the dense weights are served packed where the kernels cover their type.
+    "Qwen4ExpGGUFForCausalLM": ModelSpec(
+        "freetoken.models.qwen4_exp",
+        "Qwen4ExpForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+    ),
     # GLM-5.2 (model_type glm_moe_dsa): DeepSeek-V3.2-class MLA + DSA sparse attention
     # with GLM-4-style sigmoid/noaux_tc MoE routing; NVFP4 routed experts served from
     # the offload cache.

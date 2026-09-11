@@ -53,6 +53,9 @@ def build_linear_mixer(config: ModelConfig, layer_id: int, prefix: str) -> BaseO
     )
 
 
+from freetoken.models.qwen3_5_moe.model import _gguf_embed_type
+
+
 class Qwen4ExpDecoderLayer(BaseOP):
     """One decoder layer over the hyper-connection streams (see the module docstring for the flow)."""
 
@@ -87,10 +90,25 @@ class Qwen4ExpDecoderLayer(BaseOP):
 class Qwen4ExpModel(BaseOP):
     def __init__(self, config: ModelConfig, *, prefix: str = "model") -> None:
         self.hc_count = config.qwen4_args.hc_count
-        self.embed_tokens = VocabParallelEmbedding(
-            num_embeddings=config.vocab_size,
-            embedding_dim=config.hidden_size,
-        )
+        # A GGUF checkpoint's token table is quantized like everything else, and
+        # dequantizing it to bf16 costs both the VRAM and the gather bandwidth.
+        # VocabParallelEmbedding has no quant seam (it is a gather, not a matmul), so
+        # the packed table is selected from the same QuantConfig the linears read --
+        # see qwen3_5_moe.model._gguf_embed_type for why it lives outside the dialect.
+        embed_type = _gguf_embed_type(config)
+        if embed_type is not None:
+            from freetoken.layers.gguf import GGUFEmbedding
+
+            self.embed_tokens = GGUFEmbedding(
+                num_embeddings=config.vocab_size,
+                embedding_dim=config.hidden_size,
+                quant_type=embed_type,
+            )
+        else:
+            self.embed_tokens = VocabParallelEmbedding(
+                num_embeddings=config.vocab_size,
+                embedding_dim=config.hidden_size,
+            )
         self.layers = OPList(
             [
                 Qwen4ExpDecoderLayer(config, layer_id, prefix=f"{prefix}.layers.{layer_id}")

@@ -27,6 +27,9 @@ GGUF_ARCH_TO_REGISTRY: dict[str, str] = {
     "gpt-oss": "GptOssGGUFForCausalLM",
     # Hybrid GDN MoE (Qwen3.5/3.6-*-A*B): native GGUF expert banks via offload
     "qwen35moe": "Qwen35MoeGGUFForCausalLM",
+    # Qwen3.8-Flash-Next: same hybrid GDN MoE machinery on hyper-connection residual
+    # streams, plus the PLE n-gram table.
+    "qwen4exp": "Qwen4ExpGGUFForCausalLM",
 }
 
 

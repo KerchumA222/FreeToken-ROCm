@@ -10,6 +10,11 @@ Contracts shared across modules (do not rename):
 """
 
 from .config import parse_config
+from .gguf import (
+    gguf_module_types,
+    iter_gguf_weights,
+    parse_gguf_config,
+)
 from .model import Qwen4ExpForCausalLM
 from .weight import (
     ftw_side_files,
@@ -30,4 +35,8 @@ __all__ = [
     "load_ple_table",
     "parse_config",
     "iter_expert_pieces",
+    # GGUF adapter (fork-only: upstream has no qwen4_exp GGUF path)
+    "parse_gguf_config",
+    "gguf_module_types",
+    "iter_gguf_weights",
 ]
