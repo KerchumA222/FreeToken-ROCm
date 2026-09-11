@@ -124,7 +124,12 @@ def _hf_like(shim: "GgufConfigShim"):
         linear_key_head_dim=int(g("ssm.state_size")),
         linear_value_head_dim=int(g("ssm.inner_size")) // num_v_heads,
         linear_conv_kernel_dim=int(g("ssm.conv_kernel")),
-        output_gate_type="silu",
+        # Sigmoid, not the silu Qwen3.5 hardcodes: llama.cpp's graph gates the GDN
+        # output norm with SIGMOID(z) and gdn_reference.py says the same. ggml records
+        # no KV for it -- it is an architectural constant of qwen4exp. Feeding silu
+        # multiplied the gate by an extra z and put layer 0's gated norm at -321.7
+        # against the reference's -36.1.
+        output_gate_type="sigmoid",
         tie_word_embeddings=shim.tie_word_embeddings,
     )
 
@@ -526,17 +531,25 @@ def iter_gguf_weights(
             if module == "linear_attn.in_proj" and _is_full_attention(layer, interval):
                 continue
             i = slots.index(suffix)
-            if stem + module in packed:
-                yield f"{stem}{module}.weight_{i}", t.packed()
+            is_packed = stem + module in packed
+            val = t.packed() if is_packed else _to_bf16(t)
+            # Above the packed/dense split, not inside the dense arm: every one of
+            # these is a permutation of whole ROWS, and a block-quantized row is
+            # self-contained, so it applies to the packed bytes unchanged. Keeping it
+            # on the dense side (which is where qwen3_5_moe can leave it, never packing
+            # in_proj) silently skipped it for a checkpoint whose in_proj slots are all
+            # packable -- leaving q/k/v/z/beta/alpha in ggml's tiled head order while
+            # conv1d, A_log, dt_bias and out_proj were in the kernels'.
+            if v_perm is not None and module == "linear_attn.in_proj":
+                if suffix == "attn_qkv.weight":
+                    val = _fix_v_rows(val)                       # [q | k | v]
+                elif suffix == "attn_gate.weight":
+                    val = _permute_head_rows(val, v_perm, d_v)   # z, per value head
+                else:
+                    val = val[v_perm]                            # beta / alpha
+            if is_packed:
+                yield f"{stem}{module}.weight_{i}", val.contiguous()
             else:
-                val = _to_bf16(t)
-                if v_perm is not None and module == "linear_attn.in_proj":
-                    if suffix == "attn_qkv.weight":
-                        val = _fix_v_rows(val)                       # [q | k | v]
-                    elif suffix == "attn_gate.weight":
-                        val = _permute_head_rows(val, v_perm, d_v)   # z, per value head
-                    else:
-                        val = val[v_perm]                            # beta / alpha
                 group = feed(layer, module, slots, suffix, val)
                 if group is not None:
                     yield f"{stem}{module}.weight", torch.cat(group, dim=0).contiguous()
