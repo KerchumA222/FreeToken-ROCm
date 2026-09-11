@@ -3,7 +3,30 @@
 import pytest
 import torch
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def _no_fp8_hardware() -> bool:
+    """True on a GPU with no fp8 unit (every RDNA part today).
+
+    The emulated e4m3 path carries the *linear* fp8 kernels there, but these expert
+    kernels fault with hipErrorIllegalAddress on gfx1030 -- and an illegal access
+    poisons the HIP context, so the failure is not contained: every later GPU test in
+    the session fails too (145 of them, from these 3). Skipping keeps the rest of the
+    suite meaningful on ROCm; the kernels themselves are a real RDNA gap, not a
+    testing artifact.
+    """
+    if not torch.cuda.is_available() or getattr(torch.version, "hip", None) is None:
+        return False
+    from freetoken.kernel.triton.e4m3_compat import _device_has_native_e4m3
+
+    return not _device_has_native_e4m3()
+
+
+pytestmark = [
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA"),
+    pytest.mark.skipif(
+        _no_fp8_hardware(),
+        reason="block-fp8 expert kernels fault on GPUs without fp8 hardware (RDNA)",
+    ),
+]
 
 E, H, I, TOPK, M = 4, 256, 256, 2, 8
 BLOCK = 128
