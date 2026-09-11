@@ -507,7 +507,9 @@ class Engine:
             max_slots=method.slot_limit() if method is not None else None,
         )
 
-    def _init_disk_tier_cache(self, config: EngineConfig, decode_target: str) -> OffloadMoeCache:
+    def _init_disk_tier_cache(
+        self, config: EngineConfig, decode_target: str, cpu_layer_ids: frozenset = frozenset()
+    ) -> OffloadMoeCache:
         """Offload cache whose host side is a bounded pool backed by the checkpoint.
 
         The complete expert banks are never loaded: the pool is filled on demand from
@@ -523,13 +525,25 @@ class Engine:
         from freetoken.moe.disk_store import GgufExpertStore
         from freetoken.moe.host_tier import HostExpertCache
 
+        from freetoken.layers.quantization.scheme import QuantKind
+
         mc = config.model_config
-        bank_types = getattr(mc, "gguf_expert_bank_types", None)
-        if not bank_types:
+        # Read through the QuantConfig, not an attribute on the ModelConfig: the
+        # engine rebuilds that config with dataclasses.replace to attach `quant`,
+        # which keeps only declared fields.
+        scheme = mc.quant.scheme_for("model.layers.0.mlp.experts") if mc.quant else None
+        if scheme is None or scheme.kind is not QuantKind.GGUF:
             raise ValueError(
-                "--moe-host-cache-size needs a GGUF checkpoint with q4_0 routed "
-                "experts; this model exposes no gguf_expert_bank_types"
+                "--moe-host-cache-size needs a GGUF checkpoint whose routed experts "
+                "the gguf quant dialect claims; this model's experts resolve to "
+                f"{scheme.kind if scheme else None}"
             )
+        from freetoken.models.gguf.dequant import GGML_NAME
+
+        _by_name = {name: t for t, name in GGML_NAME.items()}
+        _names = scheme.weight.elem.split("+")
+        _gu, _dn = (_names * 2)[:2] if len(_names) == 1 else _names[:2]
+        bank_types = {"gate_up": _by_name[_gu], "down": _by_name[_dn]}
         store = GgufExpertStore(config.model_path, mc.num_experts, bank_types)
         requantized = store.requantized_layers()
         if requantized:
@@ -590,6 +604,9 @@ class Engine:
             decode_target=decode_target,
             hybrid_max_fetch=config.moe_hybrid_max_fetch,
         )
+        # before set_bank_sources, as on the resident path: the residency validation
+        # and the copy plan's skip of non-pinned layers key on the CPU-layer set
+        cache.cpu_layer_ids = cpu_layer_ids
         cache.attach_disk_tier(tier, store)
         cache.set_bank_sources({name: tier.banks[name] for name in store.banks})
 
@@ -617,7 +634,8 @@ class Engine:
             # Bounded host pool backed by the checkpoint on disk: the complete banks
             # are never read, so none of the residency/pin-budget reasoning below
             # applies -- there is nothing to pin beyond the pool itself.
-            return self._init_disk_tier_cache(config, decode_target)
+            cache = self._init_disk_tier_cache(config, decode_target, cpu_layer_ids)
+            return self._finish_offload_cache(config, cache, decode_target)
         # split residency: where pinning is quota-capped (_pin_budget_bytes), pin only the GPU layers' banks and mlock the CPU layers'
         # uncapped hosts keep every bank pinned (CPU decode reads them the same; overlap prefill stays on)
         # not applied to plain --moe-strategy cpu; all-locked under a cap = --moe-strategy offload --moe-cpu-layers 1.0
@@ -723,6 +741,13 @@ class Engine:
         cache.cpu_layer_ids = cpu_layer_ids
         cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency)
         cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
+        return self._finish_offload_cache(config, cache, decode_target)
+
+    def _finish_offload_cache(
+        self, config: EngineConfig, cache: OffloadMoeCache, decode_target: str
+    ) -> OffloadMoeCache:
+        """Everything after the banks are attached, shared by the resident and
+        disk-backed paths: both end up as the same cache object on the same layers."""
         if decode_target == "hybrid":
             self._resolve_hybrid_fetch(config, cache)
         # Must be set before CUDA graph capture so the (device-side) accumulation ops are
