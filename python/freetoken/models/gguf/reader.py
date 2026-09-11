@@ -145,6 +145,10 @@ class GgufTensor:
     rows: int  # product of shape[:-1] over the *ggml* layout = blocks-major rows
     row_bytes: int  # packed bytes per row (whole quant blocks of the fastest dim)
     _raw: np.ndarray  # uint8 view, shape [rows, row_bytes]
+    # Absolute byte offset of this tensor's data in its shard file. Lets a consumer
+    # pread a slice of the tensor without going through the mmap -- see
+    # freetoken.moe.disk_store, which addresses individual experts this way.
+    data_offset: int = 0
 
     def packed(self) -> torch.Tensor:
         """Zero-copy ``[rows, row_bytes]`` uint8 tensor of the native block bytes."""
@@ -214,6 +218,7 @@ def _iter_shard_tensors(model_path: str) -> Iterator[GgufTensor]:
             rows=rows,
             row_bytes=row_bytes,
             _raw=raw,
+            data_offset=int(t.data_offset),
         )
 
 
