@@ -66,6 +66,23 @@ logger = logging.getLogger(__name__)
 
 _EXPERT_SUFFIXES = ("ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight")
 
+# Non-expert tensors served from their packed blocks instead of a bf16 dequant.
+# output.weight is [vocab, hidden] and read in full every decode step, so it is
+# the single largest dense kernel -- the NVFP4 path already keeps it native for
+# exactly this reason (see Qwen3_5MoEForCausalLM.__init__).
+_PACKABLE_DENSE = ("output.weight",)
+
+
+def _is_packable(ggml_type: int) -> bool:
+    """Whether the vendored kernels can multiply this type without dequantizing.
+
+    Mirrors the dense-GGUF families' gate: the MMVQ GEMV set covers every quant
+    type the kernels implement, and F16/BF16/F32 have nothing to unpack.
+    """
+    from freetoken.layers.gguf import _MMVQ, _UNQUANTIZED
+
+    return ggml_type in _MMVQ and ggml_type not in _UNQUANTIZED
+
 
 def _require_tp1(what: str) -> None:
     from freetoken.distributed import get_tp_info
@@ -176,7 +193,25 @@ def parse_gguf_config(shim: "GgufConfigShim") -> "ModelConfig":
     per_layer, bank_types = _expert_types(shim.model_path)
     object.__setattr__(config, "gguf_expert_bank_types", bank_types)
     object.__setattr__(config, "gguf_expert_layer_types", per_layer)
+    object.__setattr__(config, "gguf_dense_types", _dense_types(shim.model_path))
     return config
+
+
+def _dense_types(model_path: str) -> dict[str, int]:
+    """ggml type of each non-expert tensor, for the ones we can keep packed.
+
+    A GGUF checkpoint stores these quantized and this loader has always
+    dequantized them to bf16 at load, which is both 3x the VRAM and -- because the
+    resulting fp16 GEMV runs at a fraction of peak bandwidth where the packed MMVQ
+    kernel saturates it -- the dominant cost of a decode step. Measured on an
+    RX 6800 (gfx1030), this model's dense GEMVs: 22.0 ms/token as fp16 against
+    4.3 ms as packed q8_0, of which ``output.weight`` alone is 9.2 -> 1.1 ms.
+    """
+    out: dict[str, int] = {}
+    for t in iter_gguf_tensors(model_path):
+        if t.name in _PACKABLE_DENSE and _is_packable(t.ggml_type):
+            out[t.name] = t.ggml_type
+    return out
 
 
 def _to_bf16(t: GgufTensor) -> torch.Tensor:
@@ -289,7 +324,10 @@ def iter_gguf_weights(
         elif name == "output_norm.weight":
             yield "model.norm.weight", _to_bf16(t)
         elif name == "output.weight":
-            yield "lm_head.weight", _to_bf16(t)
+            if _is_packable(t.ggml_type):
+                yield "lm_head.qweight", t.packed()
+            else:
+                yield "lm_head.weight", _to_bf16(t)
         elif name.startswith("blk."):
             layer = int(name.split(".")[1])
             suffix = name.split(".", 2)[2]

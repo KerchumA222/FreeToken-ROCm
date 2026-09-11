@@ -197,6 +197,35 @@ class GgufColSplits(BaseOP):
         return torch.cat([getattr(self, n).forward(x) for n in self._order], dim=-1)
 
 
+class GgufLMHead(BaseOP):
+    """Packed-GGUF LM head (TP=1, untied).
+
+    Mirrors ``ParallelLMHead.forward`` at TP=1 -- including the prefill slice to the
+    last token of each sequence, which is the whole reason this cannot just be a
+    ``GGUFLinear``: without it the sampler reads logits from the wrong row and the
+    model degenerates. Then the MMVQ GEMV instead of an ``F.linear`` over a
+    dequantized ``[vocab, hidden]`` weight, which for a large vocabulary is the
+    single largest dense kernel in a decode step.
+    """
+
+    def __init__(self, num_embeddings: int, embedding_dim: int, quant_type: int):
+        self.num_embeddings = num_embeddings
+        self.embedding_dim = embedding_dim
+        self._quant_type = quant_type
+        self.qweight = torch.empty(
+            num_embeddings, row_bytes(embedding_dim, quant_type), dtype=torch.uint8
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        from freetoken.core import get_global_ctx
+
+        batch = get_global_ctx().batch
+        if batch.is_prefill:
+            indices = batch.attn_metadata.get_last_indices(batch.size)
+            x = x[indices].contiguous()
+        return fused_mul_mat_gguf(x, self.qweight, self._quant_type)
+
+
 class GGUFEmbedding(BaseOP):
     """Vocab embedding stored as a native GGUF block-quantized table.
 
