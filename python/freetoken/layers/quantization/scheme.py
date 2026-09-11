@@ -108,6 +108,11 @@ def gguf_scheme(type_names: Iterable[str]) -> QuantScheme:
     fused scheme carries one type per slot in order -- which is why the dialect
     overrides ``scheme_for`` rather than letting the base reject the mix.
 
+    A slot may name an *unquantized* ggml type (F32/F16/BF16). Refusing to pack the
+    whole module because one slot is dense would be a bad trade: in Qwen4-Exp the two
+    fused modules that mix storage classes are 1.85 B parameters, of which the dense
+    slots are 0.69% -- packing the rest is worth ~14.8 ms/token on an RX 6800.
+
     ``group`` is None: a ggml block's geometry is a property of its type, which the
     kernels already know, not something a caller chooses.
     """
