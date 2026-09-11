@@ -40,12 +40,28 @@ parsers all resolve automatically from the checkpoint and the GPU.
 |---|---|---|
 | `--host` | 127.0.0.1 | Bind address |
 | `--port` | 1919 | Bind port |
+| `--gpu` | GPU 0 | GPU to run on: a UUID from `nvidia-smi -L` or an `nvidia-smi` index; see [below](#choosing-a-gpu) |
 | `--max-running-requests` | 4 | Max concurrently running requests |
 | `--max-output-tokens` | 32768 | Default output budget for requests that omit one |
 | `--max-seq-len-override` | from checkpoint | Max sequence length |
 | `--max-prefill-length` | 8192 | Chunked-prefill chunk size in tokens |
 | `--cuda-graph-max-bs`, `--graph` | = max running requests | Max batch size captured as CUDA graphs |
 | `--decode-log-interval` | 40 | Scheduler status line every N decode steps |
+
+### Choosing a GPU
+
+For example, a machine with an RTX 5090 and an RTX 3060 Ti:
+
+```console
+$ nvidia-smi -L
+GPU 0: NVIDIA GeForce RTX 3060 Ti (UUID: GPU-2f3a9b1c-8d7e-4a05-b6c1-0e5f9a3d7b42)
+GPU 1: NVIDIA GeForce RTX 5090 (UUID: GPU-9e8d7c6b-5a49-4f13-8207-c1b0a4e6d3f5)
+```
+
+```bash
+ft serve --model ... --gpu 1             # by nvidia-smi index -- the 5090
+ft serve --model ... --gpu GPU-9e8d7c6b  # the same card by UUID (a unique prefix is enough)
+```
 
 ### KV cache & memory
 
@@ -59,15 +75,17 @@ parsers all resolve automatically from the checkpoint and the GPU.
 
 ### MoE offload
 
-See [models.md](models.md#moe-backends) for what each backend does.
+See [models.md](models.md#moe-strategies) for what each strategy does.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--moe-backend` | auto | `fused`/`offload`/`cpu`/`hybrid`; auto → offload, or hybrid with a `ft bench bw` profile |
-| `--moe-cache-size` / `--moe-cache-rate` / `--moe-cache-auto` | auto | GPU expert-cache size as slots / fraction of all experts / sized from free VRAM (mutually exclusive; auto is enabled by default for offload-family backends) |
+| `--moe-strategy` | auto | `fused`/`offload`/`cpu`/`hybrid`; auto → offload, or hybrid with a `ft bench bw` profile. `--moe-backend` is the deprecated old spelling |
+| `--quant-backend` | auto | Kernel per quantized layer type, `layer[.kind]=name` entries: `linear=marlin,moe=b12x` or `moe.nvfp4=triton`. A layer-level entry applies to every kind whose table lists the name |
+| `--nvfp4-backend` | — | Deprecated: stands in for `--quant-backend moe.nvfp4=<marlin\|b12x\|triton>` (`flashinfer` means b12x); cannot be combined with `--quant-backend` |
+| `--moe-cache-size` / `--moe-cache-rate` / `--moe-cache-auto` | auto | GPU expert-cache size as slots / fraction of all experts / sized from free VRAM (mutually exclusive; auto is enabled by default for offload-family strategies) |
 | `--kv-reserve-tokens` | 8192 | KV token floor reserved before `--moe-cache-auto` fills experts |
 | `--moe-cpu-threads` | physical cores | CPU worker threads for the cpu/hybrid executor |
-| `--moe-cpu-layers` | all on GPU | With `offload`: which MoE layers decode on CPU (`3,7,11`, a count, or a fraction) |
+| `--moe-cpu-layers` | all on GPU | With `offload`: which MoE layers decode on CPU (`3,7,11`, a count, a fraction, or `auto`). `auto` is for Windows/WSL only, where CUDA pinned memory is capped; every value needs an expert format the CPU executor serves (bf16, nvfp4, mxfp4), so fp8 experts cannot use it |
 | `--moe-hybrid-max-fetch` | auto | With `hybrid`: max experts fetched over PCIe per layer per step; rest computed on CPU |
 | `--moe-prefill-hit-d2d` | off | Prefill: copy cache-hit experts device-side, stream only misses (CUDA >= 13) |
 | `--disable-moe-prefill-overlap` | overlap on | Disable the two-buffer prefill copy overlap |
@@ -130,27 +148,31 @@ environment so the agent cannot silently fall back to a paid endpoint.
 ## ft checkpoint
 
 ```bash
-ft checkpoint --model <hf_dir> --out <ftw_dir> [--dtype bfloat16] [--moe-backend offload] [--shard-gib 8] [--device cuda:0]
+ft checkpoint --model <hf_dir> --out <ftw_dir> [--dtype bfloat16] [--moe-backend offload] [--quant-backend moe.nvfp4=b12x] [--shard-gib 8] [--gpu <uuid-or-index>]
 ```
 
 Converts an HF safetensors checkpoint to FTW, FreeToken's self-contained
 fast-load format; point `ft serve --model` at the output dir. `--moe-backend
 offload` (default) packs experts into offload banks; `--moe-backend triton`
 keeps them dense for resident serving. See the FTW caveats in
-[models.md](models.md#notes).
+[models.md](models.md#notes); FTW files from older builds can be repaired with
+[scripts/ftw_hotfix.py](ftw-hotfix.md) instead of reconverting.
 
 ## ft bench bw
 
 ```bash
-ft bench bw                       # once per machine
+ft bench bw                       # once per GPU
 ft bench bw --dtype nvfp4,bf16    # only the formats you serve
+ft bench bw --gpu 1               # a specific GPU (UUID or nvidia-smi index, as for ft serve)
 ```
 
-Measures host-RAM vs PCIe bandwidth with the real cpu/offload MoE kernels and
-writes a profile (`~/.cache/freetoken/benchbw.json`) that `ft serve
---moe-backend auto` and `--moe-hybrid-max-fetch -1` read. Profiles are keyed on
-expert format + GPU name, so a profile from different hardware is ignored
-rather than misapplied. Selection flags: `--dtype`, `--model`, `--formats`,
-`--isa`; decision rule: `--threshold` (default 2.0 — recommend hybrid when CPU
-bandwidth > 2× PCIe).
+Measures host-RAM vs PCIe bandwidth with the real cpu/offload MoE kernels and writes a
+profile that `ft serve --moe-strategy auto` and `--moe-hybrid-max-fetch -1` then read.
+
+- One profile per GPU, at `~/.cache/freetoken/benchbw/<gpu-uuid>.json`.
+- Keyed on expert format + GPU, so a profile from other hardware is ignored rather than
+  misapplied. An older single `benchbw.json` still counts if its GPU name matches.
+- What to measure: `--dtype`, `--model`, `--formats`, `--isa`.
+- `--threshold` (default 2.0) sets the call: recommend hybrid when CPU bandwidth beats PCIe
+  by that factor.
 

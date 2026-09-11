@@ -27,7 +27,7 @@ class Qwen3_5DecoderLayer(BaseOP):
     where the mixer is a GatedDeltaNet (linear layers) or gated attention (full layers).
     All norms are Gemma-style (1+weight)."""
 
-    def __init__(self, config: ModelConfig, layer_id: int):
+    def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = ""):
         self._layer_id = layer_id
         self._is_linear = config.is_linear_layer(layer_id)
         if self._is_linear:
@@ -42,14 +42,18 @@ class Qwen3_5DecoderLayer(BaseOP):
                 conv_kernel_size=g.conv_kernel_dim,
                 rms_norm_eps=config.rms_norm_eps,
                 layer_id=layer_id,
-                expert_quant=config.expert_quant,
-                attn_quant=config.attn_quant,
+                quant_config=config.quant,
+                prefix=f"{prefix}.linear_attn",
             )
         else:
-            self.self_attn = Qwen3_5Attention(config, layer_id)
+            self.self_attn = Qwen3_5Attention(config, layer_id, prefix=f"{prefix}.self_attn")
         # Dense variants (num_experts==0, e.g. Qwen3.6-27B) use a plain SwiGLU MLP instead of
         # the routed MoE block; both expose ``forward(hidden)->hidden`` and the same key prefix.
-        self.mlp = Qwen3_5MoE(config, layer_id) if config.moe_enabled else Qwen3_5DenseMLP(config)
+        self.mlp = (
+            Qwen3_5MoE(config, layer_id, prefix=f"{prefix}.mlp")
+            if config.moe_enabled
+            else Qwen3_5DenseMLP(config, prefix=f"{prefix}.mlp")
+        )
         self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -68,14 +72,33 @@ class Qwen3_5DecoderLayer(BaseOP):
         return hidden, residual
 
 
+
+def _gguf_embed_type(config) -> int | None:
+    """The token embedding's ggml type when the checkpoint packs it, else None.
+
+    Every linear -- the LM head included -- resolves its layout through
+    ``quant_method_for``, but ``VocabParallelEmbedding`` has no quant seam because it
+    is a gather rather than a matmul. So the packed table is selected here, from the
+    same QuantConfig the linears read, rather than through a parallel mechanism.
+    """
+    from freetoken.layers.quantization.scheme import QuantKind
+
+    quant = getattr(config, "quant", None)
+    if quant is None or config.tie_word_embeddings:
+        return None
+    scheme = quant.scheme_for("model.embed_tokens")
+    if scheme is None or scheme.kind is not QuantKind.GGUF:
+        return None
+    from freetoken.models.gguf.dequant import GGML_NAME
+
+    return {name: t for t, name in GGML_NAME.items()}[scheme.weight.elem]
+
+
 class Qwen3_5Model(BaseOP):
-    def __init__(self, config: ModelConfig):
+    def __init__(self, config: ModelConfig, *, prefix: str = "model"):
         # A tied lm_head reads embed_tokens.weight through ParallelLMHead, and a
         # packed embedding has no .weight -- so tied checkpoints keep the bf16 table.
-        embed_type = (
-            None if config.tie_word_embeddings
-            else _gguf_dense_type(config, "token_embd.weight")
-        )
+        embed_type = _gguf_embed_type(config)
         if embed_type is not None:
             from freetoken.layers.gguf import GGUFEmbedding
 
@@ -90,7 +113,10 @@ class Qwen3_5Model(BaseOP):
                 embedding_dim=config.hidden_size,
             )
         self.layers = OPList(
-            [Qwen3_5DecoderLayer(config, layer_id) for layer_id in range(config.num_layers)]
+            [
+                Qwen3_5DecoderLayer(config, layer_id, prefix=f"{prefix}.layers.{layer_id}")
+                for layer_id in range(config.num_layers)
+            ]
         )
         self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -103,61 +129,18 @@ class Qwen3_5Model(BaseOP):
         return x
 
 
-def _gguf_dense_type(config, gguf_name: str) -> int | None:
-    """The ggml type of a dense tensor the GGUF loader can serve packed, else None."""
-    return (getattr(config, "gguf_dense_types", None) or {}).get(gguf_name)
-
-
-def _gguf_lm_head_type(config) -> int | None:
-    """The lm head's ggml type when the GGUF loader can serve it packed, else None.
-
-    A tied head shares embed_tokens, so it follows the embedding path instead.
-    """
-    if config.tie_word_embeddings:
-        return None
-    return _gguf_dense_type(config, "output.weight")
-
-
 class Qwen3_5MoEForCausalLM(BaseLLMModel):
     def __init__(self, config: ModelConfig):
         self.model = Qwen3_5Model(config)
-        if getattr(config, "lm_head_quant", "none") == "nvfp4":
-            # checkpoint stores the (untied) lm_head as NVFP4: keep it native (W4A16) -- the
-            # bf16 dequant of this ~1 GB matrix was the single largest decode kernel.
-            from freetoken.kernel.triton.nvfp4_linear import Nvfp4LMHead
+        self.lm_head = ParallelLMHead(
+            num_embeddings=config.vocab_size,
+            embedding_dim=config.hidden_size,
+            tie_word_embeddings=config.tie_word_embeddings,
+            tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
+            quant_config=config.quant,
+            prefix="lm_head",
+        )
 
-            assert not config.tie_word_embeddings, "NVFP4 lm_head assumes untied embeddings"
-            self.lm_head = Nvfp4LMHead(
-                num_embeddings=config.vocab_size, embedding_dim=config.hidden_size
-            )
-        elif _gguf_lm_head_type(config) is not None:
-            # Same reasoning as the NVFP4 branch, for a GGUF checkpoint: keep the
-            # [vocab, hidden] matrix in its packed blocks and dequantize inside the
-            # MMVQ kernel. Measured on an RX 6800 it is 9.23 ms/token as an fp16
-            # rocBLAS GEMV against 1.09 ms packed -- the largest single dense kernel
-            # in the model by a wide margin.
-            from freetoken.layers.gguf import GgufLMHead
-
-            assert not config.tie_word_embeddings, (
-                "packed-GGUF lm_head assumes untied embeddings (a tied head shares "
-                "embed_tokens, which stays on the bf16 embedding path)"
-            )
-            self.lm_head = GgufLMHead(
-                num_embeddings=config.vocab_size,
-                embedding_dim=config.hidden_size,
-                quant_type=_gguf_lm_head_type(config),
-            )
-        else:
-            self.lm_head = ParallelLMHead(
-                num_embeddings=config.vocab_size,
-                embedding_dim=config.hidden_size,
-                tie_word_embeddings=config.tie_word_embeddings,
-                tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
-            )
-        if getattr(config, "gguf_dense_types", None):
-            from .gguf import convert_dense_to_gguf
-
-            convert_dense_to_gguf(self, config)
         super().__init__()
 
     def forward(self) -> torch.Tensor:
