@@ -97,3 +97,35 @@ def test_reports_layers_that_would_be_requantized(tiny_gguf):
                                    "down": Q4_0}) as store:
         rq = store.requantized_layers()
         assert rq == {"gate_up": tuple(range(L))}
+
+
+def test_read_layer_fills_the_whole_bank(tiny_gguf, expected_expert):
+    """Prefill copies a layer at a time, so the store has to produce the layer's
+    [E, rows, row_bytes] block -- with each part scattered across experts correctly."""
+    import numpy as np
+
+    path, _ = tiny_gguf
+    with GgufExpertStore(path, E, {"gate_up": Q4_0, "down": Q4_0}) as store:
+        for bank in ("gate_up", "down"):
+            rows, row_bytes = store.row_shape(bank)
+            dst = np.zeros((E, rows, row_bytes), dtype=np.uint8)
+            for layer in range(L):
+                dst[:] = 0
+                # one read per part, not per expert
+                assert store.read_layer(bank, layer, dst) == (2 if bank == "gate_up" else 1)
+                for e in range(E):
+                    assert np.array_equal(
+                        dst[e].reshape(-1), expected_expert(bank, layer, e)
+                    ), (bank, layer, e)
+
+
+def test_read_layer_rejects_a_mis_shaped_destination(tiny_gguf):
+    import numpy as np
+
+    path, _ = tiny_gguf
+    with GgufExpertStore(path, E, {"gate_up": Q4_0, "down": Q4_0}) as store:
+        rows, row_bytes = store.row_shape("down")
+        with pytest.raises(ValueError):
+            store.read_layer("down", 0, np.zeros((E, rows, row_bytes + 1), np.uint8))
+        with pytest.raises(TypeError):
+            store.read_layer("down", 0, np.zeros((E, rows, row_bytes), np.int8))

@@ -493,6 +493,83 @@ class Engine:
             quant_format=banks.quant_format,
         )
 
+    def _init_disk_tier_cache(self, config: EngineConfig, decode_target: str) -> OffloadMoeCache:
+        """Offload cache whose host side is a bounded pool backed by the checkpoint.
+
+        The complete expert banks are never loaded: the pool is filled on demand from
+        the GGUF the model was loaded from, whose expert tensors are already laid out
+        so that one expert is a contiguous byte range (freetoken.moe.disk_store).
+
+        Two properties of this path are deliberate and worth stating. Reading device
+        state back to decide what to admit means the decode step cannot be CUDA-graph
+        captured, so capture is turned off here rather than failing later. And prefill
+        still streams whole layers, which a per-expert pool cannot serve, so each
+        layer is staged off disk -- that costs TTFT in a way decode does not.
+        """
+        from freetoken.moe.disk_store import GgufExpertStore
+        from freetoken.moe.host_tier import HostExpertCache
+
+        mc = config.model_config
+        bank_types = getattr(mc, "gguf_expert_bank_types", None)
+        if not bank_types:
+            raise ValueError(
+                "--moe-host-cache-size needs a GGUF checkpoint with q4_0 routed "
+                "experts; this model exposes no gguf_expert_bank_types"
+            )
+        if config.moe_cache_auto:
+            raise ValueError(
+                "--moe-cache-auto is not supported with --moe-host-cache-size yet; "
+                "pass --moe-cache-size explicitly (it sizes the GPU tier, which is "
+                "still a full slot cache)"
+            )
+        _require_offload_cache_size(config.moe_cache_size, mc.num_experts)
+
+        store = GgufExpertStore(config.model_path, mc.num_experts, bank_types)
+        requantized = store.requantized_layers()
+        if requantized:
+            raise ValueError(
+                "--moe-host-cache-size cannot serve layers that are requantized at "
+                f"load ({requantized}); their bytes on disk are not their bytes in "
+                "the bank. Re-quantize the checkpoint to a uniform expert type "
+                "(llama-quantize --tensor-type) or drop --moe-host-cache-size"
+            )
+        tier = HostExpertCache(store, mc.num_experts, config.moe_host_cache_size)
+        pool_bytes = sum(t.numel() for t in tier.banks.values())
+        total = mc.num_moe_layers * mc.num_experts * sum(
+            store.expert_bytes(b) for b in store.banks
+        )
+        logger.info_rank0(
+            f"disk tier: {config.moe_host_cache_size} host slots "
+            f"({mem_GB(pool_bytes)}) over {mem_GB(total)} of experts on disk "
+            f"({config.moe_host_cache_size / (mc.num_moe_layers * mc.num_experts):.1%} resident)"
+        )
+
+        cache = OffloadMoeCache(
+            num_layers=mc.num_moe_layers,
+            num_experts=mc.num_experts,
+            cache_size=config.moe_cache_size,
+            device=self.device,
+            cache_policy=config.moe_cache_policy,
+            prefill_overlap=config.moe_prefill_overlap,
+            prefill_hit_d2d=False,   # the split reads the complete bank; not available here
+            quant_format="q4_0",
+            decode_target=decode_target,
+            hybrid_max_fetch=config.moe_hybrid_max_fetch,
+        )
+        cache.attach_disk_tier(tier, store)
+        cache.set_bank_sources({name: tier.banks[name] for name in store.banks})
+
+        if config.cuda_graph_max_bs != 0:
+            # Admission reads num_indices/src_indices back to the host, which cannot
+            # happen inside a captured graph. The graph-safe form of this is the flag
+            # handshake the CPU MoE executor already uses; until then, decode is eager.
+            logger.info_rank0(
+                "disk tier: disabling CUDA graph capture (expert admission syncs "
+                "with the host each MoE layer)"
+            )
+            object.__setattr__(config, "cuda_graph_max_bs", 0)
+        return cache
+
     def _init_offload_moe_cache(self, config: EngineConfig) -> OffloadMoeCache:
         # A model may fully own cache construction via make_offload_moe_cache.
         # Otherwise load_expert_banks gives the model module a setup hook first, then
@@ -518,7 +595,9 @@ class Engine:
             decode_target = "cpu"
         else:
             decode_target = "gpu"
-        if cache_factory is None:
+        if cache_factory is None and config.moe_host_cache_size > 0:
+            cache = self._init_disk_tier_cache(config, decode_target)
+        elif cache_factory is None:
             # Fast path: an FTW checkpoint loads its repacked banks directly.
             # Slow path: load_expert_banks auto-picks parallel vs serial baseline by
             # expert-tensor granularity. Both pin-after-fill.

@@ -39,6 +39,13 @@ class EngineConfig:
     # (cudaMemcpyBatchAsync); no-op unless moe_cache_size > 2 * num_experts.
     moe_prefill_hit_d2d: bool = False
     moe_collect_stats: bool = False  # capture decode miss-rate counters into the cuda graph
+    # Disk-backed expert tier (--moe-host-cache-size): how many experts to hold in
+    # pinned host RAM. 0 (default) keeps the complete banks resident, which is what
+    # makes host RAM the ceiling on model size. Above 0, the host side becomes a
+    # bounded pool and a decode miss that is not in it is read from the checkpoint on
+    # disk. Applies to the offload backend family; only the GGUF q4_0 layout is
+    # addressable on disk today.
+    moe_host_cache_size: int = 0
     # CPU MoE backend (--moe-backend cpu): number of CPU worker threads computing
     # the decode experts. 0 = auto (physical cores). Ignored by other backends.
     moe_cpu_threads: int = 0

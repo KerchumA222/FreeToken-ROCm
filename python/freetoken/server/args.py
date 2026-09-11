@@ -548,6 +548,19 @@ def parse_args(
         help="The unified MoE cache eviction policy.",
     )
 
+    # Sizes the *host* tier. Deliberately outside moe_cache_group, which is a
+    # mutually exclusive set of three ways to size the GPU tier -- this composes with
+    # any of them rather than replacing them.
+    parser.add_argument(
+        "--moe-host-cache-size",
+        type=int,
+        default=ServerArgs.moe_host_cache_size,
+        help="The number of MoE expert slots in pinned host RAM. 0 (default) keeps "
+        "every expert resident, which makes host RAM the ceiling on model size. "
+        "Above 0 the host side is a bounded pool and a decode miss that is not in "
+        "it is read from the checkpoint on disk, trading decode throughput for RAM. "
+        "Offload backend family; GGUF q4_0 experts only.",
+    )
     parser.add_argument(
         "--moe-cpu-threads",
         type=int,

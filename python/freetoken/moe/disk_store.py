@@ -203,6 +203,51 @@ class GgufExpertStore:
                 raise OSError(f"short read: {got} of {e.nbytes} at {e.offset} in {e.path}")
         return len(ext)
 
+    def read_layer(self, bank: str, layer: int, dst) -> int:
+        """Fill a whole layer's bank -- ``[num_experts, rows, row_bytes]`` -- and return
+        the number of reads issued.
+
+        Prefill copies an entire layer at once, so this is the shape the prefill path
+        needs and the shape a bounded per-expert pool cannot serve. Each part is one
+        contiguous file range covering every expert, but it lands on a *strided* slice
+        of the destination (``gate_up``'s gate half is rows ``[0, I)`` of each expert's
+        block). ``preadv`` is exactly the right tool: one syscall, one file range, an
+        iovec per expert -- so a layer costs one read per part rather than one per
+        expert.
+        """
+        import numpy as np
+
+        arr = np.asarray(dst)
+        if arr.dtype != np.uint8:
+            raise TypeError(f"destination must be uint8, got {arr.dtype}")
+        rows, row_bytes = self.row_shape(bank)
+        if arr.shape != (self.num_experts, rows, row_bytes):
+            raise ValueError(
+                f"destination {arr.shape} != ({self.num_experts}, {rows}, {row_bytes})"
+            )
+        reads, row0 = 0, 0
+        for suffix in _BANK_PARTS[bank]:
+            p = self._part(suffix, layer)
+            part_rows = p.rows_per_expert
+            # One iovec per expert: the file range is contiguous across experts, the
+            # destination is not.
+            iov = [
+                memoryview(arr[e, row0 : row0 + part_rows]).cast("B")
+                for e in range(self.num_experts)
+            ]
+            want = self.num_experts * part_rows * p.row_bytes
+            got = os.preadv(self._fd(p.path), iov, p.data_offset)
+            if got != want:
+                raise OSError(
+                    f"short read: {got} of {want} at {p.data_offset} in {p.path}"
+                )
+            reads += 1
+            row0 += part_rows
+        return reads
+
+    def layer_bytes(self, bank: str) -> int:
+        return self.num_experts * self.expert_bytes(bank)
+
     def close(self) -> None:
         for fd in self._fds.values():
             os.close(fd)

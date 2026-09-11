@@ -136,6 +136,12 @@ class OffloadMoeCache:
         # Attached by the engine for decode_target == "cpu" (CpuMoeExecutor); None
         # for the GPU decode path.
         self.cpu_executor = None
+        # Disk tier (attach_disk_tier). When set, the host side of the cache is a
+        # bounded pinned pool rather than complete per-layer banks, and a decode miss
+        # may have to come off disk before it can cross PCIe.
+        self.host_tier = None
+        self.disk_store = None
+        self._stage: dict[str, list[torch.Tensor]] = {}
         # MoE layer ids whose decode runs on the CPU executor; the rest use the GPU
         # offload/PCIe path. Set by the engine after construction (empty = all-GPU,
         # all layers = the plain --moe-backend cpu case).
@@ -267,6 +273,35 @@ class OffloadMoeCache:
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
 
+    def attach_disk_tier(self, host_tier, store) -> None:
+        """Serve decode from ``host_tier``'s bounded pinned pool, backed by ``store``.
+
+        Must be called before :meth:`set_bank_sources`, which then expects one pooled
+        tensor per bank instead of a complete per-layer bank. Decode misses are read
+        from disk into the pool and the copy plan indexes *host slots* rather than
+        expert rows; prefill still needs whole layers, so it is staged separately (see
+        :meth:`_stage_prefill_layer`).
+        """
+        if self.bank_sources:
+            raise RuntimeError("attach_disk_tier must be called before set_bank_sources")
+        if not self.prefill_overlap:
+            # The non-overlap prefill path materializes a whole layer straight into the
+            # slot cache from per_layer[layer], which a bounded pool cannot provide.
+            # Refuse rather than silently serving the wrong rows.
+            raise NotImplementedError(
+                "the disk tier requires prefill overlap (moe_prefill_overlap=True); "
+                "the materialize_layer prefill path reads whole layers from the host "
+                "bank, which a bounded pool does not hold"
+            )
+        self.host_tier = host_tier
+        self.disk_store = store
+
+    @property
+    def _source_rows(self) -> int:
+        """Rows addressable in a bank source: host slots with a disk tier, else the
+        layer's experts."""
+        return self.host_tier.capacity if self.host_tier is not None else self.num_experts
+
     def set_bank_sources(
         self,
         sources: dict[str, list[torch.Tensor]],
@@ -302,12 +337,27 @@ class OffloadMoeCache:
             )
         self.layer_residency = list(residency)
         for name in self.bank_schema:
-            per_layer = sources[name]
-            assert len(per_layer) == self.num_layers, (name, len(per_layer))
+            if self.host_tier is not None:
+                # One pooled tensor [capacity, *row_shape] stands in for every layer:
+                # the copy plan's per-layer source pointer is the same pool, and the
+                # row index is a host slot rather than an expert. Everything
+                # downstream (copy plan, bank_views, safe copy) is unchanged.
+                pool = sources[name]
+                if isinstance(pool, (list, tuple)):
+                    raise TypeError(
+                        f"bank {name!r}: with a disk tier attached, pass one pooled "
+                        "tensor per bank, not a per-layer list"
+                    )
+                assert pool.is_contiguous(), f"bank {name!r} pool must be contiguous"
+                assert pool.size(0) == self.host_tier.capacity, (name, pool.shape)
+                per_layer = [pool] * self.num_layers
+            else:
+                per_layer = sources[name]
+                assert len(per_layer) == self.num_layers, (name, len(per_layer))
             head = per_layer[0]
             for layer_id, source in enumerate(per_layer):
                 assert source.is_contiguous(), f"bank {name!r} layer {layer_id} must be contiguous"
-                assert source.size(0) == self.num_experts, (name, layer_id, source.shape)
+                assert source.size(0) == self._source_rows, (name, layer_id, source.shape)
                 assert source.shape == head.shape and source.dtype == head.dtype, (
                     name, layer_id, source.shape, source.dtype,
                 )
@@ -320,8 +370,38 @@ class OffloadMoeCache:
         self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
         self._host_mapping_safe = [None] * self.num_layers
         self._build_copy_plan()
+        if self.host_tier is not None:
+            self._init_prefill_stage()
         if self.prefill_overlap:
             self._init_prefill_overlap_buffers()
+
+    def _init_prefill_stage(self) -> None:
+        """Two pinned whole-layer buffers per bank, for the prefill double buffer.
+
+        Prefill streams an entire layer, which a per-expert pool cannot supply, so the
+        layer is read off disk into one of these and copied H2D from there. Indexed by
+        the same ``buffer_id`` as the GPU overlap buffers so the two alternate together.
+        """
+        from freetoken.kernel.pinned import alloc_pinned_tensor
+
+        for name in self.bank_schema:
+            head = self.bank_sources[name][0]
+            rows, row_bytes = head.shape[1], head.shape[2]
+            self._stage[name] = [
+                alloc_pinned_tensor(self.num_experts, rows, row_bytes, dtype=head.dtype)
+                for _ in range(2)
+            ]
+        total = sum(t.numel() for ts in self._stage.values() for t in ts)
+        logger.info(
+            "disk tier: prefill staging %.2f GiB (2 layers x %d banks)",
+            total / (1 << 30), len(self.bank_schema),
+        )
+
+    def _stage_prefill_layer(self, name: str, layer_id: int, buffer_id: int) -> torch.Tensor:
+        """Read a whole layer of ``name`` off disk into staging and return the buffer."""
+        stage = self._stage[name][buffer_id]
+        self.disk_store.read_layer(name, layer_id, stage.numpy())
+        return stage
 
     def _build_copy_plan(self) -> None:
         """Precompute the fused multi-bank copy descriptor (base addrs + per-row bytes).
@@ -609,8 +689,13 @@ class OffloadMoeCache:
 
         def copy() -> None:
             self._invalidate_prefill_buffer(buffer_id)
-            for (per_layer, _), buffer in zip(self.banks, self.prefill_bank_buffers):
-                buffer[buffer_id].copy_(per_layer[layer_id], non_blocking=True)
+            for name, (per_layer, _), buffer in zip(
+                self.bank_schema, self.banks, self.prefill_bank_buffers
+            ):
+                src = per_layer[layer_id]
+                if self.host_tier is not None:
+                    src = self._stage_prefill_layer(name, layer_id, buffer_id)
+                buffer[buffer_id].copy_(src, non_blocking=True)
 
         if self._prefill_hit_d2d_active:
             self._prefetch_split(layer_id, buffer_id)
@@ -619,6 +704,12 @@ class OffloadMoeCache:
         else:
             with torch.cuda.stream(self.prefill_copy_stream):
                 if self._prefill_buffer_has_release_event[buffer_id]:
+                    if self.host_tier is not None:
+                        # wait_event only orders the *stream*; the host runs ahead. A
+                        # complete bank is immutable so that was always safe, but a
+                        # staging buffer gets rewritten -- block the host until the
+                        # previous H2D out of this buffer has actually retired.
+                        self.prefill_release_events[buffer_id].synchronize()
                     self.prefill_copy_stream.wait_event(self.prefill_release_events[buffer_id])
                 copy()
                 self.prefill_ready_events[buffer_id].record(self.prefill_copy_stream)
@@ -776,6 +867,26 @@ class OffloadMoeCache:
             self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
         self._pending_src_layer = layer_id
         ensure_experts(self, layer_id, expert_ids)
+        if self.host_tier is not None:
+            self._admit_to_host_tier(layer_id)
+
+    def _admit_to_host_tier(self, layer_id: int) -> None:
+        """Make this step's GPU misses resident in the host pool and rewrite
+        ``src_indices`` from expert rows to the host slots holding them.
+
+        This reads device state back, so the decode step cannot be CUDA-graph
+        captured while a disk tier is attached -- the engine turns capture off. The
+        graph-safe version of this is the flag handshake the CPU MoE executor already
+        uses; that is a later change, not a different design.
+        """
+        n = int(self.num_indices.item())
+        if n <= 0:
+            return
+        experts = self.src_indices[:n].tolist()
+        slots = self.host_tier.ensure(layer_id, experts)
+        self.src_indices[:n].copy_(
+            torch.tensor(slots, dtype=self.src_indices.dtype), non_blocking=False
+        )
 
     def ensure_experts_hybrid(self, layer_id: int, expert_ids: torch.Tensor) -> None:
         """Capped-fetch LRU for the hybrid backend.
@@ -885,9 +996,9 @@ class OffloadMoeCache:
                 raise ValueError(
                     f"safe-copy destination slot {destination} outside cache size {self.cache_size}"
                 )
-            if source < 0 or source >= self.num_experts:
+            if source < 0 or source >= self._source_rows:
                 raise ValueError(
-                    f"safe-copy source expert {source} outside expert count {self.num_experts}"
+                    f"safe-copy source row {source} outside source rows {self._source_rows}"
                 )
         if len({destination for destination, _ in plan}) != len(plan):
             raise ValueError("safe-copy plan contains duplicate destination slots")
