@@ -129,3 +129,36 @@ def test_read_layer_rejects_a_mis_shaped_destination(tiny_gguf):
             store.read_layer("down", 0, np.zeros((E, rows, row_bytes + 1), np.uint8))
         with pytest.raises(TypeError):
             store.read_layer("down", 0, np.zeros((E, rows, row_bytes), np.int8))
+
+
+def test_reads_match_the_bank_slices_across_a_split_set(split_gguf):
+    """A split GGUF puts each layer's experts in a different file, and every shard's
+    ``data_offset`` is relative to its own. Reading an expert therefore has to pair the
+    offset with the shard it came from; pairing it with any other file lands on
+    well-formed bytes belonging to some other tensor, which is why this is a test rather
+    than an assertion."""
+    path, payload = split_gguf
+    with GgufExpertStore(path, E, {"gate_up": Q4_0, "down": Q4_0}) as store:
+        assert store.layers("gate_up") == tuple(range(L))
+        assert store.requantized_layers() == {}
+        # the parts really are spread over distinct files, or this proves nothing
+        shards = {store.extents("down", layer, 0)[0].path for layer in range(L)}
+        assert len(shards) == L, f"expected one shard per layer, got {shards}"
+
+        for layer in range(L):
+            g = payload[f"blk.{layer}.ffn_gate_exps.weight"].reshape(E, I, GU_BYTES)
+            u = payload[f"blk.{layer}.ffn_up_exps.weight"].reshape(E, I, GU_BYTES)
+            d = payload[f"blk.{layer}.ffn_down_exps.weight"].reshape(E, H, DN_BYTES)
+            for e in range(E):
+                buf = bytearray(store.expert_bytes("gate_up"))
+                assert store.read_expert("gate_up", layer, e, buf) == 2
+                want = np.concatenate([g[e].reshape(-1), u[e].reshape(-1)])
+                assert np.array_equal(np.frombuffer(bytes(buf), np.uint8), want), (
+                    f"gate_up layer {layer} expert {e}"
+                )
+
+                buf = bytearray(store.expert_bytes("down"))
+                assert store.read_expert("down", layer, e, buf) == 1
+                assert np.array_equal(
+                    np.frombuffer(bytes(buf), np.uint8), d[e].reshape(-1)
+                ), f"down layer {layer} expert {e}"

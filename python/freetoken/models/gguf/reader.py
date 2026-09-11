@@ -149,6 +149,10 @@ class GgufTensor:
     # pread a slice of the tensor without going through the mmap -- see
     # freetoken.moe.disk_store, which addresses individual experts this way.
     data_offset: int = 0
+    # The shard ``data_offset`` indexes. A split set's tensors are spread over several
+    # files and each offset is relative to its own, so the offset alone does not
+    # address anything; carry them together.
+    path: str = ""
 
     def packed(self) -> torch.Tensor:
         """Zero-copy ``[rows, row_bytes]`` uint8 tensor of the native block bytes."""
@@ -219,6 +223,7 @@ def _iter_shard_tensors(model_path: str) -> Iterator[GgufTensor]:
             row_bytes=row_bytes,
             _raw=raw,
             data_offset=int(t.data_offset),
+            path=model_path,
         )
 
 

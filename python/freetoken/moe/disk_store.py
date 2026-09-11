@@ -30,7 +30,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
-from freetoken.models.gguf.reader import gguf_shard_paths, iter_gguf_tensors
+from freetoken.models.gguf.reader import iter_gguf_tensors
 from freetoken.utils import init_logger
 
 logger = init_logger(__name__)
@@ -79,26 +79,30 @@ class GgufExpertStore:
         self._fds: dict[str, int] = {}
 
         wanted = {s for parts in _BANK_PARTS.values() for s in parts}
-        for shard in gguf_shard_paths(model_path):
-            for t in iter_gguf_tensors(shard):
-                if not t.name.startswith("blk."):
-                    continue
-                suffix = t.name.split(".", 2)[2]
-                if suffix not in wanted:
-                    continue
-                layer = int(t.name.split(".")[1])
-                if t.rows % self.num_experts:
-                    raise ValueError(
-                        f"{t.name}: {t.rows} rows is not a multiple of "
-                        f"{self.num_experts} experts"
-                    )
-                self._parts[(suffix, layer)] = _Part(
-                    path=shard,
-                    data_offset=int(t.data_offset),
-                    rows_per_expert=t.rows // self.num_experts,
-                    row_bytes=t.row_bytes,
-                    ggml_type=t.ggml_type,
+        # One pass over the whole set: iter_gguf_tensors already walks every shard, and
+        # each tensor names the file its data_offset indexes. Looping over the shards
+        # and re-iterating from each one tagged every part with the outer shard instead
+        # of its own, which addressed the right offset in the wrong file -- invisible on
+        # a single-file GGUF, wrong on every split one.
+        for t in iter_gguf_tensors(model_path):
+            if not t.name.startswith("blk."):
+                continue
+            suffix = t.name.split(".", 2)[2]
+            if suffix not in wanted:
+                continue
+            layer = int(t.name.split(".")[1])
+            if t.rows % self.num_experts:
+                raise ValueError(
+                    f"{t.name}: {t.rows} rows is not a multiple of "
+                    f"{self.num_experts} experts"
                 )
+            self._parts[(suffix, layer)] = _Part(
+                path=t.path,
+                data_offset=int(t.data_offset),
+                rows_per_expert=t.rows // self.num_experts,
+                row_bytes=t.row_bytes,
+                ggml_type=t.ggml_type,
+            )
 
     # ---- geometry -------------------------------------------------------------
 

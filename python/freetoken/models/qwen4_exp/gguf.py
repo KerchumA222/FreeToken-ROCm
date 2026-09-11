@@ -139,9 +139,20 @@ def _hf_like(shim: "GgufConfigShim"):
 
 def parse_gguf_config(shim: "GgufConfigShim") -> "ModelConfig":
     """A ModelConfig for a GGUF Flash-Next, through upstream's own ``parse_config``."""
+    from freetoken.models.qwen3_5_moe.gguf import _dense_types, _expert_types
+
     from .config import parse_config
 
-    return parse_config(_hf_like(shim))
+    config = parse_config(_hf_like(shim))
+    # Routed experts ride the (generalized) q4_0 GGUF bank path: the tag means "native
+    # GGUF block bytes", and the actual ggml type per bank travels separately.
+    object.__setattr__(config, "expert_quant", "q4_0")
+    object.__setattr__(config, "moe_weight_format", "q4_0")
+    per_layer, bank_types = _expert_types(shim.model_path)
+    object.__setattr__(config, "gguf_expert_bank_types", bank_types)
+    object.__setattr__(config, "gguf_expert_layer_types", per_layer)
+    object.__setattr__(config, "gguf_dense_types", _dense_types(shim.model_path))
+    return config
 
 
 # --------------------------------------------------------------------------------------
@@ -245,8 +256,9 @@ def gguf_module_types(model_path: str) -> dict[str, tuple[str, ...]]:
     """
     from freetoken.models.gguf.dequant import GGML_NAME
     from freetoken.models.gguf.reader import iter_gguf_tensors
-    from freetoken.models.qwen3_5_moe.gguf import _is_packable
+    from freetoken.models.qwen3_5_moe.gguf import _expert_types, _is_packable
 
+    _per_layer, bank_types = _expert_types(model_path)
     globals_: dict[str, int] = {}
     by_layer: dict[int, dict[str, int]] = {}
     for t in iter_gguf_tensors(model_path):
@@ -283,6 +295,13 @@ def gguf_module_types(model_path: str) -> dict[str, tuple[str, ...]]:
             if any(t is None for t in got) or not any(_is_packable(t) for t in got):
                 continue
             out[stem + module] = tuple(name(t) for t in got)
+        # The routed experts are one module with two banks, and gate_up and down may
+        # differ in type. Reported from the RESOLVED bank types rather than this
+        # layer's stored types, so the dialect (which is what _bank_types reads, being
+        # the only carrier that survives the engine's dataclasses.replace) agrees with
+        # the loader on a checkpoint whose layers disagree and get promoted.
+        if all(s in types for s in _EXPERT_SUFFIXES):
+            out[stem + "mlp.experts"] = (name(bank_types["gate_up"]), name(bank_types["down"]))
         for module, (parts, _align) in _ROW_CONCAT.items():
             got = [types.get(p) for p in parts]
             # One buffer, so one block layout: the parts must agree on a packable type
