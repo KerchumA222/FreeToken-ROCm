@@ -154,10 +154,21 @@ _FUSED = {
     "mlp.experts": ("ffn_gate_exps.weight", "ffn_down_exps.weight"),
 }
 
-# Fusions that mix quantized and unquantized tensors and therefore never pack:
-#   in_proj                              attn_qkv/attn_gate (quantized) + ssm_beta/alpha (F32)
-#   input_mix_weight_down_block_inject   hc_*_down (quantized) + hc_*_inject (F32)
-# They are simply absent from the map, which resolves them to bf16.
+# Fusions that mix quantized and unquantized tensors. They are listed like any other:
+# the dialect carries a type per slot and the method serves the dense ones dense
+# alongside their packed siblings. Refusing them whole would cost ~14.8 ms/token on
+# an RX 6800 -- they are 1.85 B parameters and the dense slots are 0.69% of the bytes.
+_MIXED = {
+    "linear_attn.in_proj": (
+        "attn_qkv.weight", "attn_gate.weight", "ssm_beta.weight", "ssm_alpha.weight",
+    ),
+    "attn_hyper_connection.input_mix_weight_down_block_inject": (
+        "hc_attn_down.weight", "hc_attn_inject.weight",
+    ),
+    "mlp_hyper_connection.input_mix_weight_down_block_inject": (
+        "hc_ffn_down.weight", "hc_ffn_inject.weight",
+    ),
+}
 
 
 def gguf_module_types(model_path: str) -> dict[str, tuple[str, ...]]:
@@ -174,8 +185,9 @@ def gguf_module_types(model_path: str) -> dict[str, tuple[str, ...]]:
     globals_: dict[str, int] = {}
     by_layer: dict[int, dict[str, int]] = {}
     for t in iter_gguf_tensors(model_path):
-        if not _is_packable(t.ggml_type):
-            continue
+        # Every type is recorded, packable or not: a fused module needs each slot's
+        # type to decide per slot, and _packable_group() drops groups with nothing
+        # worth packing.
         if t.name.startswith("blk."):
             layer = int(t.name.split(".")[1])
             by_layer.setdefault(layer, {})[t.name.split(".", 2)[2]] = t.ggml_type
@@ -184,20 +196,34 @@ def gguf_module_types(model_path: str) -> dict[str, tuple[str, ...]]:
 
     name = GGML_NAME.__getitem__
     out: dict[str, tuple[str, ...]] = {}
-    if "output.weight" in globals_:
-        out["lm_head"] = (name(globals_["output.weight"]),)
-    if "token_embd.weight" in globals_:
-        out["model.embed_tokens"] = (name(globals_["token_embd.weight"]),)
+    for tensor, module in (("output.weight", "lm_head"),
+                           ("token_embd.weight", "model.embed_tokens")):
+        t = globals_.get(tensor)
+        if t is not None and _is_packable(t):
+            out[module] = (name(t),)
+
+    def group(types: dict[str, int], slots, *, all_packable: bool) -> tuple[str, ...] | None:
+        got = [types.get(s) for s in slots]
+        if any(t is None for t in got):
+            return None            # slot missing from this checkpoint
+        packable = [_is_packable(t) for t in got]
+        keep = all(packable) if all_packable else any(packable)
+        return tuple(name(t) for t in got) if keep else None
 
     for layer, types in by_layer.items():
         stem = f"model.layers.{layer}."
         for suffix, module in _ONE_TO_ONE.items():
-            if suffix in types:
-                out[stem + module] = (name(types[suffix]),)
+            t = types.get(suffix)
+            if t is not None and _is_packable(t):
+                out[stem + module] = (name(t),)
         for module, slots in _FUSED.items():
-            got = [types.get(s) for s in slots]
-            if all(t is not None for t in got):
-                out[stem + module] = tuple(name(t) for t in got)
+            g = group(types, slots, all_packable=True)
+            if g:
+                out[stem + module] = g
+        for module, slots in _MIXED.items():
+            g = group(types, slots, all_packable=False)
+            if g:
+                out[stem + module] = g
     return out
 
 

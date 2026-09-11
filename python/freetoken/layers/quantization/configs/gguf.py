@@ -64,9 +64,9 @@ class GgufConfig(QuantConfig):
 
         A k-quant checkpoint mixes types across a fusion's slots (Q4_K_M puts Q6_K on
         attn_v and ffn_down over a Q4_K body), which the base ``scheme_for`` treats as
-        an error; here it is the normal case. The adapter resolves the mix when it
-        builds the map, and omits any module it cannot serve whole -- there is no
-        kernel for half a packed fusion.
+        an error; here it is the normal case. A slot may also be *unquantized*, which
+        the method serves dense alongside its packed siblings -- see ``gguf_scheme``
+        for why that beats refusing the whole module.
         """
         if prefix not in self._schemes:
             self._schemes[prefix] = (
