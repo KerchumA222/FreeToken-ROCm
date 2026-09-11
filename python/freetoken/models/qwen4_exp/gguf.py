@@ -133,4 +133,72 @@ def parse_gguf_config(shim: "GgufConfigShim") -> "ModelConfig":
     return parse_config(_hf_like(shim))
 
 
-__all__ = ["parse_gguf_config"]
+# ggml tensor suffix -> the FreeToken module it feeds, for modules fed by exactly one
+# tensor. Fused modules are listed separately below because their slots have to agree.
+_ONE_TO_ONE = {
+    "attn_output.weight": "self_attn.o_proj",
+    "ssm_out.weight": "linear_attn.out_proj",
+    "ffn_down_shexp.weight": "mlp.shared_expert.down_proj",
+    "hc_attn_up.weight": "attn_hyper_connection.input_mix_weight_up",
+    "hc_ffn_up.weight": "mlp_hyper_connection.input_mix_weight_up",
+    "ple_key.weight": "ple.key_proj",
+    "ple_value.weight": "ple.value_proj",
+}
+
+# module -> the ggml tensors concatenated into it, in output order. A module is served
+# packed only when every slot is a type the kernels implement, so these resolve as a
+# group.
+_FUSED = {
+    "self_attn.qkv_proj": ("attn_q.weight", "attn_k.weight", "attn_v.weight"),
+    "mlp.shared_expert.gate_up_proj": ("ffn_gate_shexp.weight", "ffn_up_shexp.weight"),
+    "mlp.experts": ("ffn_gate_exps.weight", "ffn_down_exps.weight"),
+}
+
+# Fusions that mix quantized and unquantized tensors and therefore never pack:
+#   in_proj                              attn_qkv/attn_gate (quantized) + ssm_beta/alpha (F32)
+#   input_mix_weight_down_block_inject   hc_*_down (quantized) + hc_*_inject (F32)
+# They are simply absent from the map, which resolves them to bf16.
+
+
+def gguf_module_types(model_path: str) -> dict[str, tuple[str, ...]]:
+    """FreeToken module prefix -> ggml type per fused slot, for what we serve packed.
+
+    The GGUF side of the ``gguf`` quant dialect. Only this module knows both the ggml
+    names and the FreeToken module paths, so the translation lives here rather than
+    as NameMap rules.
+    """
+    from freetoken.models.gguf.dequant import GGML_NAME
+    from freetoken.models.gguf.reader import iter_gguf_tensors
+    from freetoken.models.qwen3_5_moe.gguf import _is_packable
+
+    globals_: dict[str, int] = {}
+    by_layer: dict[int, dict[str, int]] = {}
+    for t in iter_gguf_tensors(model_path):
+        if not _is_packable(t.ggml_type):
+            continue
+        if t.name.startswith("blk."):
+            layer = int(t.name.split(".")[1])
+            by_layer.setdefault(layer, {})[t.name.split(".", 2)[2]] = t.ggml_type
+        else:
+            globals_[t.name] = t.ggml_type
+
+    name = GGML_NAME.__getitem__
+    out: dict[str, tuple[str, ...]] = {}
+    if "output.weight" in globals_:
+        out["lm_head"] = (name(globals_["output.weight"]),)
+    if "token_embd.weight" in globals_:
+        out["model.embed_tokens"] = (name(globals_["token_embd.weight"]),)
+
+    for layer, types in by_layer.items():
+        stem = f"model.layers.{layer}."
+        for suffix, module in _ONE_TO_ONE.items():
+            if suffix in types:
+                out[stem + module] = (name(types[suffix]),)
+        for module, slots in _FUSED.items():
+            got = [types.get(s) for s in slots]
+            if all(t is not None for t in got):
+                out[stem + module] = tuple(name(t) for t in got)
+    return out
+
+
+__all__ = ["parse_gguf_config", "gguf_module_types"]
