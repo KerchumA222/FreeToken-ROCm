@@ -20,6 +20,23 @@ in the RDNA bring-up notes):
 
 Slots touched by the in-flight :meth:`ensure` are never chosen as eviction victims,
 so a row cannot be overwritten while the GPU is still copying out of it.
+
+Eviction is LRU here because this tier runs on the host, where an ordered dict is
+free. The device-side port cannot copy that: the existing GPU slot cache evicts by
+``argmin`` over a vector as wide as the pool, which is affordable for a 4000-slot
+GPU cache and not for a host pool that is deliberately larger. CLOCK is the natural
+replacement -- one reference bit and a rotating hand, O(1), no reduction -- and it
+was measured against this trace before being committed to. Miss rate, replaying the
+real 899-step routing trace (40 layers x 256 experts, top-8):
+
+    resident    5%     10%    20%    30%    44%    60%    80%
+    LRU       63.8%  42.2%  23.9%  13.6%   5.7%   2.0%   0.8%
+    CLOCK     64.0%  43.3%  25.0%  14.3%   6.1%   2.1%   0.8%
+    RANDOM    69.7%  50.6%  30.4%  19.0%   9.6%   3.9%   0.8%
+
+CLOCK costs at most +1.1 points anywhere in the range and +0.4 at a realistic
+operating point; RANDOM costs +3.9, so the reference bit is doing the work, not the
+pool size. A device-side host tier should use CLOCK.
 """
 
 from __future__ import annotations

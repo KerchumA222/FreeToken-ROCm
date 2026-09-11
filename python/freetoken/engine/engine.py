@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import math
 import os
+from types import SimpleNamespace
 from datetime import timedelta
 from typing import Any, Dict, Iterable, NamedTuple, Tuple
 
@@ -516,14 +517,6 @@ class Engine:
                 "--moe-host-cache-size needs a GGUF checkpoint with q4_0 routed "
                 "experts; this model exposes no gguf_expert_bank_types"
             )
-        if config.moe_cache_auto:
-            raise ValueError(
-                "--moe-cache-auto is not supported with --moe-host-cache-size yet; "
-                "pass --moe-cache-size explicitly (it sizes the GPU tier, which is "
-                "still a full slot cache)"
-            )
-        _require_offload_cache_size(config.moe_cache_size, mc.num_experts)
-
         store = GgufExpertStore(config.model_path, mc.num_experts, bank_types)
         requantized = store.requantized_layers()
         if requantized:
@@ -534,6 +527,34 @@ class Engine:
                 "(llama-quantize --tensor-type) or drop --moe-host-cache-size"
             )
         tier = HostExpertCache(store, mc.num_experts, config.moe_host_cache_size)
+
+        if config.moe_cache_auto:
+            # The GPU tier is sized from free VRAM exactly as it is without a disk
+            # tier -- the two tiers are independent, and the pool lives in host RAM,
+            # so nothing about the VRAM budget changes. The budget policy only reads
+            # per-expert row bytes and the quant format off the bank bundle, and a
+            # pooled bank has the same per-expert row shape as a complete one, so a
+            # shim carrying those two is exactly equivalent here.
+            shim = SimpleNamespace(
+                sources={name: [tier.banks[name]] for name in store.banks},
+                quant_format="q4_0",
+            )
+            size, pages, overlap = self._resolve_auto_moe_cache_size(config, shim)
+            if not overlap:
+                raise ValueError(
+                    f"--moe-cache-auto sized the GPU tier at {size} slots, too small "
+                    f"for prefill overlap (needs >= {2 * mc.num_experts}), which the "
+                    "disk tier requires. Raise --memory-ratio, lower "
+                    "--kv-reserve-tokens, or drop --moe-host-cache-size"
+                )
+            object.__setattr__(config, "moe_cache_size", size)
+            if config.num_page_override is None:
+                # MoE slots and KV pages were solved against ONE budget, so take both.
+                object.__setattr__(config, "num_page_override", pages)
+            logger.info_rank0(
+                f"--moe-cache-auto resolved moe_cache_size={size} num_pages={pages}"
+            )
+        _require_offload_cache_size(config.moe_cache_size, mc.num_experts)
         pool_bytes = sum(t.numel() for t in tier.banks.values())
         total = mc.num_moe_layers * mc.num_experts * sum(
             store.expert_bytes(b) for b in store.banks
