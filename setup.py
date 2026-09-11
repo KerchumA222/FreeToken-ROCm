@@ -4,6 +4,8 @@ import importlib.util
 import os
 from pathlib import Path
 
+import sys
+
 from setuptools import setup
 from torch.utils.cpp_extension import (
     BuildExtension,
@@ -107,6 +109,19 @@ if os.environ.get("FREETOKEN_SKIP_CUDA_EXT") != "1":
                 extra_compile_args=["-O3", "-std=c++17", "-pthread", *gpu_cflags],
             ),
         ]
+
+# --ple-backend disk row store (Qwen3.8-Flash-Next's n-gram table). Pure CPU --
+# it links no GPU runtime -- so unlike the two above it does not depend on a GPU
+# toolchain being present, and is built whenever the platform has the syscalls.
+# Linux-only until the TableFile/BatchReader seams grow Windows bodies.
+if sys.platform == "linux":
+    ext_modules.append(
+        CppExtension(
+            name="freetoken.kernel._ple_store",
+            sources=["python/freetoken/kernel/csrc/ple_store/ple_store_ext.cpp"],
+            extra_compile_args=["-O3", "-std=c++17"],
+        )
+    )
 
 
 setup(

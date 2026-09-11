@@ -6,22 +6,16 @@ from .gguf import (
     parse_gguf_config,
 )
 from .model import Qwen3_5MoEForCausalLM
-from .weight import (
-    iter_weights,
-    iter_weights_parallel,
-    load_nvfp4_expert_sources,
-    load_nvfp4_expert_sources_parallel,
-    setup_offload_expert_banks,
-)
+from .weight import iter_expert_pieces, iter_weights, iter_weights_parallel, nvfp4_expert_spec
 
 __all__ = [
     "Qwen3_5MoEForCausalLM",
     "parse_config",
     "iter_weights",
     "iter_weights_parallel",
-    "load_nvfp4_expert_sources",
-    "load_nvfp4_expert_sources_parallel",
-    "setup_offload_expert_banks",
+    "iter_expert_pieces",
+    "nvfp4_expert_spec",
+    # GGUF adapter (fork-only: upstream has no qwen3_5_moe GGUF path)
     "parse_gguf_config",
     "iter_gguf_weights",
     "load_q4_0_expert_sources",

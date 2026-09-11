@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
 from freetoken.layers import (
@@ -16,6 +17,9 @@ from freetoken.utils import nvtx_annotate
 if TYPE_CHECKING:
     import torch
 
+    from freetoken.core import Batch
+    from freetoken.layers.quantization import QuantConfig
+
     from .config import ModelConfig
 
 
@@ -23,13 +27,20 @@ class BaseLLMModel(ABC, BaseOP):
     @abstractmethod
     def forward(self) -> torch.Tensor: ...
 
+    @contextmanager
+    def forward_host_ctx(self, batch: Batch, use_graph: bool):
+        """Around one forward dispatch: enter before it is enqueued, exit right after. A backend that feeds the forward from host memory overrides this."""
+        yield
+
 
 class GatedMLP(BaseOP):
-    def __init__(self, config: ModelConfig):
+    def __init__(self, config: ModelConfig, *, quant_config: QuantConfig | None = None, prefix: str = ""):
         self.gate_up_proj = LinearColParallelMerged(
             config.hidden_size,
             [config.intermediate_size, config.intermediate_size],
             has_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.gate_up_proj",
         )
 
         fn_map = {"silu": silu_and_mul, "gelu": gelu_and_mul, "gelu_tanh": gelu_tanh_and_mul}
@@ -41,6 +52,8 @@ class GatedMLP(BaseOP):
             config.intermediate_size,
             config.hidden_size,
             has_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.down_proj",
         )
 
     @nvtx_annotate("MLP")

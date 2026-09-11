@@ -83,14 +83,14 @@ def e4m3_native() -> bool:
         if FORCE_EMU:
             _native = False
         else:
-            native = {_device_has_native_e4m3(i)
-                      for i in range(torch.cuda.device_count())}
-            if len(native) > 1:
-                raise NotImplementedError(
-                    "GPUs on both sides of the sm_89 fp8 boundary in one process: "
-                    "the host-side e4m3 convention is process-global"
-                )
-            _native = native.pop() if native else _device_has_native_e4m3()
+            from freetoken.gpu_select import assigned_visible_gpu
+
+            # One process runs on one GPU, so its convention is that GPU's; None
+            # (-> the current device) only before the process binds. The predicate
+            # is HIP-aware: on ROCm get_device_capability returns the *gfx* version,
+            # so every RDNA card compares >= (8, 9) and would claim native fp8 on
+            # hardware that has none.
+            _native = _device_has_native_e4m3(assigned_visible_gpu())
     return _native
 
 
