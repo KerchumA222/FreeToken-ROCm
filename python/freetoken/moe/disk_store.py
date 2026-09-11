@@ -110,6 +110,19 @@ class GgufExpertStore:
         head = _BANK_PARTS[bank][0]
         return tuple(sorted(l for (s, l) in self._parts if s == head))
 
+    def row_shape(self, bank: str) -> tuple[int, int]:
+        """One expert's row block as the host bank shapes it: ``[rows, row_bytes]``.
+
+        ``gate_up`` stacks its two parts (gate rows then up rows) into a single row
+        axis, which is the layout ``silu_and_mul`` expects.
+        """
+        layer = self.layers(bank)[0]
+        parts = [self._part(s, layer) for s in _BANK_PARTS[bank]]
+        row_bytes = {p.row_bytes for p in parts}
+        if len(row_bytes) != 1:
+            raise ValueError(f"bank {bank!r} parts disagree on row_bytes: {row_bytes}")
+        return sum(p.rows_per_expert for p in parts), next(iter(row_bytes))
+
     def expert_bytes(self, bank: str) -> int:
         return sum(
             p.rows_per_expert * p.row_bytes
