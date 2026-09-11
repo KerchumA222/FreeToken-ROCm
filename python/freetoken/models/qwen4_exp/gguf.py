@@ -17,7 +17,9 @@ for every other GGUF adapter.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Iterator
+
+import torch
 
 from freetoken.models.gguf.reader import load_gguf_metadata
 
@@ -26,6 +28,12 @@ if TYPE_CHECKING:
     from freetoken.models.gguf.config import GgufConfigShim
 
 _ARCH = "qwen4exp"
+
+
+def _num_ngram_heads(g) -> int:
+    """One head group per n-gram order 2..ngram_size (Qwen3.8: 8 x 2-gram + 8 x 3-gram).
+    Mirrors ``Qwen4Args.num_ngram_heads``; ggml records the two factors separately."""
+    return (int(g("ple.ngram_size")) - 1) * int(g("ple.heads_per_ngram"))
 
 
 class _Text:
@@ -90,7 +98,10 @@ def _hf_like(shim: "GgufConfigShim"):
         hc_lowrank=int(g("hyper_connection.low_rank")),
         # PLE / n-gram
         ple_layer_ids=ple_layers,
-        ple_embed_dim=int(g("embedding_length_per_layer_input")),
+        # ggml stores the PER-HEAD row width (FreeToken's ngram_head_dim); the model's
+        # ple_embed_dim is the width of all heads concatenated, which is what key_proj
+        # and value_proj actually consume (Qwen3.8: 160 x 16 = 2560).
+        ple_embed_dim=int(g("embedding_length_per_layer_input")) * _num_ngram_heads(g),
         ple_conv_kernel_size=int(g("ple.conv_kernel")),
         ngram_size=int(g("ple.ngram_size")),
         heads_per_ngram=int(g("ple.heads_per_ngram")),
@@ -133,42 +144,96 @@ def parse_gguf_config(shim: "GgufConfigShim") -> "ModelConfig":
     return parse_config(_hf_like(shim))
 
 
-# ggml tensor suffix -> the FreeToken module it feeds, for modules fed by exactly one
-# tensor. Fused modules are listed separately below because their slots have to agree.
-_ONE_TO_ONE = {
-    "attn_output.weight": "self_attn.o_proj",
-    "ssm_out.weight": "linear_attn.out_proj",
-    "ffn_down_shexp.weight": "mlp.shared_expert.down_proj",
-    "hc_attn_up.weight": "attn_hyper_connection.input_mix_weight_up",
-    "hc_ffn_up.weight": "mlp_hyper_connection.input_mix_weight_up",
-    "ple_key.weight": "ple.key_proj",
-    "ple_value.weight": "ple.value_proj",
+# --------------------------------------------------------------------------------------
+# ggml <-> FreeToken naming.
+#
+# Three shapes of correspondence, because the model's buffers do not all come from one
+# ggml tensor and the packed path can only serve some of them:
+#
+# * :data:`_SUFFIX_MAP` -- one ggml tensor fills one module buffer.
+# * :data:`_MERGED` -- one ggml tensor per *slot* of a merged linear. The module keeps
+#   the slots apart (``weight_0``, ``weight_1``, ...), so their ggml types may differ.
+# * :data:`_ROW_CONCAT` -- several ggml tensors are stacked into ONE buffer. The module
+#   is a plain ``LinearReplicated`` with a single weight, so the parts have to agree on
+#   a type to stay packed: a row-wise concatenation of block-quantized rows is itself a
+#   valid tensor of that type, but only when every row uses the same block layout.
+# --------------------------------------------------------------------------------------
+
+# Routed experts never come through the weight iterator; the offload banks read them.
+_EXPERT_SUFFIXES = ("ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight")
+
+# suffix -> module-relative key, for the tensors that fill one buffer unchanged.
+_SUFFIX_MAP = {
+    "attn_output.weight": "self_attn.o_proj.weight",
+    "ssm_out.weight": "linear_attn.out_proj.weight",
+    "ssm_norm.weight": "linear_attn.norm.weight",
+    "ffn_gate_inp.weight": "mlp.gate.weight",
+    "ffn_down_shexp.weight": "mlp.shared_expert.down_proj.weight",
+    "hc_attn_up.weight": "attn_hyper_connection.input_mix_weight_up.weight",
+    "hc_ffn_up.weight": "mlp_hyper_connection.input_mix_weight_up.weight",
+    "ple_key.weight": "ple.key_proj.weight",
+    "ple_value.weight": "ple.value_proj.weight",
 }
 
-# module -> the ggml tensors concatenated into it, in output order. A module is served
-# packed only when every slot is a type the kernels implement, so these resolve as a
-# group.
-_FUSED = {
+# The zero-centered norms. HF stores ``scale - 1`` and FreeToken keeps it that way --
+# GemmaPlusOneRMSNorm / GroupedPlusOneRMSNorm add the 1 back in fp32 at runtime, which is
+# the whole point of the format. llama.cpp's converter instead bakes the +1 into the
+# stored weight, so the 1 comes back off here. Measured on this checkpoint: every one of
+# these is centered on ~1 (e.g. blk.1.ple_norm_key 0.674..1.863, mean 0.893) while the
+# plain-scaled ``ssm_norm`` sits at 0.875..1.023 -- the two are only distinguishable by
+# which norm class consumes them, not by their values.
+_PLUS_ONE_MAP = {
+    "hc_attn_norm.weight": "attn_hyper_connection.hc_norm.weight",
+    "hc_ffn_norm.weight": "mlp_hyper_connection.hc_norm.weight",
+    "attn_q_norm.weight": "self_attn.q_norm.weight",
+    "attn_k_norm.weight": "self_attn.k_norm.weight",
+    "indexer.q_norm.weight": "self_attn.indexer.q_layernorm.weight",
+    "indexer.k_norm.weight": "self_attn.indexer.k_layernorm.weight",
+    "ple_norm_key.weight": "ple.norm_key.weight",
+    "ple_norm_query.weight": "ple.norm_query.weight",
+    "ple_norm_conv.weight": "ple.norm_conv.weight",
+}
+
+# Merged linears: module -> the ggml tensors feeding its slots, in output order.
+# ``attn_q`` carries q AND the output gate (``_qkv_split`` is [2*qo, kv, kv]), which is
+# why the full-attention fuse takes it whole.
+_MERGED = {
     "self_attn.qkv_proj": ("attn_q.weight", "attn_k.weight", "attn_v.weight"),
-    "mlp.shared_expert.gate_up_proj": ("ffn_gate_shexp.weight", "ffn_up_shexp.weight"),
-    "mlp.experts": ("ffn_gate_exps.weight", "ffn_down_exps.weight"),
-}
-
-# Fusions that mix quantized and unquantized tensors. They are listed like any other:
-# the dialect carries a type per slot and the method serves the dense ones dense
-# alongside their packed siblings. Refusing them whole would cost ~14.8 ms/token on
-# an RX 6800 -- they are 1.85 B parameters and the dense slots are 0.69% of the bytes.
-_MIXED = {
     "linear_attn.in_proj": (
         "attn_qkv.weight", "attn_gate.weight", "ssm_beta.weight", "ssm_alpha.weight",
     ),
+    "mlp.shared_expert.gate_up_proj": ("ffn_gate_shexp.weight", "ffn_up_shexp.weight"),
+}
+
+# Single-buffer stacks: module -> (parts in row order, row alignment). The HC mix reads
+# its low-rank projection and its injection logits out of one GEMM, padded to a multiple
+# of 16 (vLLM hyperconnection.py); the pad rows are zero and their output is dropped.
+_ROW_CONCAT = {
     "attn_hyper_connection.input_mix_weight_down_block_inject": (
-        "hc_attn_down.weight", "hc_attn_inject.weight",
+        ("hc_attn_down.weight", "hc_attn_inject.weight"), 16,
     ),
     "mlp_hyper_connection.input_mix_weight_down_block_inject": (
-        "hc_ffn_down.weight", "hc_ffn_inject.weight",
+        ("hc_ffn_down.weight", "hc_ffn_inject.weight"), 16,
+    ),
+    "self_attn.indexer.index_qk_proj": (
+        ("indexer.q_proj.weight", "indexer.k_proj.weight"), 1,
     ),
 }
+
+# Whole-model tensors (no ``blk.N.`` prefix).
+_GLOBAL_SUFFIX_MAP = {
+    "output_hc_down.weight": "model.hyper_connection_mixer.input_mix_weight_down.weight",
+    "output_hc_up.weight": "model.hyper_connection_mixer.input_mix_weight_up.weight",
+}
+_GLOBAL_PLUS_ONE = {
+    "output_hc_norm.weight": "model.hyper_connection_mixer.hc_norm.weight",
+}
+# The n-gram table: 54.4 GiB of q8_0 here, never part of the dense state dict.
+_PLE_TABLE = "per_layer_token_embd.weight"
+
+
+def _pad_rows(n: int, align: int) -> int:
+    return (-n) % align
 
 
 def gguf_module_types(model_path: str) -> dict[str, tuple[str, ...]]:
@@ -185,9 +250,8 @@ def gguf_module_types(model_path: str) -> dict[str, tuple[str, ...]]:
     globals_: dict[str, int] = {}
     by_layer: dict[int, dict[str, int]] = {}
     for t in iter_gguf_tensors(model_path):
-        # Every type is recorded, packable or not: a fused module needs each slot's
-        # type to decide per slot, and _packable_group() drops groups with nothing
-        # worth packing.
+        # Every type is recorded, packable or not: a merged module needs each slot's
+        # type to decide per slot.
         if t.name.startswith("blk."):
             layer = int(t.name.split(".")[1])
             by_layer.setdefault(layer, {})[t.name.split(".", 2)[2]] = t.ggml_type
@@ -196,35 +260,295 @@ def gguf_module_types(model_path: str) -> dict[str, tuple[str, ...]]:
 
     name = GGML_NAME.__getitem__
     out: dict[str, tuple[str, ...]] = {}
-    for tensor, module in (("output.weight", "lm_head"),
-                           ("token_embd.weight", "model.embed_tokens")):
-        t = globals_.get(tensor)
+
+    def one(types: dict[str, int], suffix: str, module: str) -> None:
+        t = types.get(suffix)
         if t is not None and _is_packable(t):
             out[module] = (name(t),)
 
-    def group(types: dict[str, int], slots, *, all_packable: bool) -> tuple[str, ...] | None:
-        got = [types.get(s) for s in slots]
-        if any(t is None for t in got):
-            return None            # slot missing from this checkpoint
-        packable = [_is_packable(t) for t in got]
-        keep = all(packable) if all_packable else any(packable)
-        return tuple(name(t) for t in got) if keep else None
+    for tensor, module in (("output.weight", "lm_head"),
+                           ("token_embd.weight", "model.embed_tokens")):
+        one(globals_, tensor, module)
+    for suffix, module in _GLOBAL_SUFFIX_MAP.items():
+        one(globals_, suffix, module.rsplit(".weight", 1)[0])
 
     for layer, types in by_layer.items():
         stem = f"model.layers.{layer}."
-        for suffix, module in _ONE_TO_ONE.items():
-            t = types.get(suffix)
-            if t is not None and _is_packable(t):
-                out[stem + module] = (name(t),)
-        for module, slots in _FUSED.items():
-            g = group(types, slots, all_packable=True)
-            if g:
-                out[stem + module] = g
-        for module, slots in _MIXED.items():
-            g = group(types, slots, all_packable=False)
-            if g:
-                out[stem + module] = g
+        for suffix, module in _SUFFIX_MAP.items():
+            one(types, suffix, stem + module.rsplit(".weight", 1)[0])
+        for module, slots in _MERGED.items():
+            got = [types.get(s) for s in slots]
+            # A slot missing means this layer does not have the module at all
+            # (full-attention vs GDN); a group with nothing packable is left dense.
+            if any(t is None for t in got) or not any(_is_packable(t) for t in got):
+                continue
+            out[stem + module] = tuple(name(t) for t in got)
+        for module, (parts, _align) in _ROW_CONCAT.items():
+            got = [types.get(p) for p in parts]
+            # One buffer, so one block layout: the parts must agree on a packable type
+            # or the whole stack is served dense.
+            if any(t is None for t in got) or len(set(got)) != 1 or not _is_packable(got[0]):
+                continue
+            out[stem + module] = (name(got[0]),)
     return out
 
 
-__all__ = ["parse_gguf_config", "gguf_module_types"]
+# --------------------------------------------------------------------------------------
+# Dense weights.
+# --------------------------------------------------------------------------------------
+
+
+def _to_bf16(t) -> "torch.Tensor":
+    from freetoken.models.gguf.dequant import dequant_any
+
+    return dequant_any(t).to(torch.bfloat16)
+
+
+def _head_block_bytes(in_features: int, head_dim: int, ggml_type: int) -> int | None:
+    """Bytes per value head inside one packed row, or None when a head does not land on
+    a block boundary. Reordering whole heads along the INPUT axis is a byte permutation
+    only if each head spans a whole number of quant blocks -- Qwen3.8 has head_v_dim 128
+    over q8_0's 32-wide blocks, so a head is exactly 4 blocks (136 bytes)."""
+    from freetoken.models.gguf.dequant import BLOCK_SHAPE, row_bytes
+
+    if ggml_type not in BLOCK_SHAPE:
+        return None
+    block, type_size = BLOCK_SHAPE[ggml_type]
+    if head_dim % block:
+        return None
+    total = row_bytes(in_features, ggml_type)
+    per_head = head_dim // block * type_size
+    return per_head if per_head * (in_features // head_dim) == total else None
+
+
+def _permute_packed_heads(packed: "torch.Tensor", perm, per_head: int) -> "torch.Tensor":
+    """Reorder whole value heads along the packed input axis of ``[out, row_bytes]``."""
+    out = packed.shape[0]
+    return (
+        packed.view(out, -1, per_head)
+        .index_select(1, perm)
+        .reshape(out, -1)
+        .contiguous()
+    )
+
+
+def _zero_rows(n: int, row_bytes: int) -> "torch.Tensor":
+    """``n`` all-zero packed rows. Every quant type this path serves encodes zero as
+    all-zero bytes (a q8_0 block is an fp16 scale of 0 over 32 zero weights), so the
+    HC pad rows need no per-type construction."""
+    return torch.zeros(n, row_bytes, dtype=torch.uint8)
+
+
+def iter_gguf_weights(
+    model_path: str,
+    device,
+    *,
+    include_moe_experts: bool,
+    include_non_moe: bool,
+) -> "Iterator[tuple[str, torch.Tensor]]":
+    """Dense (non-routed-expert) weights in FreeToken naming.
+
+    Quantized tensors are handed over packed wherever the dialect said we would serve
+    them that way, and dequantized to bf16 otherwise (fp32 for ``dt_bias``/``A_log``).
+    Routed experts are delivered by the expert-bank reader and the n-gram table by
+    :func:`load_gguf_ple_table`; neither comes through here.
+    """
+    from freetoken.models.gguf.dequant import dequant_any
+    from freetoken.models.gguf.reader import iter_gguf_tensors, load_gguf_metadata
+    from freetoken.models.qwen3_5_moe.gguf import (
+        _is_full_attention,
+        _permute_head_rows,
+        _require_tp1,
+        _v_head_permutation,
+    )
+
+    assert not include_moe_experts, (
+        "qwen4exp GGUF routed experts load as native packed banks, not through iter_weights"
+    )
+    assert include_non_moe
+    _require_tp1("weights")
+
+    md = load_gguf_metadata(model_path)
+    interval = int(md.get(f"{_ARCH}.full_attention_interval", 4))
+    packed = gguf_module_types(model_path)
+
+    # GQA head-order fix for the GDN layers, exactly as in qwen35moe: llama.cpp pairs
+    # value head j with key head j % HK, the vendored fla kernels with j // (HV // HK).
+    # Qwen3.8 has the same 3:1 split (48 value heads over 16 key heads) that made this
+    # necessary there.
+    n_v = int(md[f"{_ARCH}.ssm.time_step_rank"])
+    n_k = int(md[f"{_ARCH}.ssm.group_count"])
+    d_v = int(md[f"{_ARCH}.ssm.inner_size"]) // n_v
+    d_k = int(md[f"{_ARCH}.ssm.state_size"])
+    v_perm = _v_head_permutation(n_v, n_k)
+    key_dim = n_k * d_k
+
+    def _fix_v_rows(t: torch.Tensor) -> torch.Tensor:
+        if v_perm is None:
+            return t
+        head, tail = t[: 2 * key_dim], t[2 * key_dim :]
+        return torch.cat([head, _permute_head_rows(tail, v_perm, d_v)], dim=0).contiguous()
+
+    # The n-gram addressing tables. The HF checkpoint ships these as tensors; llama.cpp
+    # precomputes them into the KV section instead, so they are read from the metadata
+    # rather than re-derived from primes and splitmix64 (a second derivation would be a
+    # second thing to keep in agreement with the reference).
+    for ple_layer in (int(i) for i in md.get(f"{_ARCH}.ple.layers", [])):
+        base = f"model.layers.{ple_layer}.ple.ple_embedding."
+        for key, field in (
+            ("layer_multipliers", "ple.layer_multipliers"),
+            ("ngram_heads_vocab_sizes", "ple.head_vocab_sizes"),
+            ("ngram_heads_offsets", "ple.head_offsets"),
+        ):
+            yield base + key, torch.tensor(
+                [int(v) for v in md[f"{_ARCH}.{field}"]], dtype=torch.int64
+            )
+
+    # A merged or stacked module only completes once every part has been seen, and the
+    # tensors arrive in shard order rather than grouped.
+    pending: dict[tuple[int, str], dict[str, Any]] = {}
+
+    def feed(layer: int, module: str, parts: tuple[str, ...], part: str, val):
+        buf = pending.setdefault((layer, module), {})
+        buf[part] = val
+        if len(buf) != len(parts):
+            return None
+        del pending[(layer, module)]
+        return [buf[p] for p in parts]
+
+    for t in iter_gguf_tensors(model_path):
+        name = t.name
+
+        if name == _PLE_TABLE:
+            continue
+        if name == "token_embd.weight":
+            if "model.embed_tokens" in packed:
+                yield "model.embed_tokens.qweight", t.packed()
+            else:
+                yield "model.embed_tokens.weight", _to_bf16(t)
+            continue
+        if name == "output.weight":
+            yield "lm_head.weight", (
+                t.packed() if "lm_head" in packed else _to_bf16(t)
+            )
+            continue
+        if name in _GLOBAL_PLUS_ONE:
+            yield _GLOBAL_PLUS_ONE[name], _to_bf16(t) - 1.0
+            continue
+        if name in _GLOBAL_SUFFIX_MAP:
+            key = _GLOBAL_SUFFIX_MAP[name]
+            module = key.rsplit(".weight", 1)[0]
+            yield key, (t.packed() if module in packed else _to_bf16(t))
+            continue
+        if not name.startswith("blk."):
+            raise ValueError(f"{name}: unrecognized qwen4exp GGUF tensor")
+
+        layer = int(name.split(".")[1])
+        suffix = name.split(".", 2)[2]
+        stem = f"model.layers.{layer}."
+        if suffix in _EXPERT_SUFFIXES:
+            continue
+
+        if suffix in _PLUS_ONE_MAP:
+            yield stem + _PLUS_ONE_MAP[suffix], _to_bf16(t) - 1.0
+            continue
+        if suffix == "ssm_a":
+            # stored as -exp(A_log); FreeToken keeps A_log (fp32)
+            a = dequant_any(t).to(torch.float32)
+            assert (a < 0).all(), f"{name}: expected -exp(A_log) (negative values)"
+            if v_perm is not None:
+                a = a[v_perm]
+            yield stem + "linear_attn.A_log", torch.log(-a)
+            continue
+        if suffix == "ssm_dt.bias":
+            dtb = dequant_any(t).to(torch.float32)
+            yield stem + "linear_attn.dt_bias", dtb if v_perm is None else dtb[v_perm]
+            continue
+        if suffix == "ssm_conv1d.weight":
+            # ggml [K, conv_dim] -> torch (conv_dim, K) -> module [conv_dim, 1, K]
+            yield stem + "linear_attn.conv1d.weight", _fix_v_rows(
+                _to_bf16(t)
+            ).unsqueeze(1).contiguous()
+            continue
+        if suffix == "ple_conv1d.weight":
+            yield stem + "ple.conv1d.weight", _to_bf16(t).unsqueeze(1).contiguous()
+            continue
+        if suffix == "ffn_gate_inp_shexp.weight":
+            yield stem + "mlp.shared_expert_gate.weight", _to_bf16(t).reshape(1, -1)
+            continue
+        if suffix == "ssm_out.weight" and v_perm is not None:
+            # [hidden, value_dim]: reorder the input columns to match the permuted heads.
+            key = stem + "linear_attn.out_proj.weight"
+            if stem + "linear_attn.out_proj" in packed:
+                per_head = _head_block_bytes(n_v * d_v, d_v, t.ggml_type)
+                assert per_head is not None, (
+                    f"{name}: value heads do not land on {t.ggml_type} block boundaries, "
+                    "so the head permutation cannot be applied to the packed rows"
+                )
+                yield key, _permute_packed_heads(t.packed(), v_perm, per_head)
+            else:
+                cols = (v_perm[:, None] * d_v + torch.arange(d_v)).reshape(-1)
+                yield key, _to_bf16(t)[:, cols].contiguous()
+            continue
+
+        done = False
+        for module, slots in _MERGED.items():
+            if suffix not in slots:
+                continue
+            if module == "self_attn.qkv_proj" and not _is_full_attention(layer, interval):
+                continue
+            if module == "linear_attn.in_proj" and _is_full_attention(layer, interval):
+                continue
+            i = slots.index(suffix)
+            if stem + module in packed:
+                yield f"{stem}{module}.weight_{i}", t.packed()
+            else:
+                val = _to_bf16(t)
+                if v_perm is not None and module == "linear_attn.in_proj":
+                    if suffix == "attn_qkv.weight":
+                        val = _fix_v_rows(val)                       # [q | k | v]
+                    elif suffix == "attn_gate.weight":
+                        val = _permute_head_rows(val, v_perm, d_v)   # z, per value head
+                    else:
+                        val = val[v_perm]                            # beta / alpha
+                group = feed(layer, module, slots, suffix, val)
+                if group is not None:
+                    yield f"{stem}{module}.weight", torch.cat(group, dim=0).contiguous()
+            done = True
+            break
+        if done:
+            continue
+
+        for module, (parts, align) in _ROW_CONCAT.items():
+            if suffix not in parts:
+                continue
+            is_packed = stem + module in packed
+            group = feed(
+                layer, module, parts, suffix,
+                t.packed() if is_packed else _to_bf16(t),
+            )
+            if group is not None:
+                rows = sum(g.shape[0] for g in group)
+                pad = _pad_rows(rows, align)
+                if pad:
+                    group.append(
+                        _zero_rows(pad, group[0].shape[1]) if is_packed
+                        else group[0].new_zeros(pad, group[0].shape[1])
+                    )
+                yield f"{stem}{module}.weight", torch.cat(group, dim=0).contiguous()
+            done = True
+            break
+        if done:
+            continue
+
+        rel = _SUFFIX_MAP.get(suffix)
+        if rel is None:
+            raise ValueError(f"{name}: unrecognized qwen4exp GGUF tensor")
+        module = stem + rel.rsplit(".weight", 1)[0]
+        yield stem + rel, (t.packed() if module in packed else _to_bf16(t))
+
+    leftovers = sorted(pending)
+    assert not leftovers, f"incomplete fused groups: {leftovers}"
+
+
+__all__ = ["parse_gguf_config", "gguf_module_types", "iter_gguf_weights"]
