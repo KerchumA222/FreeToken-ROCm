@@ -37,9 +37,13 @@ class MmvqGgufLinearKernel(LinearKernel):
     def apply(self, layer: Any, x: torch.Tensor) -> torch.Tensor:
         from freetoken.layers.gguf import fused_mul_mat_gguf
 
-        outs = [fused_mul_mat_gguf(x, q, t) for q, t in zip(layer.qweights, layer.gguf_types)]
+        outs = [
+            fused_mul_mat_gguf(x, getattr(layer, n), t)
+            for n, t in zip(layer.gguf_slots, layer.gguf_types)
+        ]
         out = outs[0] if len(outs) == 1 else torch.cat(outs, dim=-1)
-        return out + layer.bias.to(out.dtype) if layer.bias is not None else out
+        bias = getattr(layer, "bias", None)
+        return out + bias.to(out.dtype) if bias is not None else out
 
 
 @register_method(QuantKind.GGUF, LayerKind.LINEAR)
@@ -56,11 +60,20 @@ class GgufLinearMethod(LinearMethod):
                 f"gguf scheme has {len(types)} types for {len(g.output_sizes)} fused slots"
             )
         layer.gguf_types = types
-        layer.qweights = [
-            torch.empty(out, row_bytes(g.in_features, t), dtype=torch.uint8)
-            for out, t in zip(g.output_sizes, types)
-        ]
-        # Single-slot layers keep the conventional attribute name so the weight
-        # readers and state_dict see `qweight`, matching the other dialects' `weight`.
-        if len(layer.qweights) == 1:
-            layer.qweight = layer.qweights[0]
+        # One named tensor per slot rather than one concatenated buffer: slots of a
+        # fused module can carry different ggml types, so their row_bytes differ and
+        # there is no single [out, row_bytes] shape covering them. Named because
+        # BaseOP's state_dict walks attributes -- a list would be invisible to the
+        # weight readers. A plain linear keeps the conventional single `qweight`,
+        # matching the other dialects' `weight`.
+        # Named `weight` like every other dialect's tensor rather than `qweight`:
+        # the element type is the scheme's business, and ParallelLMHead pre-creates a
+        # bf16 `weight` that create_weights is expected to replace -- a differently
+        # named tensor would leave that stale one behind for the weight reader to
+        # demand.
+        layer.gguf_slots = (
+            ("weight",) if len(types) == 1
+            else tuple(f"weight_{i}" for i in range(len(types)))
+        )
+        for slot, out, t in zip(layer.gguf_slots, g.output_sizes, types):
+            setattr(layer, slot, torch.empty(out, row_bytes(g.in_features, t), dtype=torch.uint8))

@@ -288,12 +288,29 @@ def _load_attr(module_path: str, attr_name: str) -> Any:
 
 
 def checkpoint_quant_config(model_path: str, hf_config: Any, spec: ModelSpec):
-    """The checkpoint's QuantConfig under the family's naming, or None for GGUF, whose native-quant ops the shared parser does not model yet."""
+    """The checkpoint's QuantConfig under the family's naming.
+
+    A GGUF checkpoint carries its types per tensor in the tensor table rather than in
+    a ``quantization_config``, so the family's GGUF adapter builds the module -> ggml
+    type map (it is the only code that knows both namings) and the ``gguf`` dialect is
+    constructed from it. Families whose GGUF adapter does not export
+    ``gguf_module_types`` keep serving their packed weights the older way, so this
+    stays None for them rather than claiming an empty layout.
+    """
     from freetoken.layers.quantization import NameMap, QuantConfig
     from freetoken.utils.hf import optional_hf_file
 
     if spec.parse_config == "parse_gguf_config":
-        return None
+        from freetoken.layers.quantization.configs.gguf import (
+            GgufConfig,
+            gguf_quantization_config,
+        )
+
+        try:
+            module_types = _load_attr(spec.module, "gguf_module_types")
+        except AttributeError:
+            return None
+        return GgufConfig(gguf_quantization_config(module_types(model_path)))
     # NOTE: ModelOpt exports before 0.41 keep the quantization config only in hf_quant_config.json, and the weight download fetches nothing but the safetensors shards, so this sidecar is fetched on its own.
     hf_quant_config = None
     sidecar = optional_hf_file(model_path, "hf_quant_config.json")
