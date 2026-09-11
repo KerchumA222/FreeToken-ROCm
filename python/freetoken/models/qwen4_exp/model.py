@@ -183,11 +183,8 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             return 0
 
         if engine_config.ple_backend == "disk":
-            from freetoken.utils import download_hf_weight
-
             from .ple_disk import DiskRowTable, resolve_row_source
 
-            folder = download_hf_weight(engine_config.model_path)
             # one WAIT node per captured graph: the flag protocol supports a single consume
             assert len(ple_layers) == 1, "disk PLE backend expects exactly one PLE layer"
             emb, args = ple_layers[0].ple_embedding, ple_layers[0].args
@@ -200,7 +197,7 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 "eos_token_id": args.ngram_boundary_token_id,
             }
             disk_table = DiskRowTable(
-                resolve_row_source(folder),
+                resolve_row_source(engine_config.model_path),
                 constants,
                 max_graph_rows=max(256, engine_config.cuda_graph_max_bs or 0),
                 max_extend_tokens=engine_config.max_extend_tokens,

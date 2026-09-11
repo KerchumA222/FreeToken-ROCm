@@ -48,6 +48,16 @@ class PleRowSource:
     row_bytes: int
     row_stride: int
     scale: float
+    # Elements per row. Equal to row_bytes for the fp8 checkpoint (one byte each) but
+    # not for a block-quantized table, where a row of 160 elements is 170 bytes.
+    head_dim: int = 0
+    # ggml type of a row, or None for the checkpoint's fp8-with-one-global-scale rows.
+    # The store reads bytes either way; this only selects how they are decoded.
+    ggml_type: int | None = None
+
+    def __post_init__(self) -> None:
+        if not self.head_dim:
+            object.__setattr__(self, "head_dim", self.row_bytes)
 
     @property
     def total_rows(self) -> int:
@@ -93,9 +103,41 @@ def source_from_safetensors(folder: str) -> PleRowSource:
     return PleRowSource(paths, [f for f, _ in order], [b for _, b in order], rows, cols, cols, float(scale))
 
 
-def resolve_row_source(folder: str) -> PleRowSource:
-    """Pick the row source for a checkpoint; the seam where a repacked format would plug in."""
-    return source_from_safetensors(folder)
+# llama.cpp flattens the checkpoint's 128 n-gram shards into one tensor, so the GGUF
+# table is a single extent and the row index needs no shard arithmetic.
+_GGUF_PLE_TABLE = "per_layer_token_embd.weight"
+
+
+def source_from_gguf(model_path: str) -> PleRowSource:
+    """Map the GGUF's flat ``per_layer_token_embd`` in place: one extent, block-quantized rows."""
+    from freetoken.models.gguf.reader import iter_gguf_tensors
+
+    for t in iter_gguf_tensors(model_path):
+        if t.name != _GGUF_PLE_TABLE:
+            continue
+        return PleRowSource(
+            paths=[t.path],
+            extent_file=[0],
+            extent_base=[int(t.data_offset)],
+            rows_per_extent=t.rows,
+            row_bytes=t.row_bytes,
+            row_stride=t.row_bytes,
+            scale=1.0,          # block-quantized rows carry their own scales
+            head_dim=int(t.shape[-1]),
+            ggml_type=t.ggml_type,
+        )
+    raise ValueError(f"{model_path}: GGUF has no {_GGUF_PLE_TABLE}")
+
+
+def resolve_row_source(model_path: str) -> PleRowSource:
+    """Pick the row source for a checkpoint; the seam where a repacked format plugs in."""
+    from freetoken.models.gguf.reader import is_gguf_path
+
+    if is_gguf_path(model_path):
+        return source_from_gguf(model_path)
+    from freetoken.utils import download_hf_weight
+
+    return source_from_safetensors(download_hf_weight(model_path))
 
 
 class DiskRowTable:
@@ -113,7 +155,9 @@ class DiskRowTable:
         from freetoken.kernel import _ple_store
 
         self.num_rows = source.total_rows
-        self.head_dim = source.row_bytes  # fp8: one byte per element
+        self.head_dim = source.head_dim      # elements per row
+        self.row_bytes = source.row_bytes    # bytes per row on disk (>= head_dim)
+        self.ggml_type = source.ggml_type
         self.dtype = dtype
         self.heads = int(hash_constants["num_ngram_heads"])
         self.scale = source.scale
@@ -139,7 +183,8 @@ class DiskRowTable:
             use_io_uring=os.getenv(_IO_URING_ENV, "1") != "0",
         )
         self._device = torch.device("cuda", torch.cuda.current_device())
-        self._token_bytes = self.heads * self.head_dim
+        # what the store stages per token: bytes, not elements
+        self._token_bytes = self.heads * self.row_bytes
         # allocated up front: pinned alloc inside stream capture is illegal; one replay consumes it at a time
         self._graph_pinned = alloc_pinned_tensor(max_graph_rows * self._token_bytes, dtype=torch.uint8)
         self._graph_pinned.zero_()  # padded decode lanes read whatever sits here
@@ -257,9 +302,20 @@ class DiskRowTable:
         )
         nbytes = rows * self._token_bytes
         dev[:nbytes].copy_(pinned[:nbytes], non_blocking=True)
-        values = dev[:nbytes].view(torch.float8_e4m3fn).to(self.dtype)
-        if self.scale != 1.0:
-            values = values * self.scale
+        if self.ggml_type is None:
+            values = dev[:nbytes].view(torch.float8_e4m3fn).to(self.dtype)
+            if self.scale != 1.0:
+                values = values * self.scale
+        else:
+            # Block-quantized rows carry their scales inline, so there is no global
+            # multiply; the triton dequant is graph-safe and covers every type the
+            # GGUF families serve.
+            from freetoken.layers.gguf import _dequant_triton
+
+            n = rows * self.heads
+            values = _dequant_triton(
+                dev[:nbytes].view(n, self.row_bytes), self.ggml_type, n, self.head_dim
+            ).to(self.dtype)
         values = values.view(*row_ids.shape[:-1], -1)
         if out is None:
             return values
