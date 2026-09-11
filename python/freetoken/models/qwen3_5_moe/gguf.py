@@ -70,7 +70,11 @@ _EXPERT_SUFFIXES = ("ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps
 # output.weight is [vocab, hidden] and read in full every decode step, so it is
 # the single largest dense kernel -- the NVFP4 path already keeps it native for
 # exactly this reason (see Qwen3_5MoEForCausalLM.__init__).
-_PACKABLE_DENSE = ("output.weight",)
+# token_embd is a pure lookup, so keeping it packed buys VRAM rather than time --
+# GGUFEmbedding gathers the looked-up rows and dequantizes only those. That matters
+# far more for a model whose embedding table is the largest structure in it than it
+# does here (Q4_K: 273 MiB packed against 970 MiB dequantized).
+_PACKABLE_DENSE = ("output.weight", "token_embd.weight")
 
 
 def _is_packable(ggml_type: int) -> bool:
@@ -320,7 +324,10 @@ def iter_gguf_weights(
     for t in iter_gguf_tensors(model_path):
         name = t.name
         if name == "token_embd.weight":
-            yield "model.embed_tokens.weight", _to_bf16(t)
+            if _is_packable(t.ggml_type):
+                yield "model.embed_tokens.qweight", t.packed()
+            else:
+                yield "model.embed_tokens.weight", _to_bf16(t)
         elif name == "output_norm.weight":
             yield "model.norm.weight", _to_bf16(t)
         elif name == "output.weight":

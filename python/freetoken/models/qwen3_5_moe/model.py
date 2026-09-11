@@ -70,10 +70,25 @@ class Qwen3_5DecoderLayer(BaseOP):
 
 class Qwen3_5Model(BaseOP):
     def __init__(self, config: ModelConfig):
-        self.embed_tokens = VocabParallelEmbedding(
-            num_embeddings=config.vocab_size,
-            embedding_dim=config.hidden_size,
+        # A tied lm_head reads embed_tokens.weight through ParallelLMHead, and a
+        # packed embedding has no .weight -- so tied checkpoints keep the bf16 table.
+        embed_type = (
+            None if config.tie_word_embeddings
+            else _gguf_dense_type(config, "token_embd.weight")
         )
+        if embed_type is not None:
+            from freetoken.layers.gguf import GGUFEmbedding
+
+            self.embed_tokens = GGUFEmbedding(
+                num_embeddings=config.vocab_size,
+                embedding_dim=config.hidden_size,
+                quant_type=embed_type,
+            )
+        else:
+            self.embed_tokens = VocabParallelEmbedding(
+                num_embeddings=config.vocab_size,
+                embedding_dim=config.hidden_size,
+            )
         self.layers = OPList(
             [Qwen3_5DecoderLayer(config, layer_id) for layer_id in range(config.num_layers)]
         )
@@ -88,11 +103,19 @@ class Qwen3_5Model(BaseOP):
         return x
 
 
+def _gguf_dense_type(config, gguf_name: str) -> int | None:
+    """The ggml type of a dense tensor the GGUF loader can serve packed, else None."""
+    return (getattr(config, "gguf_dense_types", None) or {}).get(gguf_name)
+
+
 def _gguf_lm_head_type(config) -> int | None:
-    """The lm head's ggml type when the GGUF loader can serve it packed, else None."""
+    """The lm head's ggml type when the GGUF loader can serve it packed, else None.
+
+    A tied head shares embed_tokens, so it follows the embedding path instead.
+    """
     if config.tie_word_embeddings:
         return None
-    return (getattr(config, "gguf_dense_types", None) or {}).get("output.weight")
+    return _gguf_dense_type(config, "output.weight")
 
 
 class Qwen3_5MoEForCausalLM(BaseLLMModel):
