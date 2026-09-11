@@ -248,17 +248,24 @@ class GGUFEmbedding(BaseOP):
         )
         self._embed_scale = embed_scale
         self._embed_scale_t: torch.Tensor | None = None
+        # Modules are constructed under ``torch_dtype(config.dtype)``, so the default
+        # dtype here IS the model's -- the same way every other layer's torch.empty
+        # picks it up. Hardcoding bf16 silently produced bf16 activations inside an
+        # fp16 model, which --dtype auto now selects on every gfx10xx GPU.
+        self._out_dtype = torch.get_default_dtype()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         flat = x.flatten()
         rows = self.qweight.index_select(0, flat)  # [n, row_bytes] packed
         if _use_triton(x):
             y = _dequant_triton(rows, self._quant_type, flat.shape[0], self.embedding_dim)
-            y = y.to(torch.bfloat16)
+            y = y.to(self._out_dtype)
         else:
             from freetoken.kernel.gguf import ggml_dequantize
 
-            y = ggml_dequantize(rows, self._quant_type, flat.shape[0], self.embedding_dim, torch.bfloat16)
+            y = ggml_dequantize(
+                rows, self._quant_type, flat.shape[0], self.embedding_dim, self._out_dtype
+            )
         y = y.view(*x.shape, self.embedding_dim)
         if self._embed_scale is not None:
             if self._embed_scale_t is None:
@@ -267,4 +274,4 @@ class GGUFEmbedding(BaseOP):
         return y
 
 
-__all__ = ["GGUFLinear", "GGUFEmbedding", "fused_mul_mat_gguf"]
+__all__ = ["GGUFLinear", "GgufColSplits", "GgufLMHead", "GGUFEmbedding", "fused_mul_mat_gguf"]
