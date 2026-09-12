@@ -4,7 +4,7 @@ import math
 import os
 import sys
 from dataclasses import dataclass
-from typing import Iterator
+from typing import Iterator, Sequence
 
 import torch
 from flashlib.kernels.slot_cache import N_STATS, Stat
@@ -461,21 +461,32 @@ class OffloadMoeCache:
             total / (1 << 30), len(self.bank_schema),
         )
 
-    def _fill_prefill_buffer_from_tier(self, layer_id: int, buffer_id: int) -> None:
+    def _fill_prefill_buffer_from_tier(
+        self, layer_id: int, buffer_id: int, wanted: Sequence[int] | None = None
+    ) -> None:
         """Fill this layer's prefill double buffer from the host tier plus disk.
 
-        Prefill wants a whole layer, but the pool already holds a good fraction of it,
-        and re-reading those experts is the single largest cost of a disk-backed tier
-        (a naive whole-layer stage re-reads every expert in the model on every
-        prefill). So split it: gather the resident experts out of the pool and read
-        only the remainder off disk. Both halves land in the buffer through the same
-        indexed-copy kernel decode uses, one launch per bank per half, so the scatter
-        costs no more than the contiguous copy it replaces.
+        Two reductions, because the naive form re-reads every expert in the model on
+        every prefill:
+
+        * ``wanted`` is the set of experts this chunk's tokens actually route to. The
+          GPU buffer is indexed by expert id and the GEMM only ever reads the rows
+          ``topk_ids`` names, so the rest may be left stale rather than fetched. A
+          short prompt routes to a small slice of the layer -- measured on
+          Qwen3.8-Flash-Next, 8 tokens reach 41 of 512 experts (8%) -- so staging the
+          whole layer moves an order of magnitude more bytes than the GEMM reads.
+          ``None`` keeps the whole-layer behaviour.
+        * Of what is wanted, the pool already holds some; only the remainder is read
+          off disk.
+
+        Both halves land in the buffer through the same indexed-copy kernel decode
+        uses, one launch per bank per half, so the scatter costs no more than the
+        contiguous copy it replaces.
         """
         from freetoken.kernel import fast_index_copy_jit
 
         tier, idx = self.host_tier, self._stage_idx[buffer_id]
-        hit_e, hit_s, miss = tier.residency_split(layer_id, self.num_experts)
+        hit_e, hit_s, miss = tier.residency_split(layer_id, self.num_experts, wanted)
         # Park what we are about to read in any free slots rather than throwing it
         # away: an unadmitted prefill leaves a cold pool cold, so the first requests
         # read 100% from disk no matter how large the pool is. Free slots only -- see
@@ -490,7 +501,7 @@ class OffloadMoeCache:
         # Same counters the GPU-tier hit/miss split reports through
         # decode_miss_stats: rows served without re-fetching, over rows needed.
         self.prefill_hit_rows += n_hit
-        self.prefill_total_rows += self.num_experts
+        self.prefill_total_rows += self.num_experts if wanted is None else len(wanted)
 
         if n_miss:
             tier.read_into(
@@ -854,7 +865,16 @@ class OffloadMoeCache:
                 self._prefill_slot_snapshot.copy_(self.slot_for_id, non_blocking=True)
             self.prefill_copy_stream.synchronize()
 
-    def prefetch_prefill_layer(self, layer_id: int) -> None:
+    def prefetch_prefill_layer(
+        self, layer_id: int, wanted: Sequence[int] | None = None
+    ) -> None:
+        """Stage ``layer_id`` into its double buffer.
+
+        ``wanted`` (disk tier only) restricts the staging to the experts this chunk
+        routes to; see :meth:`_fill_prefill_buffer_from_tier`. It is only known for
+        the layer being computed, never for the look-ahead, which is why the caller
+        drops the look-ahead when it passes one.
+        """
         if not self.prefill_overlap or layer_id >= self.num_layers:
             return
         if layer_id < 0:
@@ -873,7 +893,7 @@ class OffloadMoeCache:
         def copy() -> None:
             self._invalidate_prefill_buffer(buffer_id)
             if self.host_tier is not None:
-                self._fill_prefill_buffer_from_tier(layer_id, buffer_id)
+                self._fill_prefill_buffer_from_tier(layer_id, buffer_id, wanted)
                 return
             for (per_layer, _), buffer in zip(self.banks, self.prefill_bank_buffers):
                 buffer[buffer_id].copy_(per_layer[layer_id], non_blocking=True)

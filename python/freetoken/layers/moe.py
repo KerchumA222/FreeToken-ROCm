@@ -480,7 +480,7 @@ class OffloadMoELayer(MoELayer):
         cache = self.offload_cache
         assert cache is not None
         if cache.prefill_overlap:
-            views = self._wait_prefill_overlap(cache)
+            views = self._wait_prefill_overlap(cache, topk_ids)
             out = self._expert_gemm(
                 cache,
                 hidden_states,
@@ -506,16 +506,42 @@ class OffloadMoELayer(MoELayer):
             is_prefill=True,
         )
 
-    def _wait_prefill_overlap(self, cache: OffloadMoeCache) -> tuple[torch.Tensor, ...]:
+    # Above this share of the layer, staging only the routed experts stops paying for
+    # itself: the bytes saved shrink while the cost of giving up the look-ahead (which
+    # needs the NEXT layer's routing, and so cannot be restricted) stays the same.
+    # Measured on Qwen3.8-Flash-Next over a disk tier, 373-token prompt (routing reaches
+    # ~64% of each layer): whole-layer with the look-ahead moved 123.2 GB in 61.4 s,
+    # routed-only without it moved 102.5 GB -- 17% fewer bytes -- in 94.7 s, because a
+    # read serialised against the GEMM only sustains 1.08 GB/s where an overlapped one
+    # sustains 2.0. Short prompts are the other way round by a wide margin, hence a
+    # split rather than a single policy.
+    _ROUTED_STAGE_MAX_SHARE = 0.5
+
+    def _wait_prefill_overlap(
+        self, cache: OffloadMoeCache, topk_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, ...]:
         """Double-buffer choreography for this layer's overlap prefill: kick off the
-        next layer's full-layer H2D copy, then return this layer's bank views (in
-        bank registration order; buffer position == expert id, so routing ids pass
-        through unmapped). The caller runs ``release_prefill_layer`` after its GEMMs.
+        next layer's H2D copy, then return this layer's bank views (in bank
+        registration order; buffer position == expert id, so routing ids pass through
+        unmapped). The caller runs ``release_prefill_layer`` after its GEMMs.
+
+        With a disk tier the staging is restricted to the experts this chunk actually
+        routes to, which for a short prompt is a small slice of the layer. That
+        forecloses the look-ahead -- layer N+1's routing is not known until its own
+        router runs -- so the layer is staged on demand instead. Trading the overlap
+        for an order of magnitude fewer bytes is the right way round when the bytes
+        come off disk; when they do not (banks resident in host RAM) nothing changes.
         """
         if self.layer_id == 0:
             cache.begin_prefill()
-        cache.prefetch_prefill_layer(self.layer_id)
-        cache.prefetch_prefill_layer(self.layer_id + 1)
+        wanted = None
+        if cache.host_tier is not None:
+            routed = torch.unique(topk_ids).tolist()
+            if len(routed) <= self._ROUTED_STAGE_MAX_SHARE * self.num_experts:
+                wanted = routed
+        cache.prefetch_prefill_layer(self.layer_id, wanted)
+        if wanted is None:
+            cache.prefetch_prefill_layer(self.layer_id + 1)
         return cache.wait_prefill_layer(self.layer_id)
 
     # ------------------------------------------------------------------

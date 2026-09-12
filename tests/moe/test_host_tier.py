@@ -193,3 +193,43 @@ def test_admit_free_takes_only_what_is_free(store):
         admitted = c.admit_free(1, [5 % E, 2, 3])
         assert len(admitted) == 2
         assert c.resident == 3
+
+
+def test_residency_split_restricted_to_the_routed_experts(store, expected_expert):
+    """Prefill stages what the chunk routes to, not the whole layer.
+
+    The GPU buffer is indexed by expert id and the GEMM only reads the rows
+    ``topk_ids`` names, so an unrouted expert must not be classified -- and above all
+    must not be read -- merely because it belongs to the layer. Restricting the split
+    is what turns a whole-layer stage into a slice of one.
+    """
+    with HostExpertCache(store, E, capacity=E, pin=False) as c:
+        # make experts 0 and 2 of layer 1 resident, leave the rest cold
+        c.ensure(1, [0, 2])
+
+        # whole layer: every expert is classified
+        hit_e, hit_s, miss = c.residency_split(1, E)
+        assert sorted(hit_e) == [0, 2]
+        assert sorted(hit_e + miss) == list(range(E))
+
+        # restricted: only the routed ones, hits and misses alike
+        routed = [2, 3]
+        hit_e, hit_s, miss = c.residency_split(1, E, routed)
+        assert hit_e == [2] and miss == [3]
+        assert set(hit_e) | set(miss) == set(routed)
+        # and the slot handed back still holds that expert's bytes
+        _check(c, expected_expert, 1, hit_e, hit_s)
+
+        # an empty routing asks for nothing
+        assert c.residency_split(1, E, []) == ([], [], [])
+
+
+def test_residency_split_does_not_disturb_recency(store):
+    """It is a query about what prefill can take, not a use of those entries."""
+    with HostExpertCache(store, E, capacity=2, pin=False) as c:
+        c.ensure(0, [0])
+        c.ensure(0, [1])          # LRU order: 0 (oldest), 1
+        c.residency_split(0, E, [0])   # must not promote expert 0
+        c.ensure(0, [2])          # evicts the oldest, which is still expert 0
+        hit_e, _hit_s, miss = c.residency_split(0, E, [0, 1, 2])
+        assert 0 in miss and sorted(hit_e) == [1, 2]
