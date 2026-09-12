@@ -274,16 +274,23 @@ class HostExpertCache:
         self.stats.reads += len(jobs)
         return claims
 
-    def residency_split(self, layer: int, num_experts: int) -> tuple[list[int], list[int], list[int]]:
-        """``(hit_experts, hit_slots, missing_experts)`` for a whole layer.
+    def residency_split(
+        self,
+        layer: int,
+        num_experts: int,
+        experts: Sequence[int] | None = None,
+    ) -> tuple[list[int], list[int], list[int]]:
+        """``(hit_experts, hit_slots, missing_experts)`` for a layer.
 
-        Lookups do not change recency: this is a query about what prefill can take
-        from the pool, not a use of those entries.
+        ``experts`` restricts the query to a subset -- the experts a prefill chunk
+        actually routes to -- instead of the whole layer. Lookups do not change
+        recency: this is a query about what prefill can take from the pool, not a use
+        of those entries.
         """
         hit_e: list[int] = []
         hit_s: list[int] = []
         miss: list[int] = []
-        for e in range(num_experts):
+        for e in (range(num_experts) if experts is None else experts):
             slot = self._lru.get(self._fid(layer, e), MISS)
             if slot == MISS:
                 miss.append(e)
