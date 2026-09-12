@@ -17,6 +17,7 @@ for every other GGUF adapter.
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Any, Iterator
 
 import torch
@@ -293,9 +294,25 @@ def gguf_module_types(model_path: str) -> dict[str, tuple[str, ...]]:
     name = GGML_NAME.__getitem__
     out: dict[str, tuple[str, ...]] = {}
 
+    # Escape hatch: comma-separated module suffixes to serve DENSE even when their
+    # ggml type is packable. It exists because serving `mlp.shared_expert.down_proj`
+    # packed corrupts memory on a Q4_K_M requant of this model -- layers run, then an
+    # unrelated later layer dies on an illegal access, or (with the corruption landing
+    # in mapped memory) generation degenerates to empty output. Forcing that one
+    # module dense is correct and stable; the same module packed at the SAME type
+    # (Q8_0, 640 -> 2560) is fine in the Q8_0 checkpoint, so the trigger is not the
+    # module or its type alone and the root cause is still open. Not a default: it
+    # costs the packed path on checkpoints that do not need it.
+    #   FT_GGUF_DENSE_MODULES=mlp.shared_expert.down_proj
+    _force_dense = tuple(
+        x for x in os.environ.get("FT_GGUF_DENSE_MODULES", "").split(",") if x
+    )
+
     def one(types: dict[str, int], suffix: str, module: str) -> None:
         t = types.get(suffix)
         if t is None or not _is_packable(t):
+            return
+        if any(module.endswith(x) for x in _force_dense):
             return
         if (suffix == "ssm_out.weight" and perm_needed
                 and _head_block_bytes(n_v * d_v, d_v, t) is None):
