@@ -63,6 +63,21 @@ class _Part:
     ggml_type: int
 
 
+def _fadvise(fd: int, offset: int, nbytes: int, advice: str) -> None:
+    """posix_fadvise where the platform has it; a no-op where it does not.
+
+    Both uses are hints -- the kernel may decline either -- so a platform without
+    them loses performance, never correctness.
+    """
+    flag = getattr(os, advice, None)
+    if flag is None or not hasattr(os, "posix_fadvise"):
+        return
+    try:
+        os.posix_fadvise(fd, offset, nbytes, flag)
+    except OSError:
+        pass
+
+
 class GgufExpertStore:
     """Where each (bank, layer, expert) lives on disk, and how to read it.
 
@@ -190,6 +205,20 @@ class GgufExpertStore:
         fd = self._fds.get(path)
         if fd is None:
             fd = os.open(path, os.O_RDONLY)
+            # Readahead is pure waste here: an expert is read whole, and the bytes
+            # after it belong to some other expert this token almost certainly does
+            # not route to. Measured on Qwen3.8-Flash-Next it inflated device reads
+            # 3-4% over what was asked for; with this hint they track to within 0.2%.
+            #
+            # Only readahead is turned off, not the page cache itself. Caching these
+            # reads does nothing -- the pool in front of it absorbs all the reuse, so
+            # what reaches the disk is the cold tail of a working set far larger than
+            # RAM, and the measured hit rate is zero. But POSIX_FADV_DONTNEED after
+            # each read was 5% SLOWER (2.10 vs 2.21 tok/s over four runs): the syscall
+            # costs more than the pages do, since the kernel already reclaims them for
+            # free under the pinned allocations, which are what the pool is really
+            # bounded by.
+            _fadvise(fd, 0, 0, "POSIX_FADV_RANDOM")
             self._fds[path] = fd
         return fd
 
