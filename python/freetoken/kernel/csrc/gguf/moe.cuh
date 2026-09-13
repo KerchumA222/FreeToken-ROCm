@@ -77,7 +77,8 @@ static __device__ __forceinline__ void moe_q(
         threadIdx.y,
         nrows_x - row_x_0 - 1,
         threadIdx.x,
-        blocks_per_row_x);
+        blocks_per_row_x,
+        ib0);
 
     const int n_per_r = ((qk * blocks_per_warp) / qr);
 #pragma unroll

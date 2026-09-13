@@ -295,14 +295,11 @@ def gguf_module_types(model_path: str) -> dict[str, tuple[str, ...]]:
     out: dict[str, tuple[str, ...]] = {}
 
     # Escape hatch: comma-separated module suffixes to serve DENSE even when their
-    # ggml type is packable. It exists because serving `mlp.shared_expert.down_proj`
-    # packed corrupts memory on a Q4_K_M requant of this model -- layers run, then an
-    # unrelated later layer dies on an illegal access, or (with the corruption landing
-    # in mapped memory) generation degenerates to empty output. Forcing that one
-    # module dense is correct and stable; the same module packed at the SAME type
-    # (Q8_0, 640 -> 2560) is fine in the Q8_0 checkpoint, so the trigger is not the
-    # module or its type alone and the root cause is still open. Not a default: it
-    # costs the packed path on checkpoints that do not need it.
+    # ggml type is packable, for isolating a module suspected of a kernel-side fault.
+    # It was introduced to work around what turned out to be the MMQ partial-tile
+    # over-read (docs/investigations/packed-shared-expert-down-proj.md) -- that is
+    # fixed, and no checkpoint needs this today. Kept because naming one module and
+    # re-running is the cheapest way to bisect the next one.
     #   FT_GGUF_DENSE_MODULES=mlp.shared_expert.down_proj
     _force_dense = tuple(
         x for x in os.environ.get("FT_GGUF_DENSE_MODULES", "").split(",") if x
