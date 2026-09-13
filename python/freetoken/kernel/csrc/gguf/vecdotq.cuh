@@ -570,9 +570,11 @@ static __device__ __forceinline__ void load_tiles_q4_0(
     const int& i_offset,
     const int& i_max,
     const int& k,
-    const int& blocks_per_row) {
+    const int& blocks_per_row,
+    const int& ib0) {
   const int kbx = k / QI4_0;
   const int kqsx = k % QI4_0;
+  const int kbx_eff = min(kbx, blocks_per_row - ib0 - 1);
 
   const block_q4_0* bx0 = (const block_q4_0*)vx;
   float* x_dmf = (float*)x_dm;
@@ -583,13 +585,14 @@ static __device__ __forceinline__ void load_tiles_q4_0(
     if (need_check) {
       i = min(i, i_max);
     }
-    const block_q4_0* bxi = bx0 + i * blocks_per_row + kbx;
+    const block_q4_0* bxi = bx0 + i * blocks_per_row + kbx_eff;
     x_ql[i * (WARP_SIZE_GGUF + 1) + k] = get_int_from_uint8(bxi->qs, kqsx);
     // x_dmf[i * (WARP_SIZE_GGUF/QI4_0) + i / QI4_0 + kbx] = bxi->d;
   }
 
   const int blocks_per_tile_x_row = WARP_SIZE_GGUF / QI4_0;
   const int kbxd = k % blocks_per_tile_x_row;
+  const int kbxd_eff = min(kbxd, blocks_per_row - ib0 - 1);
 
 #pragma unroll
   for (int i0 = 0; i0 < mmq_y; i0 += nwarps * QI4_0) {
@@ -597,7 +600,7 @@ static __device__ __forceinline__ void load_tiles_q4_0(
     if (need_check) {
       i = min(i, i_max);
     }
-    const block_q4_0* bxi = bx0 + i * blocks_per_row + kbxd;
+    const block_q4_0* bxi = bx0 + i * blocks_per_row + kbxd_eff;
     x_dmf[i * (WARP_SIZE_GGUF / QI4_0) + i / QI4_0 + kbxd] = __half2float(bxi->d);
   }
 }
@@ -668,9 +671,11 @@ static __device__ __forceinline__ void load_tiles_q4_1(
     const int& i_offset,
     const int& i_max,
     const int& k,
-    const int& blocks_per_row) {
+    const int& blocks_per_row,
+    const int& ib0) {
   const int kbx = k / QI4_1;
   const int kqsx = k % QI4_1;
+  const int kbx_eff = min(kbx, blocks_per_row - ib0 - 1);
 
   const block_q4_1* bx0 = (const block_q4_1*)vx;
 
@@ -680,12 +685,13 @@ static __device__ __forceinline__ void load_tiles_q4_1(
     if (need_check) {
       i = min(i, i_max);
     }
-    const block_q4_1* bxi = bx0 + i * blocks_per_row + kbx;
+    const block_q4_1* bxi = bx0 + i * blocks_per_row + kbx_eff;
     x_ql[i * (WARP_SIZE_GGUF + 1) + k] = get_int_from_uint8_aligned(bxi->qs, kqsx);
   }
 
   const int blocks_per_tile_x_row = WARP_SIZE_GGUF / QI4_1;
   const int kbxd = k % blocks_per_tile_x_row;
+  const int kbxd_eff = min(kbxd, blocks_per_row - ib0 - 1);
 
 #pragma unroll
   for (int i0 = 0; i0 < mmq_y; i0 += nwarps * QI4_1) {
@@ -693,7 +699,7 @@ static __device__ __forceinline__ void load_tiles_q4_1(
     if (need_check) {
       i = min(i, i_max);
     }
-    const block_q4_1* bxi = bx0 + i * blocks_per_row + kbxd;
+    const block_q4_1* bxi = bx0 + i * blocks_per_row + kbxd_eff;
     x_dm[i * (WARP_SIZE_GGUF / QI4_1) + i / QI4_1 + kbxd] = bxi->dm;
   }
 }
@@ -763,9 +769,11 @@ static __device__ __forceinline__ void load_tiles_q5_0(
     const int& i_offset,
     const int& i_max,
     const int& k,
-    const int& blocks_per_row) {
+    const int& blocks_per_row,
+    const int& ib0) {
   const int kbx = k / QI5_0;
   const int kqsx = k % QI5_0;
+  const int kbx_eff = min(kbx, blocks_per_row - ib0 - 1);
 
   const block_q5_0* bx0 = (const block_q5_0*)vx;
 
@@ -776,7 +784,7 @@ static __device__ __forceinline__ void load_tiles_q5_0(
     if (need_check) {
       i = min(i, i_max);
     }
-    const block_q5_0* bxi = bx0 + i * blocks_per_row + kbx;
+    const block_q5_0* bxi = bx0 + i * blocks_per_row + kbx_eff;
     const int ql = get_int_from_uint8(bxi->qs, kqsx);
     const int qh = get_int_from_uint8(bxi->qh, 0) >> (4 * (k % QI5_0));
 
@@ -801,6 +809,7 @@ static __device__ __forceinline__ void load_tiles_q5_0(
 
   const int blocks_per_tile_x_row = WARP_SIZE_GGUF / QI5_0;
   const int kbxd = k % blocks_per_tile_x_row;
+  const int kbxd_eff = min(kbxd, blocks_per_row - ib0 - 1);
   float* x_dmf = (float*)x_dm;
 
 #pragma unroll
@@ -811,7 +820,7 @@ static __device__ __forceinline__ void load_tiles_q5_0(
       i = min(i, i_max);
     }
 
-    const block_q5_0* bxi = bx0 + i * blocks_per_row + kbxd;
+    const block_q5_0* bxi = bx0 + i * blocks_per_row + kbxd_eff;
     x_dmf[i * (WARP_SIZE_GGUF / QI5_0) + i / QI5_0 + kbxd] = __half2float(bxi->d);
   }
 }
@@ -884,9 +893,11 @@ static __device__ __forceinline__ void load_tiles_q5_1(
     const int& i_offset,
     const int& i_max,
     const int& k,
-    const int& blocks_per_row) {
+    const int& blocks_per_row,
+    const int& ib0) {
   const int kbx = k / QI5_1;
   const int kqsx = k % QI5_1;
+  const int kbx_eff = min(kbx, blocks_per_row - ib0 - 1);
 
   const block_q5_1* bx0 = (const block_q5_1*)vx;
 
@@ -898,7 +909,7 @@ static __device__ __forceinline__ void load_tiles_q5_1(
       i = min(i, i_max);
     }
 
-    const block_q5_1* bxi = bx0 + i * blocks_per_row + kbx;
+    const block_q5_1* bxi = bx0 + i * blocks_per_row + kbx_eff;
 
     const int ql = get_int_from_uint8_aligned(bxi->qs, kqsx);
     const int qh = get_int_from_uint8_aligned(bxi->qh, 0) >> (4 * (k % QI5_1));
@@ -922,6 +933,7 @@ static __device__ __forceinline__ void load_tiles_q5_1(
 
   const int blocks_per_tile_x_row = WARP_SIZE_GGUF / QI5_1;
   const int kbxd = k % blocks_per_tile_x_row;
+  const int kbxd_eff = min(kbxd, blocks_per_row - ib0 - 1);
 
 #pragma unroll
   for (int i0 = 0; i0 < mmq_y; i0 += nwarps * QI5_1) {
@@ -931,7 +943,7 @@ static __device__ __forceinline__ void load_tiles_q5_1(
       i = min(i, i_max);
     }
 
-    const block_q5_1* bxi = bx0 + i * blocks_per_row + kbxd;
+    const block_q5_1* bxi = bx0 + i * blocks_per_row + kbxd_eff;
 
     x_dm[i * (WARP_SIZE_GGUF / QI5_1) + i / QI5_1 + kbxd] = bxi->dm;
   }
@@ -1000,9 +1012,11 @@ static __device__ __forceinline__ void load_tiles_q8_0(
     const int& i_offset,
     const int& i_max,
     const int& k,
-    const int& blocks_per_row) {
+    const int& blocks_per_row,
+    const int& ib0) {
   const int kbx = k / QI8_0;
   const int kqsx = k % QI8_0;
+  const int kbx_eff = min(kbx, blocks_per_row - ib0 - 1);
   float* x_dmf = (float*)x_dm;
 
   const block_q8_0* bx0 = (const block_q8_0*)vx;
@@ -1014,12 +1028,13 @@ static __device__ __forceinline__ void load_tiles_q8_0(
     if (need_check) {
       i = min(i, i_max);
     }
-    const block_q8_0* bxi = bx0 + i * blocks_per_row + kbx;
+    const block_q8_0* bxi = bx0 + i * blocks_per_row + kbx_eff;
     x_ql[i * (WARP_SIZE_GGUF + 1) + k] = get_int_from_int8(bxi->qs, kqsx);
   }
 
   const int blocks_per_tile_x_row = WARP_SIZE_GGUF / QI8_0;
   const int kbxd = k % blocks_per_tile_x_row;
+  const int kbxd_eff = min(kbxd, blocks_per_row - ib0 - 1);
 
 #pragma unroll
   for (int i0 = 0; i0 < mmq_y; i0 += nwarps * QI8_0) {
@@ -1028,7 +1043,7 @@ static __device__ __forceinline__ void load_tiles_q8_0(
     if (need_check) {
       i = min(i, i_max);
     }
-    const block_q8_0* bxi = bx0 + i * blocks_per_row + kbxd;
+    const block_q8_0* bxi = bx0 + i * blocks_per_row + kbxd_eff;
     x_dmf[i * (WARP_SIZE_GGUF / QI8_0) + i / QI8_0 + kbxd] = __half2float(bxi->d);
   }
 }
@@ -1096,7 +1111,8 @@ static __device__ __forceinline__ void load_tiles_q2_K(
     const int& i_offset,
     const int& i_max,
     const int& k,
-    const int& blocks_per_row) {
+    const int& blocks_per_row,
+    const int& /*ib0*/) {
   const int kbx = k / QI2_K;
   const int kqsx = k % QI2_K;
 
@@ -1220,7 +1236,8 @@ static __device__ __forceinline__ void load_tiles_q3_K(
     const int& i_offset,
     const int& i_max,
     const int& k,
-    const int& blocks_per_row) {
+    const int& blocks_per_row,
+    const int& /*ib0*/) {
   const int kbx = k / QI3_K;
   const int kqsx = k % QI3_K;
 
@@ -1388,7 +1405,8 @@ static __device__ __forceinline__ void load_tiles_q4_K(
     const int& i_offset,
     const int& i_max,
     const int& k,
-    const int& blocks_per_row) {
+    const int& blocks_per_row,
+    const int& /*ib0*/) {
   const int kbx = k / QI4_K;   // == 0 if QK_K == 256
   const int kqsx = k % QI4_K;  // == k if QK_K == 256
 
@@ -1529,7 +1547,8 @@ static __device__ __forceinline__ void load_tiles_q5_K(
     const int& i_offset,
     const int& i_max,
     const int& k,
-    const int& blocks_per_row) {
+    const int& blocks_per_row,
+    const int& /*ib0*/) {
   const int kbx = k / QI5_K;   // == 0 if QK_K == 256
   const int kqsx = k % QI5_K;  // == k if QK_K == 256
 
@@ -1667,7 +1686,8 @@ static __device__ __forceinline__ void load_tiles_q6_K(
     const int& i_offset,
     const int& i_max,
     const int& k,
-    const int& blocks_per_row) {
+    const int& blocks_per_row,
+    const int& /*ib0*/) {
   const int kbx = k / QI6_K;   // == 0 if QK_K == 256
   const int kqsx = k % QI6_K;  // == k if QK_K == 256
 

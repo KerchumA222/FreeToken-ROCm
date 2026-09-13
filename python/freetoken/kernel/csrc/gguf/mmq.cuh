@@ -61,7 +61,8 @@ static __device__ __forceinline__ void mul_mat_q(
         threadIdx.y,
         nrows_x - row_x_0 - 1,
         threadIdx.x,
-        blocks_per_row_x);
+        blocks_per_row_x,
+        ib0);
 
 #pragma unroll
     for (int ir = 0; ir < qr && ib0 + ir * blocks_per_warp / qr < blocks_per_row_x; ++ir) {

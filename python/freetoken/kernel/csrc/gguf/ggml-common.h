@@ -943,7 +943,8 @@ typedef void (*load_tiles_cuda_t)(
     const int& i_offset,
     const int& i_max,
     const int& k,
-    const int& blocks_per_row);
+    const int& blocks_per_row,
+    const int& ib0);
 typedef float (*vec_dot_q_mul_mat_cuda_t)(
     const int* __restrict__ x_ql,
     const half2* __restrict__ x_dm,
