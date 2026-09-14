@@ -258,7 +258,9 @@ def _pad_rows(n: int, align: int) -> int:
     return (-n) % align
 
 
-def gguf_module_types(model_path: str) -> dict[str, tuple[str, ...]]:
+def gguf_module_types(
+    model_path: str, draft_path: str | None = None
+) -> dict[str, tuple[str, ...]]:
     """FreeToken module prefix -> ggml type per fused slot, for what we serve packed.
 
     The GGUF side of the ``gguf`` quant dialect. Only this module knows both the ggml
@@ -352,6 +354,22 @@ def gguf_module_types(model_path: str) -> dict[str, tuple[str, ...]]:
             if any(t is None for t in got) or len(set(got)) != 1 or not _is_packable(got[0]):
                 continue
             out[stem + module] = (name(got[0]),)
+
+    if draft_path is not None:
+        # A sidecar MTP head lives under its own module prefix, so its entries cannot be
+        # written as model.layers.<n>.* -- nothing would look them up. Only the routed
+        # bank: the head's dense tensors are delivered dequantized by
+        # iter_gguf_mtp_weights, and claiming them packed would build modules that expect
+        # block bytes and then be handed bf16. The bank types stay the trunk's, which is
+        # what the loader requantizes the draft block's tensors to.
+        draft_types: dict[str, int] = {}
+        for t in iter_gguf_tensors(draft_path):
+            if t.name.startswith("blk.") and "_exps." in t.name:
+                draft_types[t.name.split(".", 2)[2]] = t.ggml_type
+        if all(sfx in draft_types for sfx in _EXPERT_SUFFIXES):
+            out["mtp.layer.mlp.experts"] = (
+                name(bank_types["gate_up"]), name(bank_types["down"])
+            )
     return out
 
 

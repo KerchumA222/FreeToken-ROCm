@@ -309,6 +309,10 @@ class ModelConfig:
     # than architecture, but it has to reach the model: it decides whether the draft head is
     # built at all, and the head's block claims a KV layer when it is.
     num_speculative_tokens: int = 0
+    # Checkpoint holding the MTP draft head when it is not inside the target. Carried on
+    # the config rather than threaded through the MoE stack: the leaf readers that need it
+    # (the head's routed bank lives in that file, not the target's) already take a config.
+    speculative_draft_path: str | None = None
     # Second RMSNorm eps for models whose post-sublayer norms use a different eps than the
     # pre-sublayer ones (muse_glimmer: post_attention/post_feedforward at 1e-8 vs 1e-5).
     post_norm_eps: float | None = None

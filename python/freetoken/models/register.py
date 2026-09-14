@@ -306,7 +306,9 @@ def _load_attr(module_path: str, attr_name: str) -> Any:
     return getattr(module, attr_name)
 
 
-def checkpoint_quant_config(model_path: str, hf_config: Any, spec: ModelSpec):
+def checkpoint_quant_config(
+    model_path: str, hf_config: Any, spec: ModelSpec, draft_path: str | None = None
+):
     """The checkpoint's QuantConfig under the family's naming.
 
     A GGUF checkpoint carries its types per tensor in the tensor table rather than in
@@ -329,7 +331,12 @@ def checkpoint_quant_config(model_path: str, hf_config: Any, spec: ModelSpec):
             module_types = _load_attr(spec.module, "gguf_module_types")
         except AttributeError:
             return None
-        return GgufConfig(gguf_quantization_config(module_types(model_path)))
+        # A sidecar MTP head keeps the draft block's tensors in its own file, so the
+        # module map has to be built from both or the head's modules resolve to no scheme
+        # and fall back to an unquantized path they have no weights for.
+        return GgufConfig(
+            gguf_quantization_config(module_types(model_path, draft_path=draft_path))
+        )
     # NOTE: ModelOpt exports before 0.41 keep the quantization config only in hf_quant_config.json, and the weight download fetches nothing but the safetensors shards, so this sidecar is fetched on its own.
     hf_quant_config = None
     sidecar = optional_hf_file(model_path, "hf_quant_config.json")

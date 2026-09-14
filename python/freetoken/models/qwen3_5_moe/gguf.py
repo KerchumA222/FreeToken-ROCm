@@ -241,7 +241,9 @@ def _dense_types(model_path: str) -> dict[str, int]:
     return out
 
 
-def gguf_module_types(model_path: str) -> dict[str, tuple[str, ...]]:
+def gguf_module_types(
+    model_path: str, draft_path: str | None = None
+) -> dict[str, tuple[str, ...]]:
     """FreeToken module prefix -> ggml type per fused slot, for the modules we serve packed.
 
     This is the GGUF side of the ``gguf`` quant dialect: it is the only place that
@@ -253,6 +255,9 @@ def gguf_module_types(model_path: str) -> dict[str, tuple[str, ...]]:
     """
     from freetoken.models.gguf.dequant import GGML_NAME
 
+    # This family carries its draft head inside the checkpoint, so a sidecar is never
+    # expected; the parameter exists so every GGUF adapter takes the same call.
+    assert draft_path is None, "qwen35moe checkpoints carry their MTP head inline"
     md = load_gguf_metadata(model_path)
     interval = int(md.get("qwen35moe.full_attention_interval", 4))
     # The MTP draft block sits past the target stack under its own module prefix, so its
@@ -587,7 +592,9 @@ def load_q4_0_expert_sources(
     # An MTP checkpoint carries a routed bank for the draft block too, at an index past the
     # target stack. It is the head's, not a layer's, so it is skipped unless the caller asks
     # for a wider range -- indexing the target's banks with it is an IndexError.
-    L, E = (config.num_layers if num_layers is None else num_layers), config.num_experts
+    # Indexed by ggml block index, so the bound is the block-index space: one wider than
+    # the trunk when a draft head is in use, and identical to num_layers when it is not.
+    L, E = (config.num_addressable_layers if num_layers is None else num_layers), config.num_experts
     H, I = config.hidden_size, config.moe_intermediate_size
     types = _bank_types(config)
     gu_bytes = row_bytes(H, types["gate_up"])
@@ -599,7 +606,7 @@ def load_q4_0_expert_sources(
     def _load(sink) -> None:
         # 3 writes/layer: gate half, up half, down
         tracker = LayerCompletionTracker(3, hb, sink) if sink is not None else None
-        for t in iter_gguf_tensors(model_path):
+        for t in _iter_expert_tensors(model_path, config):
             if not t.name.startswith("blk."):
                 continue
             suffix = t.name.split(".", 2)[2]
@@ -711,6 +718,22 @@ def convert_dense_to_gguf(model, config) -> None:
         swap_single(shexp, "down_proj", lid, "ffn_down_shexp")
 
 
+def _iter_expert_tensors(model_path: str, config):
+    """The target's tensors, followed by a sidecar draft head's if one is configured.
+
+    A standalone MTP head (Qwen3.8-Flash-Next publishes one) carries the draft block's
+    routed bank in its own file; the target has no tensors for that block at all. Both name
+    it ``blk.<draft layer>``, so the layer index already places it correctly.
+    """
+    from itertools import chain
+
+    paths = [model_path]
+    draft = getattr(config, "speculative_draft_path", None)
+    if draft and getattr(config, "num_speculative_tokens", 0):
+        paths.append(draft)
+    return chain.from_iterable(iter_gguf_tensors(p) for p in paths)
+
+
 def iter_gguf_expert_pieces(model_path: str, config, *, parallel: bool = False,
                             workers: int = 8, chunk: int = 8 << 20):
     """Routed-expert pieces straight from the GGUF tensor table, one per MoE layer.
@@ -731,7 +754,7 @@ def iter_gguf_expert_pieces(model_path: str, config, *, parallel: bool = False,
     dn_bytes = row_bytes(I, types["down"])
 
     pending: dict[int, dict[str, torch.Tensor]] = {}
-    for t in iter_gguf_tensors(model_path):
+    for t in _iter_expert_tensors(model_path, config):
         if not t.name.startswith("blk."):
             continue
         suffix = t.name.split(".", 2)[2]

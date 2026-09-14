@@ -345,7 +345,10 @@ class Engine:
         from freetoken.speculative.build import build_mtp_head
 
         self.mtp_head = build_mtp_head(
-            config.model_path, config.model_config, device=self.device, dtype=config.dtype
+            config.speculative_draft_path or config.model_path,
+            config.model_config,
+            device=self.device,
+            dtype=config.dtype,
         )
         if self.mtp_head is not None:
             finalize_quant(self.mtp_head)

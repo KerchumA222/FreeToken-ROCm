@@ -17,6 +17,15 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _nextn_layers_of(draft_path: str) -> int:
+    """How many draft blocks a standalone head checkpoint carries."""
+    from freetoken.models.gguf.reader import gguf_architecture, load_gguf_metadata
+
+    md = load_gguf_metadata(draft_path)
+    arch = gguf_architecture(draft_path)
+    return int(md.get(f"{arch}.nextn_predict_layers", 0) or 0)
+
+
 @dataclass(frozen=True)
 class EngineConfig:
     model_path: str
@@ -99,6 +108,10 @@ class EngineConfig:
     # head, and DISABLE_OVERLAP_SCHEDULING: a draft is conditioned on the verify forward's
     # hidden states, so the two cannot be in flight at once.
     speculative_draft_tokens: int = 0
+    # Checkpoint holding the MTP draft head, when it does not ship inside the target.
+    # Qwen3.8-Flash-Next publishes its head as a standalone GGUF; Qwen3.5/3.6 carry theirs
+    # in the quant, where this stays empty.
+    speculative_draft_path: str | None = None
 
     def __post_init__(self):
         if self.moe_backend is None:
@@ -116,20 +129,30 @@ class EngineConfig:
     @cached_property
     def model_config(self) -> ModelConfig:
         spec = get_model_spec(self.hf_config.architectures[0])
-        quant = checkpoint_quant_config(self.model_path, self.hf_config, spec)
+        quant = checkpoint_quant_config(
+            self.model_path, self.hf_config, spec, self.speculative_draft_path
+        )
         set_quant_config(quant)
         parse_config = _load_attr(spec.module, spec.parse_config)
         config = replace(
             parse_config(self.hf_config),
             quant=quant,
             num_speculative_tokens=self.speculative_draft_tokens,
+            speculative_draft_path=self.speculative_draft_path,
         )
         if not self.speculative_draft_tokens:
             return config
+        if self.speculative_draft_path and not config.num_nextn_layers:
+            # A sidecar head: the target's own metadata says nothing about it, so the
+            # block count comes from the head's file.
+            config = replace(
+                config, num_nextn_layers=_nextn_layers_of(self.speculative_draft_path)
+            )
         if not config.num_nextn_layers:
             raise ValueError(
-                f"--speculative-draft-tokens needs a checkpoint with an MTP head; "
-                f"{self.model_path} carries none"
+                "--speculative-draft-tokens needs an MTP head; neither "
+                f"{self.model_path} nor {self.speculative_draft_path or '(no draft path)'} "
+                "carries one"
             )
         # The draft block sits one index past the target stack. Claiming it here is what
         # gives it a KV layer, since the pool sizes itself from the group's layer_ids.
