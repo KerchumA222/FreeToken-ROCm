@@ -119,8 +119,10 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         ``cu_seqlens`` / ``cache_indices`` / ``has_initial_state`` come from FLAMetadata."""
         li = pool.local_index(self.layer_id)
         x = conv_in.transpose(0, 1).contiguous()  # [conv_dim, total]
+        reqs = get_global_ctx().batch.padded_reqs
         out = causal_conv1d_varlen(x, self._conv_weight(), pool.conv_states[li],
-                                   cu_seqlens, cache_indices, has_initial_state)
+                                   cu_seqlens, cache_indices, has_initial_state,
+                                   max_seq_len=max(r.extend_len for r in reqs), batch=len(reqs))
         return out.transpose(0, 1)  # [total, conv_dim]
 
     def _conv_decode(self, conv_in: torch.Tensor, table_idx: torch.Tensor, pool) -> torch.Tensor:

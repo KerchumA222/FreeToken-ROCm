@@ -72,20 +72,20 @@ if (-not (Get-ChildItem "$WheelDir" -Recurse -Filter "torch-*.whl" -ErrorAction 
     Invoke-Expression "$Py -m pip download --index-url $INDEX -d `"$WheelDir`" `"$rocmSpec`""
     Invoke-Expression "$Py -m pip download --no-deps --index-url $INDEX -d `"$WheelDir`" `"$torchSpec`" `"$devSpec`""
 }
-$PIP install (Get-ChildItem $WheelDir -Recurse -Filter *.whl | ForEach-Object { $_.FullName }) --no-deps --force-reinstall
+& $PYEXE -m pip install (Get-ChildItem $WheelDir -Recurse -Filter *.whl | ForEach-Object { $_.FullName }) --no-deps --force-reinstall
 # the 'rocm' metapackage sdist provides the rocm_sdk module torch's _rocm_init imports
 $rocmSdist = Get-ChildItem $WheelDir -Recurse -Filter "rocm-*.tar.gz" -ErrorAction SilentlyContinue | Select-Object -First 1
-if ($rocmSdist) { $PIP install $rocmSdist.FullName --no-deps --no-build-isolation }
+if ($rocmSdist) { & $PYEXE -m pip install $rocmSdist.FullName --no-deps --no-build-isolation }
 
 # ---- Step 3: engine + helpers -----------------------------------------
 # freetoken itself is installed --no-deps, so every runtime dep from pyproject.toml
 # must be listed here (CUDA-only extras excluded: flashinfer, sglang-kernel).
 Write-Host "[3/5] Installing FreeToken + helpers ..." -ForegroundColor Yellow
-$PIP install "triton-windows>=3.7.1" apache-tvm-ffi==0.1.13.post3 msgpack pyzmq psutil requests aiohttp partial_json_parser gguf `
+& $PYEXE -m pip install "triton-windows>=3.7.1" apache-tvm-ffi==0.1.13.post3 msgpack pyzmq psutil requests aiohttp partial_json_parser gguf `
     einops fastapi uvicorn pydantic openai prompt_toolkit "transformers>=5.5,<6" huggingface_hub safetensors `
-    "numpy>=2.0,<2.5" tqdm modelscope tornado ninja setuptools wheel
+    "numpy>=2.0,<2.5" tqdm modelscope tornado ninja numba setuptools wheel
 $env:FREETOKEN_SKIP_CUDA_EXT = "1"
-$PIP install -e "$REPO" --no-deps --no-build-isolation
+& $PYEXE -m pip install -e "$REPO" --no-deps --no-build-isolation
 Remove-Item Env:FREETOKEN_SKIP_CUDA_EXT
 
 # ---- Step 4: upstream patches -----------------------------------------

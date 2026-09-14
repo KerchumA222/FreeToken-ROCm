@@ -16,6 +16,7 @@ if not torch.cuda.is_available():  # pragma: no cover
     pytest.skip("CUDA required", allow_module_level=True)
 
 from freetoken.kernel.triton.e4m3_compat import e4m3_native
+from freetoken.kernel.triton.fp8_pertensor_linear import _scaled_mm_supported
 
 DEV = "cuda"
 FP8 = torch.float8_e4m3fn
@@ -62,7 +63,10 @@ def test_w8a16_matches_dequant_reference(M: int, K: int, part_rows: list[int]):
     assert rel.item() < 2e-2, rel.item()
 
 
-@pytest.mark.skipif(not e4m3_native(), reason="torch._scaled_mm needs sm_89+")
+@pytest.mark.skipif(
+    not (e4m3_native() and _scaled_mm_supported()),
+    reason="torch._scaled_mm is unsupported on this GPU",
+)
 @pytest.mark.parametrize("M", [1, 2, 4, 16, 64])
 @pytest.mark.parametrize("part_rows,uniform", [
     ([12288, 1024, 1024], False),  # fused -> piecewise-constant scale -> row-wise
@@ -84,7 +88,10 @@ def test_w8a8_matches_w8a8_reference(M: int, part_rows: list[int], uniform: bool
     assert rel < 1e-2, rel
 
 
-@pytest.mark.skipif(not e4m3_native(), reason="torch._scaled_mm needs sm_89+")
+@pytest.mark.skipif(
+    not (e4m3_native() and _scaled_mm_supported()),
+    reason="torch._scaled_mm is unsupported on this GPU",
+)
 def test_batch_size_does_not_change_the_numeric_scheme():
     """A deployment that can run W8A8 must run it at every M, so that a reply reproduces at
     bs=1 regardless of how many other requests shared its forward. Feeding the same row alone

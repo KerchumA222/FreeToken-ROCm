@@ -196,6 +196,13 @@ def _gemm(a: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
 _E4M3_MAX = 448.0  # largest finite e4m3 magnitude
 
 
+def _scaled_mm_supported(device=None) -> bool:
+    if torch.version.hip:
+        arch = torch.cuda.get_device_properties(device).gcnArchName.split(":", 1)[0]
+        return arch.startswith(("gfx94", "gfx95"))
+    return torch.cuda.get_device_capability(device) >= (8, 9)
+
+
 @triton.jit
 def _static_quant_kernel(x_ptr, out_ptr, scale_ptr, n_elements, BLOCK: tl.constexpr):
     """bf16 activation -> fp8-e4m3 under one broadcast per-tensor scale."""
@@ -269,7 +276,7 @@ def fp8_pertensor_linear(
     if _USE_REF:  # numeric-reference fallback (debug / A-B)
         w = weight.to(x.dtype) * weight_scale.to(x.dtype)[:, None]
         out = (x.reshape(-1, K) @ w.t()).reshape(*lead, N)
-    elif input_scale is not None and e4m3_native():
+    elif input_scale is not None and e4m3_native() and _scaled_mm_supported(x.device):
         out = _scaled_mm(
             x.reshape(-1, K), weight, weight_scale, input_scale, uniform_scale, x.dtype,
         ).reshape(*lead, N)
