@@ -160,7 +160,11 @@ def parse_gguf_config(shim: "GgufConfigShim") -> "ModelConfig":
     def g(key: str, default=None):
         return m.get(f"{prefix}.{key}", default)
 
-    num_layers = int(g("block_count"))
+    # block_count counts the MTP draft blocks too, but they are not part of the target
+    # stack: block 40 of a 40-layer checkpoint is the nextn head, and the layer pattern
+    # would misread it as linear attention (it carries attn_q/k/v and no ssm_*).
+    num_nextn_layers = int(g("nextn_predict_layers", 0) or 0)
+    num_layers = int(g("block_count")) - num_nextn_layers
     interval = int(g("full_attention_interval", 4))
     layer_types = [
         "full_attention" if _is_full_attention(i, interval) else "linear_attention"
@@ -173,6 +177,7 @@ def parse_gguf_config(shim: "GgufConfigShim") -> "ModelConfig":
     # no text_config attr: parse_config's getattr then falls back to the namespace itself
     hf_like = SimpleNamespace(
         num_hidden_layers=num_layers,
+        mtp_num_hidden_layers=num_nextn_layers,
         num_attention_heads=int(g("attention.head_count")),
         num_key_value_heads=int(g("attention.head_count_kv")),
         head_dim=head_dim,
@@ -248,7 +253,13 @@ def gguf_module_types(model_path: str) -> dict[str, tuple[str, ...]]:
     """
     from freetoken.models.gguf.dequant import GGML_NAME
 
-    interval = int(load_gguf_metadata(model_path).get("qwen35moe.full_attention_interval", 4))
+    md = load_gguf_metadata(model_path)
+    interval = int(md.get("qwen35moe.full_attention_interval", 4))
+    # The MTP draft block sits past the target stack under its own module prefix, so its
+    # entries cannot be written as model.layers.<n>.*: nothing would ever look them up.
+    draft_layer = int(md["qwen35moe.block_count"]) - int(
+        md.get("qwen35moe.nextn_predict_layers", 0) or 0
+    )
     by_layer: dict[int, dict[str, int]] = {}
     globals_: dict[str, int] = {}
     for t in iter_gguf_tensors(model_path):
@@ -272,8 +283,15 @@ def gguf_module_types(model_path: str) -> dict[str, tuple[str, ...]]:
             out[prefix] = tuple(name(t) for t in types)
 
     for layer, types in by_layer.items():
-        stem = f"model.layers.{layer}."
         g = types.get
+        if layer >= draft_layer:
+            # Only the routed bank: the head's dense tensors are delivered dequantized by
+            # iter_gguf_mtp_weights, so claiming them packed here would build modules that
+            # expect block bytes and then be handed bf16.
+            add("mtp.layer.mlp.experts",
+                [g("ffn_gate_exps.weight"), g("ffn_down_exps.weight")])
+            continue
+        stem = f"model.layers.{layer}."
         if _is_full_attention(layer, interval):
             add(stem + "self_attn.qkv_proj",
                 [g("attn_q.weight"), g("attn_k.weight"), g("attn_v.weight")])
@@ -360,6 +378,13 @@ def iter_gguf_weights(
 
     md = load_gguf_metadata(model_path)
     interval = int(md.get("qwen35moe.full_attention_interval", 4))
+    # The MTP draft blocks sit past the target stack and belong to the head, which loads
+    # them through iter_gguf_mtp_weights. Left in, they would be translated against the
+    # layer pattern -- which calls that index linear attention, against a block carrying
+    # attn_q/k/v -- and land on module names the target does not have.
+    num_target_layers = int(md["qwen35moe.block_count"]) - int(
+        md.get("qwen35moe.nextn_predict_layers", 0) or 0
+    )
     # Which tensors this checkpoint lets us hand over packed. A fused module is only
     # packed when *every* slot is (GgufColSplits holds one GGUFLinear per slot), so
     # the decision is per group, not per tensor.
@@ -413,6 +438,8 @@ def iter_gguf_weights(
                 yield "lm_head.weight", _to_bf16(t)
         elif name.startswith("blk."):
             layer = int(name.split(".")[1])
+            if layer >= num_target_layers:
+                continue
             suffix = name.split(".", 2)[2]
             stem = f"model.layers.{layer}."
             if suffix in _EXPERT_SUFFIXES:
@@ -544,7 +571,7 @@ def _packed_as(t: GgufTensor, target_type: int) -> torch.Tensor:
 
 
 def load_q4_0_expert_sources(
-    model_path: str, config: "ModelConfig", *, layer_sink=None
+    model_path: str, config: "ModelConfig", *, layer_sink=None, num_layers: int | None = None
 ) -> dict[str, list[torch.Tensor]]:
     """Per-layer host banks of the routed experts' native GGUF block bytes.
 
@@ -557,7 +584,10 @@ def load_q4_0_expert_sources(
     from freetoken.moe.host_banks import LayerCompletionTracker, PinPipeline, alloc_layer_banks
 
     _require_tp1("expert banks")
-    L, E = config.num_layers, config.num_experts
+    # An MTP checkpoint carries a routed bank for the draft block too, at an index past the
+    # target stack. It is the head's, not a layer's, so it is skipped unless the caller asks
+    # for a wider range -- indexing the target's banks with it is an IndexError.
+    L, E = (config.num_layers if num_layers is None else num_layers), config.num_experts
     H, I = config.hidden_size, config.moe_intermediate_size
     types = _bank_types(config)
     gu_bytes = row_bytes(H, types["gate_up"])
@@ -576,6 +606,8 @@ def load_q4_0_expert_sources(
             if suffix not in _EXPERT_SUFFIXES:
                 continue
             layer = int(t.name.split(".")[1])
+            if layer >= L:
+                continue
             if suffix == "ffn_gate_exps.weight":
                 banks["gate_up"][layer][:, :I].copy_(
                     _packed_as(t, types["gate_up"]).reshape(E, I, gu_bytes)

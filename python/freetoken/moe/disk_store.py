@@ -86,9 +86,21 @@ class GgufExpertStore:
     bytes and the extents fill it end to end.
     """
 
-    def __init__(self, model_path: str, num_experts: int, bank_types: dict[str, int]):
+    def __init__(
+        self,
+        model_path: str,
+        num_experts: int,
+        bank_types: dict[str, int],
+        num_layers: int | None = None,
+    ):
         self.model_path = model_path
         self.num_experts = int(num_experts)
+        # Bound on the block indices this store will resolve. An MTP checkpoint carries a
+        # routed bank for its draft block past the target stack: it belongs here only when
+        # the head is in use. Counting it otherwise makes it look like an extra
+        # requantized layer and rejects a --moe-host-cache-size the target could serve;
+        # omitting it when the head IS in use leaves the head's experts unresolvable.
+        self._num_layers = num_layers
         self._bank_types = dict(bank_types)
         self._parts: dict[tuple[str, int], _Part] = {}   # (suffix, layer) -> part
         self._fds: dict[str, int] = {}
@@ -106,6 +118,8 @@ class GgufExpertStore:
             if suffix not in wanted:
                 continue
             layer = int(t.name.split(".")[1])
+            if self._num_layers is not None and layer >= self._num_layers:
+                continue
             if t.rows % self.num_experts:
                 raise ValueError(
                     f"{t.name}: {t.rows} rows is not a multiple of "

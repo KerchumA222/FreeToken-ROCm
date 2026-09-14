@@ -22,6 +22,12 @@ class ModelSpec:
     packed_modules_mapping: tuple[tuple[str, tuple[str, ...]], ...] = ()
     # checkpoint-name globs the family serves in bf16 although the quantization_config covers them
     unquantized_modules: tuple[str, ...] = ()
+    # Multi-token-prediction draft head, for families whose checkpoints ship one. The head
+    # is built and loaded beside the target rather than inside it: it is a separate model
+    # that borrows the target's embedding and LM head, and keeping it out of the target's
+    # module tree leaves the target's strict load_state_dict alone.
+    mtp_head: str | None = None           # (config, layer_id) -> module
+    iter_mtp_weights: str | None = None   # (model_path) -> (name, tensor) pairs
 
 
 # Multimodal wrappers store the text tower under model.language_model.
@@ -247,6 +253,8 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "Qwen3_5MoEForCausalLM",
         parse_config="parse_gguf_config",
         iter_weights="iter_gguf_weights",
+        mtp_head="Qwen3_5MTPHead",
+        iter_mtp_weights="iter_gguf_mtp_weights",
     ),
     # GGUF Qwen3.8-Flash-Next (llama.cpp arch qwen4exp): experts stay in native GGUF
     # quant banks (offload backends), the PLE n-gram table streams from the file, and

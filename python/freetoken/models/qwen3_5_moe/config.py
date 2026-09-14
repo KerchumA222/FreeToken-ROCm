@@ -130,6 +130,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         vision_config=None,  # text-only milestone
         image_token_id=getattr(hf_config, "image_token_id", None),
         attention_groups=groups,
+        num_nextn_layers=int(getattr(text, "mtp_num_hidden_layers", 0) or 0),
         expert_quant=expert_quant,
         weight_block_size=weight_block_size,
     )

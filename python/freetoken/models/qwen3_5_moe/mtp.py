@@ -35,33 +35,13 @@ if TYPE_CHECKING:
 
 
 def _with_full_attention(config: "ModelConfig", layer_id: int) -> "ModelConfig":
-    """``config`` with ``layer_id`` moved into the full-attention group.
-
-    The draft block sits one past the target's last layer, where the hybrid pattern
+    """The draft block sits one past the target's last layer, where the hybrid pattern
     would place a linear-attention layer; the checkpoints carry ``attn_q/k/v`` for it.
     llama.cpp sidesteps this by building the MTP graph explicitly rather than from the
-    layer pattern -- this is the same statement, made to the config.
-    """
-    from dataclasses import replace
+    layer pattern -- this is the same statement, made to the config."""
+    from freetoken.models.config import with_layer_in_full_attention
 
-    from freetoken.models.config import FullAttentionGroupConfig
-
-    groups = []
-    for group in config.attention_groups or ():
-        ids = set(group.layer_ids)
-        if isinstance(group, FullAttentionGroupConfig):
-            ids.add(layer_id)
-        else:
-            ids.discard(layer_id)
-        groups.append(replace(group, layer_ids=tuple(sorted(ids))))
-    out = replace(config, attention_groups=tuple(groups))
-    # replace() keeps only declared fields, and the GGUF readers stash the expert
-    # bank types with object.__setattr__ -- carry those across or the block builds
-    # its MoE against nothing.
-    for key, value in config.__dict__.items():
-        if key not in out.__dict__:
-            object.__setattr__(out, key, value)
-    return out
+    return with_layer_in_full_attention(config, layer_id)
 
 
 class Qwen3_5MTPHead(BaseOP):

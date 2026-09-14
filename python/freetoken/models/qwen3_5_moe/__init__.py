@@ -8,6 +8,7 @@ from .gguf import (
     parse_gguf_config,
 )
 from .model import Qwen3_5MoEForCausalLM
+from .mtp import Qwen3_5MTPHead, iter_gguf_mtp_weights, mtp_draft_layer
 from .weight import (
     iter_expert_pieces as _iter_expert_pieces_hf,
     iter_weights,
@@ -41,4 +42,8 @@ __all__ = [
     "iter_gguf_weights",
     "load_q4_0_expert_sources",
     "dummy_q4_0_expert_sources",
+    # MTP draft head
+    "Qwen3_5MTPHead",
+    "iter_gguf_mtp_weights",
+    "mtp_draft_layer",
 ]

@@ -76,6 +76,21 @@ def resolve_pool_class(model_config: ModelConfig) -> type[BaseKVCachePool]:
     return MHAKVCache
 
 
+
+def _layer_id_space(model_config, layer_ids=None) -> int:
+    """Width of the global layer-id space the pools index by.
+
+    Normally the target's layer count, but a speculative draft block presents itself one
+    index past it and still needs a slot in the map. Taking the max with ``layer_ids``
+    keeps the pool correct even when a caller hands it ids the config does not describe
+    (and lets the sizing-surface tests pass a minimal config stub).
+    """
+    width = int(getattr(model_config, "num_addressable_layers", model_config.num_layers))
+    if layer_ids:
+        width = max(width, max(layer_ids) + 1)
+    return width
+
+
 def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dtype):
     """Build the engine's KV pool for ``num_pages`` USABLE pages (the dummy page and every
     secondary tier -- window pool, index slab, state rings -- are derived here or inside
@@ -134,7 +149,7 @@ def create_kvcache_pool(
 
         return HybridSWAKVCache(
             groups=model_config.kv_cache_group_specs(),
-            num_layers=model_config.num_layers,
+            num_layers=_layer_id_space(model_config),
             num_full_pages=num_pages,
             page_size=page_size,
             num_swa_tokens=num_swa_tokens,
@@ -171,7 +186,7 @@ def create_kvcache_pool(
         assert layer_ids is None, "hybrid-linear x BSA has no pool support yet"
         return BSAKVCache(
             num_kv_heads=spec.num_kv_heads,
-            num_layers=model_config.num_layers,
+            num_layers=_layer_id_space(model_config, layer_ids),
             head_dim=spec.head_dim,
             num_pages=num_pages,
             page_size=page_size,
@@ -193,7 +208,7 @@ def create_kvcache_pool(
             raise ValueError("QSA pools need num_req_slots (max_running_req + 1)")
         return QSAKVCache(
             num_kv_heads=spec.num_kv_heads,
-            num_layers=model_config.num_layers,
+            num_layers=_layer_id_space(model_config, layer_ids),
             head_dim=spec.head_dim,
             num_pages=num_pages,
             page_size=page_size,
@@ -212,7 +227,7 @@ def create_kvcache_pool(
         spec = kv_specs[0]
         # With a layer remap the pool allocates len(layer_ids) slabs; without one
         # it backs every model layer (all-MLA models, GLM-5.2).
-        num_layers = model_config.num_layers if layer_ids is None else len(layer_ids)
+        num_layers = _layer_id_space(model_config) if layer_ids is None else len(layer_ids)
         if spec.index_head_dim > 0 and spec.num_index_layers > 0:
             common = dict(
                 latent_dim=spec.head_dim,
@@ -250,7 +265,7 @@ def create_kvcache_pool(
         num_kv_heads=spec.num_kv_heads if spec is not None else model_config.num_kv_heads,
         num_pages=num_pages,
         page_size=page_size,
-        num_layers=model_config.num_layers,
+        num_layers=_layer_id_space(model_config, layer_ids),
         head_dim=spec.head_dim if spec is not None else model_config.head_dim,
         device=device,
         dtype=dtype,

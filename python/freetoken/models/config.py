@@ -298,6 +298,17 @@ class ModelConfig:
     attn_sm_scale: float | None = None  # None -> 1/sqrt(head_dim)
     final_logit_softcapping: float | None = None
     embedding_scale: float | None = None
+    # Multi-token-prediction draft blocks the checkpoint carries past the target stack
+    # (Qwen's ``nextn``). They are not target layers: a checkpoint's own block count
+    # includes them, and reading that as the layer count builds a block the layer pattern
+    # then misclassifies. A declared field rather than a stashed attribute because
+    # EngineConfig.model_config rebuilds the config with dataclasses.replace, which keeps
+    # only declared fields.
+    num_nextn_layers: int = 0
+    # Draft depth speculative decoding runs at; 0 serves the model normally. Runtime rather
+    # than architecture, but it has to reach the model: it decides whether the draft head is
+    # built at all, and the head's block claims a KV layer when it is.
+    num_speculative_tokens: int = 0
     # Second RMSNorm eps for models whose post-sublayer norms use a different eps than the
     # pre-sublayer ones (muse_glimmer: post_attention/post_feedforward at 1e-8 vs 1e-5).
     post_norm_eps: float | None = None
@@ -345,13 +356,32 @@ class ModelConfig:
         return "moe" in self.model_type or self.moe_enabled
 
     @property
+    def num_addressable_layers(self) -> int:
+        """One past the highest block index the model can present.
+
+        The target's layer count, plus a speculative draft block when one is in use: it
+        sits one index past the target's last layer and is addressed by that index
+        everywhere blocks are indexed -- the KV pools' layer maps, and the expert store
+        that resolves a layer to its bytes on disk. Storage sizing is separate; this only
+        bounds which indices are legal.
+        """
+        extra = self.num_nextn_layers if self.num_speculative_tokens else 0
+        return self.num_layers + extra
+
+    @property
     def num_moe_layers(self) -> int:
         """Number of layers that own a sparse MoE block (and offload-cache expert slots).
 
         Models with leading dense layers (``first_k_dense_replace`` > 0, e.g. GLM-4)
         only store experts for the trailing layers; everything else has all layers MoE.
+
+        A draft block in use owns a routed bank of its own, at the index just past the
+        target's last layer, so it is counted here -- that is what reserves it a slot in
+        the expert banks and the offload cache. It is not counted when speculation is off,
+        where the block is never built and its bank never read.
         """
-        return self.num_layers - self.first_k_dense_replace
+        extra = self.num_nextn_layers if self.num_speculative_tokens else 0
+        return self.num_layers + extra - self.first_k_dense_replace
 
     @property
     def is_multimodal(self) -> bool:
@@ -499,3 +529,31 @@ class ModelConfig:
             for group in self.kv_cache_group_specs()
             if group.num_layers > 0
         ]
+
+
+def with_layer_in_full_attention(config: "ModelConfig", layer_id: int) -> "ModelConfig":
+    """``config`` with ``layer_id`` moved into the full-attention group.
+
+    A multi-token-prediction draft block sits one index past the target's last layer,
+    where a hybrid pattern would usually place a linear-attention layer -- but the
+    checkpoints carry ``attn_q/k/v`` for it and no ``ssm_*``. Claiming the layer here is
+    also what sizes the KV cache for it: the pool derives its depth from the group's
+    ``layer_ids``, so the head's block gets a slot without any separate allocation.
+    """
+    from dataclasses import replace
+
+    groups = []
+    for group in config.attention_groups or ():
+        ids = set(group.layer_ids)
+        if isinstance(group, FullAttentionGroupConfig):
+            ids.add(layer_id)
+        else:
+            ids.discard(layer_id)
+        groups.append(replace(group, layer_ids=tuple(sorted(ids))))
+    out = replace(config, attention_groups=tuple(groups))
+    # The GGUF readers stash the expert bank types with object.__setattr__, and replace()
+    # keeps only declared fields -- without this the block builds its MoE against nothing.
+    for key, value in config.__dict__.items():
+        if key not in out.__dict__:
+            object.__setattr__(out, key, value)
+    return out
