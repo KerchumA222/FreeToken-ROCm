@@ -59,6 +59,10 @@ def e4m3_native() -> bool:
     if _native is None:
         if FORCE_EMU:
             _native = False
+        elif torch.version.hip:
+            # HIP reports a CUDA-compatible capability that is not an NVIDIA SM
+            # level. Triton's HIP target takes the uint8 E4M3 emulation branch.
+            _native = False
         else:
             native = {torch.cuda.get_device_capability(i) >= (8, 9)
                       for i in range(torch.cuda.device_count())}

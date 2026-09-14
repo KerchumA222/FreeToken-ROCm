@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import importlib.util
 import types
+from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
@@ -37,6 +39,46 @@ TOPK = 2
 _E2M1 = torch.tensor(
     [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
 )
+
+
+def test_gfx11_prefill_uses_route_wise_marlin_kernel():
+    from freetoken.moe import fused_nvfp4
+
+    hidden = torch.empty(2, 4)
+    gate_up_packed = torch.empty(3, 6, 2, dtype=torch.uint8)
+    bank = torch.empty(0)
+    weights = torch.empty(2, 1)
+    ids = torch.empty(2, 1, dtype=torch.int32)
+    expected = object()
+
+    with (
+        mock.patch.object(torch.version, "hip", "test"),
+        mock.patch.object(
+            torch.cuda,
+            "get_device_properties",
+            return_value=SimpleNamespace(gcnArchName="gfx1101"),
+        ),
+        mock.patch.object(
+            fused_nvfp4,
+            "fused_experts_decode_nvfp4_marlin",
+            return_value=expected,
+        ) as marlin,
+    ):
+        result = fused_nvfp4.fused_experts_nvfp4(
+            hidden,
+            gate_up_packed,
+            bank,
+            bank,
+            bank,
+            bank,
+            bank,
+            weights,
+            ids,
+            num_experts=3,
+        )
+
+    assert result is expected
+    marlin.assert_called_once()
 
 
 def _dequant_ref(packed: torch.Tensor, scale: torch.Tensor, row_global: torch.Tensor) -> torch.Tensor:

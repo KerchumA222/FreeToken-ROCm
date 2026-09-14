@@ -91,6 +91,7 @@ Write-Host "[3/5] Installing FreeToken + helpers ..." -ForegroundColor Yellow
 # torch>=2.0 -- resolving that would pull the CUDA torch from PyPI over the ROCm wheel
 # installed in step 2. Its other deps (triton-windows, numpy, numba, tqdm) are above.
 & $PYEXE -m pip install flashlib==0.3.0 --no-deps
+    "numpy>=2.0,<2.5" tqdm modelscope tornado ninja numba setuptools wheel
 $env:FREETOKEN_SKIP_CUDA_EXT = "1"
 & $PYEXE -m pip install -e "$REPO" --no-deps --no-build-isolation
 Remove-Item Env:FREETOKEN_SKIP_CUDA_EXT

@@ -40,6 +40,15 @@ New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 Remove-Item "$LogDir\serve.log", "$LogDir\serve_err.log" -ErrorAction SilentlyContinue
 if (Test-Path "$LogDir\serve.log") {
     throw "$LogDir\serve.log is still locked by a previous run, so this launch would read the old log and report its error as this one's. A scheduler worker outlived a failed server and still holds the inherited handle: it is a python.exe running ``multiprocessing.spawn``, NOT anything matching ``freetoken``. Run dist\stop-server.ps1 - it sweeps those - then retry."
+"$LogDir\serve.log", "$LogDir\serve_err.log" | ForEach-Object {
+    if (Test-Path $_) {
+        try {
+            Remove-Item $_ -Force -ErrorAction Stop
+        } catch {
+            # The desktop app may tail the log with delete sharing disabled.
+            Clear-Content $_ -Force -ErrorAction Stop
+        }
+    }
 }
 
 if (-not $RocmPath) {
@@ -100,9 +109,16 @@ if (-not $vcvars) {
               Select-Object -First 1 -ExpandProperty FullName
 }
 if (-not $vcvars) { Write-Warning "vcvarsall.bat not found - JIT DLL links may fail to find the MSVC CRT." }
+$vcvars = @("${env:ProgramFiles(x86)}\Microsoft Visual Studio", "$env:ProgramFiles\Microsoft Visual Studio") |
+          Where-Object { Test-Path $_ } |
+          ForEach-Object { Get-ChildItem $_ -Recurse -Filter vcvarsall.bat -ErrorAction SilentlyContinue } |
+          Select-Object -First 1 -ExpandProperty FullName
+if (-not $vcvars) {
+    throw "Visual Studio Build Tools with the C++ workload and Windows SDK are required (vcvarsall.bat not found)."
+}
 
 $cmd = @"
-$(if ($vcvars) { "call `"$vcvars`" x64 >nul" })
+call `"$vcvars`" x64 >nul
 set HIP_PATH=$RocmPath
 rem tvm_ffi's JIT resolves the toolchain from ROCM_HOME (not HIP_PATH) and dies at
 rem the first kernel build without it -- long after the model has loaded.
@@ -117,9 +133,16 @@ rem device and whose build failure kills the backend worker after a full load.
 set PYTORCH_ROCM_ARCH=$Arch
 set TRITON_OVERRIDE_ARCH=$Arch
 set ROCM_SDK_TARGET_FAMILY=$Arch
-set "CC=$RocmPath\lib\llvm\bin\clang.EXE"
+set PYTORCH_ROCM_ARCH=$Arch
+set HIP_DEVICE_LIB_PATH=$RocmPath\lib\llvm\amdgcn\bitcode
+set ROCM_HOME=$RocmPath
+set ROCM_PATH=$RocmPath
+set TVM_FFI_CACHE_DIR=$REPO\.tvm-ffi-cache
+set PATH=$RocmPath\bin;%PATH%
+set "CC=$RocmPath\lib\llvm\bin\clang-cl.exe"
 cd /d %TEMP%
 "$ft" serve --model "$Model" --port $Port $($ExtraArgs -join ' ') > "$LogDir\serve.log" 2> "$LogDir\serve_err.log"
+"$ft" serve --model-path "$Model" --port $Port $($ExtraArgs -join ' ') > "$LogDir\serve.log" 2> "$LogDir\serve_err.log"
 "@
 $runner = Join-Path $env:TEMP "freetoken_serve.cmd"
 Set-Content $runner $cmd -Encoding ASCII

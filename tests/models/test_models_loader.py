@@ -2,8 +2,33 @@ from __future__ import annotations
 
 import re
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
+
+
+def test_download_hf_weight_includes_safetensors_index():
+    from freetoken.utils.hf import download_hf_weight
+
+    with mock.patch("freetoken.utils.hf.snapshot_download", return_value="cached") as download:
+        assert download_hf_weight("org/model") == "cached"
+
+    assert download.call_args.kwargs["allow_patterns"] == [
+        "*.safetensors",
+        "model.safetensors.index.json",
+    ]
+
+
+def test_drop_page_cache_tolerates_unsupported_platform(tmp_path, monkeypatch):
+    import os
+
+    from freetoken.models.loader import drop_page_cache
+
+    path = tmp_path / "weights.safetensors"
+    path.write_bytes(b"weights")
+    monkeypatch.delattr(os, "posix_fadvise", raising=False)
+
+    drop_page_cache(str(path))
 
 
 def test_shard_tensor_splits_vocab_with_ceil_partition():

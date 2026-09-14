@@ -319,6 +319,25 @@ def fused_experts_nvfp4(
     two_i = gate_up_packed.shape[1]
     inter = two_i // 2
     dev, dt = hidden_states.device, hidden_states.dtype
+    gfx = getattr(torch.cuda.get_device_properties(dev), "gcnArchName", "")
+    if torch.version.hip and gfx.startswith("gfx11"):
+        # The grouped prefill kernel causes a HIP launch failure on RDNA3. The
+        # route-wise Marlin kernel has the same semantics and bounded memory use.
+        return fused_experts_decode_nvfp4_marlin(
+            hidden_states,
+            gate_up_packed,
+            gate_up_scale,
+            gate_up_global,
+            down_packed,
+            down_scale,
+            down_global,
+            topk_weights,
+            topk_ids,
+            activation,
+            apply_router_weight_on_input,
+            act_alpha,
+            act_limit,
+        )
     cfg = _prefill_config(M)
 
     sorted_ids, expert_ids, ntpp = moe_align_block_size(topk_ids, cfg["BLOCK_SIZE_M"], num_experts)
