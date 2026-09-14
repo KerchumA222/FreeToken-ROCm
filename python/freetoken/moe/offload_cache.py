@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import os
 import sys
+import time
 from dataclasses import dataclass
 from typing import Iterator, Sequence
 
@@ -1122,6 +1123,9 @@ class OffloadMoeCache:
         graph-safe version of this is the flag handshake the CPU MoE executor already
         uses; that is a later change, not a different design.
         """
+        if torch.cuda.is_current_stream_capturing():
+            self._admit_capture(layer_id)
+            return
         n_host, src_host, out_host, event = self._admit_staging()
         # One stall per layer instead of three. The count and the index vector are
         # staged together and waited on once; the slot rewrite goes back as an async
@@ -1139,6 +1143,83 @@ class OffloadMoeCache:
         slots = self.host_tier.ensure(layer_id, src_host[:n].tolist())
         out_host[:n] = torch.as_tensor(slots, dtype=out_host.dtype)
         self.src_indices[:n].copy_(out_host[:n], non_blocking=True)
+
+    # ---- graph-safe admission ------------------------------------------------
+    #
+    # Under capture there is no host to read back from. A flag handshake cannot
+    # help on HIP -- stream memops run eagerly at capture time and leave no node --
+    # so the fetch rides a host-function node instead: the stream does not advance
+    # past it until the callback returns, which is the same barrier the eager path
+    # got from its sync. Per MoE layer the captured stream does
+    #
+    #     D2H num_indices/src_indices -> pinned ; HOST(ensure) ; H2D slots -> src_indices
+    #
+    # The callback runs on a driver thread and must not touch the GPU runtime or
+    # raise into it; it only reads pinned memory, reads the disk, and writes pinned
+    # memory. Failures are parked on the cache and re-raised by the engine.
+
+    def _admit_graph_bufs(self, layer_id: int) -> dict:
+        bufs = getattr(self, "_admit_graph", {}).get(layer_id)
+        if bufs is None:
+            from freetoken.kernel.pinned import alloc_pinned_tensor
+            from freetoken.moe import graph_host
+
+            if not hasattr(self, "_admit_graph"):
+                self._admit_graph, self._admit_order = {}, []
+                self._admit_error = None
+            width = self.src_indices.numel()
+            bufs = {
+                "n": alloc_pinned_tensor(1, dtype=torch.int64),
+                "src": alloc_pinned_tensor(width, dtype=torch.int32),
+                "out": alloc_pinned_tensor(width, dtype=torch.int32),
+            }
+            for t in bufs.values():
+                t.zero_()
+            # held on the cache: ctypes frees the trampoline with this object, and a
+            # replay would then call into freed memory
+            bufs["cb"] = graph_host.make_host_func(self._admit_callback(layer_id, bufs))
+            self._admit_graph[layer_id] = bufs
+        return bufs
+
+    def _admit_callback(self, layer_id: int, bufs: dict):
+        def _run() -> None:
+            try:
+                n = int(bufs["n"][0])
+                if n > 0:
+                    slots = self.host_tier.ensure(layer_id, bufs["src"][:n].tolist())
+                    bufs["out"][:n] = torch.as_tensor(slots, dtype=torch.int32)
+            except BaseException as exc:  # never unwind into the driver
+                if self._admit_error is None:
+                    self._admit_error = exc
+
+        return _run
+
+    def prepare_graph_admission(self, layer_ids: Sequence[int]) -> None:
+        """Pre-create every layer's staging and host node before capture opens.
+
+        ``alloc_pinned_tensor`` is illegal inside stream capture, so the first
+        request for a layer must not be the captured one."""
+        for layer_id in layer_ids:
+            self._admit_graph_bufs(int(layer_id))
+
+    def raise_admission_error(self) -> None:
+        """Re-raise on the engine thread whatever a host node swallowed."""
+        exc = getattr(self, "_admit_error", None)
+        if exc is not None:
+            self._admit_error = None
+            raise RuntimeError("disk-tier expert admission failed inside a graph replay") from exc
+
+    def _admit_capture(self, layer_id: int) -> None:
+        from freetoken.moe import graph_host
+
+        b = self._admit_graph_bufs(layer_id)
+        stream = torch.cuda.current_stream().cuda_stream
+        b["n"].copy_(self.num_indices, non_blocking=True)
+        b["src"].copy_(self.src_indices, non_blocking=True)
+        graph_host.launch_host_func(stream, b["cb"])
+        self.src_indices.copy_(b["out"], non_blocking=True)
+        if layer_id not in self._admit_order:
+            self._admit_order.append(layer_id)
 
     def _admit_staging(self):
         """Pinned host mirrors of (num_indices, src_indices) plus the slot write-back

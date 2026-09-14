@@ -147,6 +147,13 @@ class GraphRunner:
 
         self.buffer = GraphCaptureBuffer.init(self.max_graph_bs, vocab_size, self.device)
         self._reset_moe_offload_cache()
+        # getattr: the duck-typed cache doubles in tests carry neither attribute.
+        if getattr(self.moe_offload_cache, "host_tier", None) is not None:
+            # Pinned staging for the disk tier's admission host nodes: allocating it is
+            # illegal once capture opens, so every layer's has to exist beforehand.
+            self.moe_offload_cache.prepare_graph_admission(
+                range(self.moe_offload_cache.num_layers)
+            )
 
         pbar = tqdm(
             sorted(self.graph_bs_list, reverse=True),

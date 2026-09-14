@@ -644,14 +644,30 @@ class Engine:
         cache.set_bank_sources({name: tier.banks[name] for name in store.banks})
 
         if config.cuda_graph_max_bs != 0:
-            # Admission reads num_indices/src_indices back to the host, which cannot
-            # happen inside a captured graph. The graph-safe form of this is the flag
-            # handshake the CPU MoE executor already uses; until then, decode is eager.
-            logger.info_rank0(
-                "disk tier: disabling CUDA graph capture (expert admission syncs "
-                "with the host each MoE layer)"
-            )
-            object.__setattr__(config, "cuda_graph_max_bs", 0)
+            from freetoken.moe import graph_host
+
+            opt_in = os.getenv("FREETOKEN_DISK_TIER_GRAPH", "").strip().lower() in ("1", "true", "yes", "on")
+            if graph_host.available() and opt_in:
+                # Admission rides a host-function node, which capture records and
+                # replays; the stream holds at the node until the fetch returns.
+                # Opt-in: capture itself is not yet sound for this stack on ROCm --
+                # it wedges the (uncaptured) causal_conv1d prefill kernel -- and the
+                # disk tier is the only configuration that would turn it on.
+                logger.info_rank0("disk tier: expert admission on graph host nodes")
+            elif graph_host.available():
+                logger.info_rank0(
+                    "disk tier: disabling CUDA graph capture (set "
+                    "FREETOKEN_DISK_TIER_GRAPH=1 to admit experts on host nodes)"
+                )
+                object.__setattr__(config, "cuda_graph_max_bs", 0)
+            else:
+                # No host-node launcher: admission has to read num_indices back to the
+                # host, which capture forbids, so decode stays eager.
+                logger.info_rank0(
+                    "disk tier: disabling CUDA graph capture (no host-function "
+                    "launcher, so expert admission must sync each MoE layer)"
+                )
+                object.__setattr__(config, "cuda_graph_max_bs", 0)
         return cache
 
     def _init_offload_moe_cache(self, config: EngineConfig) -> OffloadMoeCache:
@@ -1119,6 +1135,10 @@ class Engine:
             next_tokens_gpu = self.sampler.sample(logits[:rows], args).to(torch.int32)
             if self.mtp_head is not None and batch.capture_hidden:
                 draft_tokens_gpu = self._draft_tokens(batch, next_tokens_gpu)
+        if self.moe_offload_cache is not None and self.moe_offload_cache.host_tier is not None:
+            # A host node cannot unwind into the driver, so a failed fetch is parked
+            # on the cache and surfaces here instead of as silently stale experts.
+            self.moe_offload_cache.raise_admission_error()
         if self.cpu_moe_executor is not None:
             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
             # -> stale expert outputs) as a loud error instead of silent corruption.
