@@ -63,11 +63,26 @@ using CuMemOp64Fn = int (*)(void *stream, unsigned long long addr, unsigned long
                             unsigned int flags);
 CuMemOp64Fn g_cu_write64 = nullptr;
 CuMemOp64Fn g_cu_wait64 = nullptr;
-constexpr unsigned kCuWaitValueGeq = 0x0;
+// HIP spells the same two ops with a void* instead of a CUdeviceptr, and its wait
+// carries a mask the CUDA call does not. Same semantics, so they back the same seam.
+using HipWrite64Fn = int (*)(void *stream, void *ptr, uint64_t value, unsigned int flags);
+using HipWait64Fn = int (*)(void *stream, void *ptr, uint64_t value, unsigned int flags,
+                            uint64_t mask);
+HipWrite64Fn g_hip_write64 = nullptr;
+HipWait64Fn g_hip_wait64 = nullptr;
+constexpr unsigned kCuWaitValueGeq = 0x0;  // == hipStreamWaitValueGte
 constexpr unsigned kCuWriteDefault = 0x0;
+constexpr uint64_t kHipWaitMaskAll = ~static_cast<uint64_t>(0);
 
 bool cumemop_resolve() {
   static bool resolved = [] {
+    // ROCm first: only one of the two runtimes is ever loadable in a given process,
+    // so the order just decides which dlopen misses.
+    if (void *hip = dlopen("libamdhip64.so", RTLD_LAZY | RTLD_LOCAL)) {
+      g_hip_write64 = reinterpret_cast<HipWrite64Fn>(dlsym(hip, "hipStreamWriteValue64"));
+      g_hip_wait64 = reinterpret_cast<HipWait64Fn>(dlsym(hip, "hipStreamWaitValue64"));
+      if (g_hip_write64 != nullptr && g_hip_wait64 != nullptr) return true;
+    }
     void *h = dlopen("libcuda.so.1", RTLD_LAZY | RTLD_LOCAL);
     if (h == nullptr) h = dlopen("libcuda.so", RTLD_LAZY | RTLD_LOCAL);
     if (h == nullptr) return false;
@@ -84,11 +99,17 @@ bool cumemop_resolve() {
 
 int memop_write(uintptr_t stream, uintptr_t addr, uint64_t value) {
   if (!cumemop_resolve()) return -1;
+  if (g_hip_write64 != nullptr)
+    return g_hip_write64(reinterpret_cast<void *>(stream), reinterpret_cast<void *>(addr),
+                         value, kCuWriteDefault);
   return g_cu_write64(reinterpret_cast<void *>(stream), addr, value, kCuWriteDefault);
 }
 
 int memop_wait_geq(uintptr_t stream, uintptr_t addr, uint64_t value) {
   if (!cumemop_resolve()) return -1;
+  if (g_hip_wait64 != nullptr)
+    return g_hip_wait64(reinterpret_cast<void *>(stream), reinterpret_cast<void *>(addr),
+                        value, kCuWaitValueGeq, kHipWaitMaskAll);
   return g_cu_wait64(reinterpret_cast<void *>(stream), addr, value, kCuWaitValueGeq);
 }
 
