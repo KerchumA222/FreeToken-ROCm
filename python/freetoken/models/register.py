@@ -264,6 +264,8 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "Qwen4ExpForCausalLM",
         parse_config="parse_gguf_config",
         iter_weights="iter_gguf_weights",
+        mtp_head="Qwen4ExpMTPHead",
+        iter_mtp_weights="iter_gguf_mtp_weights",
     ),
     # GLM-5.2 (model_type glm_moe_dsa): DeepSeek-V3.2-class MLA + DSA sparse attention
     # with GLM-4-style sigmoid/noaux_tc MoE routing; NVFP4 routed experts served from

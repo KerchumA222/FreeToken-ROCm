@@ -55,7 +55,11 @@ def _hf_like(shim: "GgufConfigShim"):
 
     head_dim = int(g("attention.key_length"))
     rotary_dim = int(g("rope.dimension_count"))
-    layers = int(g("block_count"))
+    # block_count includes the MTP draft blocks, which are not part of the trunk: block 48
+    # of a 48-layer checkpoint is the nextn head, and it would otherwise be built as a
+    # trunk layer the weights do not describe.
+    num_nextn_layers = int(g("nextn_predict_layers", 0) or 0)
+    layers = int(g("block_count")) - num_nextn_layers
     interval = int(g("full_attention_interval", 4))
     num_v_heads = int(g("ssm.time_step_rank"))
 
@@ -71,6 +75,7 @@ def _hf_like(shim: "GgufConfigShim"):
     text = _Text(
         hidden_size=int(g("embedding_length")),
         num_hidden_layers=layers,
+        mtp_num_hidden_layers=num_nextn_layers,
         num_attention_heads=int(g("attention.head_count")),
         num_key_value_heads=int(g("attention.head_count_kv")),
         head_dim=head_dim,

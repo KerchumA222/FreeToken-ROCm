@@ -218,6 +218,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
 
     return ModelConfig(
         num_layers=text.num_hidden_layers,
+        num_nextn_layers=int(getattr(text, "mtp_num_hidden_layers", 0) or 0),
         num_qo_heads=text.num_attention_heads,
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,

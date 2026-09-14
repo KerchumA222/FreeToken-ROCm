@@ -269,7 +269,11 @@ class Batch:
         # position to keep its own KV complete, while the LM head still scores only the
         # rows that predict anything. Capturing after would force logits for the whole
         # extent, which for a large vocabulary is hundreds of MB on a long prompt.
-        if self.capture_hidden:
+        # Only if nothing claimed it already: an architecture whose draft head consumes a
+        # different representation than the LM head does (qwen4_exp's wide hyper-connection
+        # residual, which the model collapses before this point) stashes its own earlier in
+        # the forward. Batches are built fresh per forward, so None means unclaimed.
+        if self.capture_hidden and self.hidden_states is None:
             self.hidden_states = x
         if self.logits_indices is not None:
             x = x[self.logits_indices].contiguous()

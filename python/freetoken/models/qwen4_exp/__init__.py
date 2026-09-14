@@ -16,6 +16,7 @@ from .gguf import (
     parse_gguf_config,
 )
 from .model import Qwen4ExpForCausalLM
+from .mtp import Qwen4ExpMTPHead, iter_gguf_mtp_weights, mtp_draft_layer
 from .weight import (
     ftw_side_files,
     nvfp4_expert_spec,
@@ -64,4 +65,7 @@ __all__ = [
     "iter_gguf_weights",
     "load_q4_0_expert_sources",
     "dummy_q4_0_expert_sources",
+    "Qwen4ExpMTPHead",
+    "iter_gguf_mtp_weights",
+    "mtp_draft_layer",
 ]

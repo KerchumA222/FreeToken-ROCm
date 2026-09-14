@@ -139,6 +139,12 @@ class Qwen4ExpModel(BaseOP):
             # single writer: the layers only read the context, so a second PLE layer's
             # prefetch sees the un-rolled window
             commit_ngram_context(meta, getattr(batch, "fla_metadata", None))
+        if batch.capture_hidden:
+            # The MTP draft head folds the next token's embedding into the WIDE residual,
+            # before this mixer collapses it, so that is what it has to be handed. The
+            # mixer doubles as this architecture's output norm -- there is no other one --
+            # so its result is not a representation the head can re-enter.
+            batch.hidden_states = hidden
         return self.hyper_connection_mixer.mix(hidden)[0]
 
 

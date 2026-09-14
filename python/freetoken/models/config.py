@@ -549,7 +549,12 @@ def with_layer_in_full_attention(config: "ModelConfig", layer_id: int) -> "Model
             ids.add(layer_id)
         else:
             ids.discard(layer_id)
-        groups.append(replace(group, layer_ids=tuple(sorted(ids))))
+        extra = {}
+        # QSA groups size their index slab by a layer count of their own; it has to follow
+        # the membership change or the added block has no index tier.
+        if getattr(group, "num_index_layers", 0) == len(group.layer_ids):
+            extra["num_index_layers"] = len(ids)
+        groups.append(replace(group, layer_ids=tuple(sorted(ids)), **extra))
     out = replace(config, attention_groups=tuple(groups))
     # The GGUF readers stash the expert bank types with object.__setattr__, and replace()
     # keeps only declared fields -- without this the block builds its MoE against nothing.
