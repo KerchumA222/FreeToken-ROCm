@@ -221,9 +221,40 @@ class DiskRowTable:
         if ok:
             stream.synchronize()
             ok = int(scratch[0]) == 7
+        # Returning 0 is not enough: the WAIT is only useful if capture records it as
+        # a node. HIP's memops run eagerly under capture and leave none behind, which
+        # would park the capture stream and replay with no wait at all. Capture a
+        # write and check it did not land until replay.
+        if ok:
+            ok = self._probe_memops_capture(scratch)
         if mode == "wait" and not ok:
             raise RuntimeError("FREETOKEN_PLE_SYNC=wait but stream memops are unavailable")
         return ok
+
+    @staticmethod
+    def _probe_memops_capture(scratch: torch.Tensor) -> bool:
+        from freetoken.kernel import _ple_store
+
+        scratch.zero_()
+        graph = torch.cuda.CUDAGraph()
+        sink = torch.zeros(1, device=scratch.device if scratch.is_cuda else "cuda")
+        try:
+            torch.cuda.synchronize()
+            with torch.cuda.graph(graph):
+                sink.add_(1.0)
+                _ple_store.memop_write(
+                    torch.cuda.current_stream().cuda_stream, scratch.data_ptr(), 9
+                )
+            if int(scratch[0]) == 9:
+                return False  # ran at capture time: not a node
+            scratch.zero_()
+            graph.replay()
+            torch.cuda.synchronize()
+            return int(scratch[0]) == 9
+        except Exception:
+            return False
+        finally:
+            scratch.zero_()
 
     # ---------------- host side (engine thread, before the forward launches) ----------------
 
