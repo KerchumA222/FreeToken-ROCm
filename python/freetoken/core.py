@@ -63,6 +63,20 @@ class Req:
     # handler must not free resources under an in-flight forward; it sets this flag and
     # _process_last_data frees the request when the batch drains (after copy_done.synchronize).
     aborted: bool = False
+    # Draft tokens staged by a speculative proposer and not yet verified. They are already
+    # counted in device_len (so extend_len is 1 + this), and are dropped or committed by
+    # accept() after the verify forward. 0 whenever speculation is off or idle.
+    spec_draft_len: int = 0
+    # The token the draft head proposed for this request's next position, carried from the
+    # forward that produced it to the batch that will verify it. None when speculation is
+    # off, or for the first step after a prefill that has not drafted yet.
+    pending_draft: int | None = None
+    # Spare LinearStatePool slot holding this request's GDN state as it was before the
+    # verify forward. Recurrent state cannot be rewound token by token, so speculation
+    # snapshots it and restores on a rejection.
+    spec_state_slot: int | None = None
+    # Consecutive rejections, to stop a request that keeps failing from retrying forever.
+    spec_rejects: int = 0
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
@@ -87,6 +101,88 @@ class Req:
     def complete_one(self) -> None:
         self.cached_len = self.device_len
         self.device_len += 1
+
+    @property
+    def spec_capacity(self) -> int:
+        """How many draft tokens this request can still carry. The verify step emits one
+        token of its own on top of the drafts, so one slot past them has to stay free."""
+        return max(0, self.remain_len - 1)
+
+    def reserve_drafts(self, k: int) -> None:
+        """Stage ``k`` draft positions before their token ids are known.
+
+        Reserving first is not an optimization: a draft head is a decoder block with its
+        own KV, and it attends to the positions it is drafting, so their cache slots have
+        to be allocated before it runs. ``device_len`` is what the cache manager allocates
+        against, so it moves here and the ids are filled in by ``write_draft``."""
+        assert self.spec_draft_len == 0, "drafts are already staged"
+        assert k <= self.spec_capacity, f"{k} drafts exceed capacity {self.spec_capacity}"
+        self.device_len += k
+        self.input_ids = self._ids_buf[: self.device_len]
+        self.spec_draft_len = k
+
+    def write_draft(self, j: int, token: torch.Tensor) -> None:
+        """Fill in draft ``j`` once the proposer has produced it."""
+        assert 0 <= j < self.spec_draft_len
+        self._ids_buf[self.device_len - self.spec_draft_len + j] = token
+
+    def propose(self, draft_ids: torch.Tensor) -> None:
+        """Stage ``k`` already-known draft tokens.
+
+        ``extend_len`` becomes ``1 + k``: the last committed token (sampled last step, not
+        in the KV cache yet) followed by the drafts. Everything downstream that sizes a
+        batch reads ``extend_len``, so the verify forward needs no other change."""
+        k = int(draft_ids.numel())
+        self.reserve_drafts(k)
+        for j in range(k):
+            self.write_draft(j, draft_ids[j])
+
+    def accept(self, num_accepted: int, correction: torch.Tensor) -> int:
+        """Commit ``num_accepted`` drafts plus one token the target sampled itself, and
+        drop the rest. Returns how many staged positions were rejected, which is what the
+        cache manager has to roll back -- this resets ``spec_draft_len``, so read the
+        return value rather than the field afterwards.
+
+        The target's logits at the first rejected draft are a valid sample for that
+        position whether or not any draft survived, so a step always commits at least one
+        token and speculation can never stall."""
+        k = self.spec_draft_len
+        assert 0 <= num_accepted <= k
+        # [cached_len, cached_len + k] were all forwarded; only 1 + num_accepted survive.
+        committed = self.cached_len + 1 + num_accepted
+        self._ids_buf[committed] = correction
+        self.input_ids = self._ids_buf[: committed + 1]
+        self.cached_len = committed
+        self.device_len = committed + 1
+        self.spec_draft_len = 0
+        return k - num_accepted
+
+    def reject_and_restage(self, correction: torch.Tensor) -> None:
+        """Discard the drafts without committing anything, and restage the target's own
+        token as the next draft.
+
+        For state a verify forward advances but cannot rewind -- the GDN recurrent state,
+        which has no per-token inverse. Rather than commit a prefix the state no longer
+        matches, the round is abandoned: the caller restores the pre-verify state, and the
+        next forward re-derives the same position with the correction now staged as its
+        draft. That draft is what the target itself just produced from the same state, so
+        it is accepted and the pair of rounds retires two tokens -- no worse than plain
+        decoding, and never a stall."""
+        assert self.spec_draft_len >= 1
+        self._ids_buf[self.cached_len + 1] = correction
+        self.device_len = self.cached_len + 2
+        self.input_ids = self._ids_buf[: self.device_len]
+        self.spec_draft_len = 1
+
+    def drop_drafts(self) -> int:
+        """Unstage drafts without verifying them (the request was aborted or the batch
+        was abandoned before its forward). Returns the number dropped."""
+        k = self.spec_draft_len
+        if k:
+            self.device_len -= k
+            self.input_ids = self._ids_buf[: self.device_len]
+            self.spec_draft_len = 0
+        return k
 
     def append_host(self, next_token: torch.Tensor) -> None:
         n = self.input_ids.numel()
@@ -130,6 +226,23 @@ class Batch:
     # positions anywhere in a request's history snapshot those rows before a captured replay
     # (DSV4), since the next batch's allocate_paged mutates the live table.
     active_table_idx: "torch.Tensor | None" = None
+    # A speculative verify batch. It runs the prefill path (extend_len is 1 + the per-request
+    # draft depth, resuming mid-sequence), so phase stays "prefill"; this is what tells the
+    # steps that do care -- logits selection, sampling, and the post-forward commit -- apart.
+    is_spec_verify: bool = False
+    # Rows of the forward's hidden states to run the LM head over. None keeps the default:
+    # the last token of each request on prefill, every row on decode. A verify batch sets it
+    # to all 1 + k extend rows per request, since each one scores a draft.
+    logits_indices: "torch.Tensor | None" = None
+    # Keep the forward's per-token hidden states for a draft head. Every forwarded
+    # position, not just the scored ones: the head is a decoder block with its own KV and
+    # has to cover the whole extent to stay consistent with the committed sequence.
+    capture_hidden: bool = False
+    hidden_states: "torch.Tensor | None" = None
+    # Index of each request's LAST row within this forward's rows, captured before the
+    # post-forward bookkeeping moves extend_len off its forward value. That row carries the
+    # draft head's prediction for the position after the one the target just produced.
+    draft_last_rows: "list[int] | None" = None
     # this field should be set by attention backend
     attn_metadata: BaseAttnMetadata = field(init=False)
     # concatenated multimodal soft-token embeddings for a prefill batch (or None)
@@ -145,6 +258,24 @@ class Batch:
     # _prepare_batch succeeds. Continuation chunks leave this empty, so accounting is
     # exactly-once.
     prompt_admissions: List[Tuple[int, int, int]] = field(default_factory=list, init=False)
+
+    def select_output_rows(self, x: torch.Tensor) -> torch.Tensor:
+        """Narrow a forward's per-token hidden states to the rows the LM head scores.
+
+        Decode already produces one row per request. Prefill produces the whole extent and
+        only the last row of each request predicts anything -- except on a verify batch,
+        where every staged row scores a draft and ``logits_indices`` names them all."""
+        # Captured BEFORE the gather: a draft head has to run over every forwarded
+        # position to keep its own KV complete, while the LM head still scores only the
+        # rows that predict anything. Capturing after would force logits for the whole
+        # extent, which for a large vocabulary is hundreds of MB on a long prompt.
+        if self.capture_hidden:
+            self.hidden_states = x
+        if self.logits_indices is not None:
+            x = x[self.logits_indices].contiguous()
+        elif self.is_prefill:
+            x = x[self.attn_metadata.get_last_indices(self.size)].contiguous()
+        return x
 
     @property
     def is_prefill(self) -> bool:

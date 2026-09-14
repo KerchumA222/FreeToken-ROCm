@@ -220,9 +220,7 @@ class GgufLMHead(BaseOP):
         from freetoken.core import get_global_ctx
 
         batch = get_global_ctx().batch
-        if batch.is_prefill:
-            indices = batch.attn_metadata.get_last_indices(batch.size)
-            x = x[indices].contiguous()
+        x = batch.select_output_rows(x)
         return fused_mul_mat_gguf(x, self.qweight, self._quant_type)
 
 

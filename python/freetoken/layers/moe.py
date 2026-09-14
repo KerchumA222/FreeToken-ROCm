@@ -192,7 +192,9 @@ class OffloadMoELayer(MoELayer):
         router_logits: torch.Tensor | None = None,
     ):
         ctx = get_global_ctx()
-        if ctx.batch.is_prefill:
+        # See routed_forward: a speculative verify batch is a decode step for expert
+        # movement, whatever path the rest of the forward takes.
+        if ctx.batch.is_prefill and not ctx.batch.is_spec_verify:
             final_hidden_states = self.prefill_forward(hidden_states, router_logits)
         else:
             final_hidden_states = self.decode_forward(hidden_states, router_logits)
@@ -212,7 +214,14 @@ class OffloadMoELayer(MoELayer):
         rewrites expert ids into cache slot ids); pass a fresh tensor or a clone.
         """
         ctx = get_global_ctx()
-        if ctx.batch.is_prefill:
+        # A speculative verify batch rides the prefill path because the decode path is
+        # one-token-per-request throughout, but for expert movement it is a decode step:
+        # a handful of tokens routing to a few experts each. Streaming whole layers for
+        # it stages two orders of magnitude more experts than it reads, and restricting
+        # the stage instead forecloses the cross-layer look-ahead, leaving 41 serialized
+        # on-demand transfers. The decode path loads exactly the routed union into the
+        # slot cache and reuses it across steps.
+        if ctx.batch.is_prefill and not ctx.batch.is_spec_verify:
             out = self._prefill_routed(hidden_states, topk_weights, topk_ids)
         else:
             out = self._decode_routed(hidden_states, topk_weights, topk_ids)

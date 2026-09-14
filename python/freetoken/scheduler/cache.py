@@ -634,6 +634,24 @@ class CacheManager:
         self.free_slots = self.free_slots[needed_pages:]
         return allocated
 
+    def rollback_speculative(self, req: Req, staged_device_len: int) -> None:
+        """Return the pages for staged positions acceptance did not keep.
+
+        ``staged_device_len`` is the request's ``device_len`` as the verify forward saw it;
+        everything from the post-acceptance ``device_len`` up to it is now unused. Taking
+        the old length rather than a count of rejected drafts is deliberate: the correction
+        token occupies the first rejected draft's position, so the number of freeable
+        positions is one less than the number of drafts rejected -- and at depth 1 it is
+        zero. Freeing by the draft count instead hands the allocator a slot that was never
+        this request's, which corrupts whichever request receives it next.
+        """
+        first = div_ceil(req.device_len, self.page_size)
+        last = div_ceil(staged_device_len, self.page_size)
+        if last <= first:
+            return
+        rows = self.page_table[req.table_idx, first * self.page_size : last * self.page_size]
+        self._free(rows[:: self.page_size].contiguous())
+
     def _free(self, indices: torch.Tensor) -> None:
         if len(indices) > 0:
             self.free_slots = torch.cat([self.free_slots, indices[:: self.page_size]])

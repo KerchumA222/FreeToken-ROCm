@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, List
 import torch
 from freetoken.distributed import DistributedInfo
 from freetoken.layers.quantization import set_quant_config
+from freetoken.models.config import with_layer_in_full_attention
 from freetoken.models.register import _load_attr, checkpoint_quant_config, get_model_spec
 from freetoken.utils import cached_load_hf_config, init_logger
 
@@ -94,6 +95,10 @@ class EngineConfig:
     # KV capacity in tokens; resolved into num_page_override by _adjust_config once page_size
     # is final. Mutually exclusive with num_page_override.
     num_token_override: int | None = None
+    # Speculative decoding draft depth (0 = off). Needs a checkpoint that carries an MTP
+    # head, and DISABLE_OVERLAP_SCHEDULING: a draft is conditioned on the verify forward's
+    # hidden states, so the two cannot be in flight at once.
+    speculative_draft_tokens: int = 0
 
     def __post_init__(self):
         if self.moe_backend is None:
@@ -114,7 +119,21 @@ class EngineConfig:
         quant = checkpoint_quant_config(self.model_path, self.hf_config, spec)
         set_quant_config(quant)
         parse_config = _load_attr(spec.module, spec.parse_config)
-        return replace(parse_config(self.hf_config), quant=quant)
+        config = replace(
+            parse_config(self.hf_config),
+            quant=quant,
+            num_speculative_tokens=self.speculative_draft_tokens,
+        )
+        if not self.speculative_draft_tokens:
+            return config
+        if not config.num_nextn_layers:
+            raise ValueError(
+                f"--speculative-draft-tokens needs a checkpoint with an MTP head; "
+                f"{self.model_path} carries none"
+            )
+        # The draft block sits one index past the target stack. Claiming it here is what
+        # gives it a KV layer, since the pool sizes itself from the group's layer_ids.
+        return with_layer_in_full_attention(config, config.num_layers)
 
     @property
     def max_seq_len(self) -> int:

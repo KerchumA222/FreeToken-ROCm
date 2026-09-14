@@ -125,11 +125,9 @@ class ParallelLMHead(VocabParallelEmbedding):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         ctx = get_global_ctx()
         batch = ctx.batch
-        bs = batch.size
-        if batch.is_prefill:
-            indices = batch.attn_metadata.get_last_indices(bs)
-            x = x[indices].contiguous()
-            del indices
+        x = batch.select_output_rows(x)
+        # Row count, not request count: a verify batch scores several rows per request.
+        bs = x.shape[0]
 
         if self.tied_embedding is not None:
             logits = F.linear(x, self.tied_embedding.weight, self.bias)

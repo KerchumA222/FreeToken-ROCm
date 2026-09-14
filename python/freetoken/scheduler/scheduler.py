@@ -40,6 +40,18 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# Diagnostic: reject every draft. The committed sequence must still match plain decoding
+# exactly -- a step that rejects everything is a plain decode step plus a discarded
+# position. A mismatch under this means some state the verify forward advanced is not
+# being rolled back, which isolates rollback bugs from draft quality.
+import os as _os
+
+# Consecutive rejections after which a request stops speculating for a step. Guards
+# against a request whose draft never verifies spinning on zero-progress rounds.
+_SPEC_MAX_REJECTS = 2
+
+_SPEC_FORCE_REJECT = _os.environ.get("FT_SPEC_FORCE_REJECT", "") not in ("", "0")
+
 Indice2D: TypeAlias = Tuple[torch.Tensor, torch.Tensor]
 
 
@@ -125,6 +137,10 @@ class Scheduler(SchedulerIOMixin):
                 toolcall_opener_for(getattr(config, "tool_call_parser", "")),
             )
         self.token_pool = self.table_manager.token_pool
+        # Speculation counters: drafts accepted and verify rounds run, for the accepted
+        # length per round (1 + accepted/rounds tokens per forward).
+        self._spec_accepted = 0
+        self._spec_rounds = 0
         # Floor the prefill chunk by the cache manager's cap (DSV4: ~half the window pool) so a
         # sliding-window cache chunks long prompts and frees out-of-window pages between chunks
         # instead of OOMing _alloc_window on a prompt longer than the window pool.
@@ -283,7 +299,14 @@ class Scheduler(SchedulerIOMixin):
         # backend's per-batch SNAPSHOT (staged in prepare_for_replay right before the replay, on
         # the same stream, like the generic out_loc copy_from), not the live slot maps -- so the
         # next batch's allocate_paged cannot corrupt the in-flight graph replay. DSV4 overlaps.
-        if ENV.DISABLE_OVERLAP_SCHEDULING:
+        speculating = getattr(getattr(self, "engine", None), "mtp_head", None) is not None
+        if speculating and not ENV.DISABLE_OVERLAP_SCHEDULING:
+            logger.info_rank0(
+                "speculative decoding: running without overlap scheduling (a draft is "
+                "conditioned on the verify forward's result, so the two cannot be in "
+                "flight at once)"
+            )
+        if ENV.DISABLE_OVERLAP_SCHEDULING or speculating:
             with self.engine_stream_ctx:
                 self.engine.stream.wait_stream(self.stream)
                 while True:
@@ -303,7 +326,17 @@ class Scheduler(SchedulerIOMixin):
         if last_data is None:
             return
 
-        batch, (_, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
+        # Trailing fields (the draft head's predictions) are ignored here and read by the
+        # speculative path; starred so a plain 3-tuple stand-in still unpacks.
+        batch = last_data[0].batch
+        _, next_tokens_cpu, copy_done, *_extra = last_data[1]
+        draft_tokens_cpu = _extra[1] if len(_extra) > 1 else None
+        row_offsets: List[int] = []
+        if batch.is_spec_verify:
+            off = 0
+            for r in batch.reqs:
+                row_offsets.append(off)
+                off += r.extend_len
         copy_done.synchronize()
         reply: List[DetokenizeMsg] = []
         new_finished_reqs: Set[Req] = set()
@@ -334,58 +367,23 @@ class Scheduler(SchedulerIOMixin):
                     # are freed below/already; shipping this token would append past the
                     # client's terminal reply.
                     continue
-                next_token = next_tokens_cpu[i]
-                req.append_host(next_token.unsqueeze(0))
-                next_token = int(next_token.item())
-                # EOS / stop-string -> "stop", output budget exhausted -> "length";
-                # EOS and stop strings win over length.
-                hit_length = not req.can_decode
-                hit_eos = (
-                    not req.sampling_params.ignore_eos and next_token in self.eos_token_ids
-                )
-                matched_stop = (
-                    self._match_stop_str(req)
-                    if not hit_eos and req.sampling_params.stop_strs
-                    else None
-                )
-                finished = hit_length or hit_eos or matched_stop is not None
-                finish_reason = (
-                    ("stop" if (hit_eos or matched_stop is not None) else "length")
-                    if finished
-                    else None
-                )
-                if (
-                    next_token == self.toolcall_anchor_id
-                    and req.toolcall_anchor_len is None
-                    and not finished
-                ):
-                    req.toolcall_anchor_len = req.input_ids.numel()
-                reply.append(
-                    DetokenizeMsg(
-                        uid=req.uid,
-                        next_token=next_token,
-                        finished=finished,
-                        finish_reason=finish_reason,
-                        matched_stop=matched_stop,
-                        stop_strs=req.sampling_params.stop_strs or None,
+                if batch.is_spec_verify:
+                    emitted = self._commit_verified(
+                        req, row_offsets[i], next_tokens_cpu, draft_tokens_cpu
                     )
-                )
-
-                # NOTE: overlap scheduling may make the request freed twice, skip second free
-                if finished and req not in self.finished_reqs:
-                    self.decode_manager.remove_req(req)
-                    self._free_req_resources(req)
-                    new_finished_reqs.add(req)
-                elif batch.is_prefill and req.table_idx != -1:
-                    # for prefill, non-chunk req, cache the prefix.
-                    # Polymorphic: the DSV4 naive manager keeps the request's slots (no-op);
-                    # the generic manager inserts the prefix into its radix/naive cache.
-                    # table_idx == -1 is defense-in-depth: aborts mark in-flight requests
-                    # instead of freeing them (handled above), so a freed request should
-                    # never reach this commit -- but if a future path frees one early, skip
-                    # rather than re-read the freed page-table row (and on hybrid, deref the
-                    # None'd GDN ping-pong slots).
-                    self.cache_manager.cache_req(req, finished=False)
+                else:
+                    tok = next_tokens_cpu[i]
+                    req.append_host(tok.unsqueeze(0))
+                    emitted = [int(tok.item())]
+                    # Seed the next round's draft. Without this nothing ever stages one:
+                    # the only other producer is the verify path, which cannot run first.
+                    if draft_tokens_cpu is not None and batch.draft_last_rows:
+                        last = batch.draft_last_rows[i]
+                        if last < draft_tokens_cpu.numel():
+                            req.pending_draft = int(draft_tokens_cpu[last])
+                for next_token in emitted:
+                    if self._commit_token(batch, req, next_token, reply, new_finished_reqs):
+                        break
 
         self.finished_reqs = new_finished_reqs
         # Stamp each reply with the post-batch KV page occupancy so the frontend (shell
@@ -601,6 +599,11 @@ class Scheduler(SchedulerIOMixin):
         # slots to two later requests. table_idx == -1 marks an already-freed request.
         if req.table_idx == -1:
             return
+        if req.spec_state_slot is not None:
+            # The speculative rollback snapshot; freed with the rest so the slot does not
+            # leak out of the linear-state pool when a request ends mid-speculation.
+            self.engine.linear_state_pool.free([req.spec_state_slot])
+            req.spec_state_slot = None
         # Polymorphic free: the DSV4 manager returns the request's window pages + cmp/idx blocks
         # to their tier free-lists; the generic manager frees its KV pages (it reads
         # page_table[req.table_idx], so free the table entry after).
@@ -759,6 +762,185 @@ class Scheduler(SchedulerIOMixin):
         except Exception as e:  # noqa: BLE001
             logger.warning(f"could not log cache geometry: {e!r}")
 
+    def _snapshot_linear_state(self, req, pool) -> bool:
+        """Copy the request's GDN state aside so a rejection can restore it.
+
+        Recurrent state has no per-token inverse: once the verify forward has run it
+        through the drafts, the only way back to the accepted prefix is a copy taken
+        before. Returns False when no spare slot is available."""
+        if req.linear_slot_idx is None:
+            return True                      # not a hybrid model: nothing recurrent to save
+        if req.spec_state_slot is None:
+            if pool.num_free_slots < 1:
+                return False
+            req.spec_state_slot = pool.alloc(1)[0]
+        pool.copy_from(req.linear_slot_idx, req.spec_state_slot)
+        return True
+
+    def _restore_spec_linear_state(self, req) -> None:
+        """Put back the GDN state as it was before the verify forward."""
+        pool = self.engine.linear_state_pool
+        if pool is not None and req.linear_slot_idx is not None and req.spec_state_slot is not None:
+            pool.copy_from(req.spec_state_slot, req.linear_slot_idx)
+
+    def _commit_token(self, batch, req, next_token: int, reply, new_finished_reqs) -> bool:
+        """Ship one committed token and settle the request if it terminates.
+
+        Split out of the commit loop because a speculative step commits a run of them:
+        the accepted drafts plus the token the target drew itself.  Returns whether the
+        request finished on this token, so a run stops at the first terminal one."""
+        # EOS / stop-string -> "stop", output budget exhausted -> "length";
+        # EOS and stop strings win over length.
+        hit_length = not req.can_decode
+        hit_eos = (
+            not req.sampling_params.ignore_eos and next_token in self.eos_token_ids
+        )
+        matched_stop = (
+            self._match_stop_str(req)
+            if not hit_eos and req.sampling_params.stop_strs
+            else None
+        )
+        finished = hit_length or hit_eos or matched_stop is not None
+        finish_reason = (
+            ("stop" if (hit_eos or matched_stop is not None) else "length")
+            if finished
+            else None
+        )
+        if (
+            next_token == self.toolcall_anchor_id
+            and req.toolcall_anchor_len is None
+            and not finished
+        ):
+            req.toolcall_anchor_len = req.input_ids.numel()
+        reply.append(
+            DetokenizeMsg(
+                uid=req.uid,
+                next_token=next_token,
+                finished=finished,
+                finish_reason=finish_reason,
+                matched_stop=matched_stop,
+                stop_strs=req.sampling_params.stop_strs or None,
+            )
+        )
+
+        # NOTE: overlap scheduling may make the request freed twice, skip second free
+        if finished and req not in self.finished_reqs:
+            self.decode_manager.remove_req(req)
+            self._free_req_resources(req)
+            new_finished_reqs.add(req)
+        elif batch.is_prefill and not batch.is_spec_verify and req.table_idx != -1:
+            # for prefill, non-chunk req, cache the prefix. A verify batch rides the
+            # prefill path but is a decode step: its prefix is already cached.
+            # Polymorphic: the DSV4 naive manager keeps the request's slots (no-op);
+            # the generic manager inserts the prefix into its radix/naive cache.
+            # table_idx == -1 is defense-in-depth: aborts mark in-flight requests
+            # instead of freeing them (handled above), so a freed request should
+            # never reach this commit -- but if a future path frees one early, skip
+            # rather than re-read the freed page-table row (and on hybrid, deref the
+            # None'd GDN ping-pong slots).
+            self.cache_manager.cache_req(req, finished=False)
+        return finished
+
+    def _commit_verified(self, req, off: int, next_tokens_cpu, draft_tokens_cpu) -> List[int]:
+        """Judge one request's drafts and commit the run the target agrees with.
+
+        Row ``j`` of the verify forward is the target's own draw at the position draft
+        ``j`` occupies, so the accepted run is the leading stretch where they match and
+        the row just past it supplies a token the target chose itself. That last token is
+        why a verify step always commits at least one, and why speculation cannot stall.
+        """
+        k = req.spec_draft_len
+        base = req.cached_len
+        drafts = [int(req.input_ids[base + 1 + j]) for j in range(k)]
+        targets = [int(next_tokens_cpu[off + j]) for j in range(k + 1)]
+        accepted = 0
+        if not _SPEC_FORCE_REJECT:
+            while accepted < k and drafts[accepted] == targets[accepted]:
+                accepted += 1
+        correction = targets[accepted]
+        self._spec_rounds += 1
+        if accepted < k and self.engine.linear_state_pool is not None:
+            # A partial accept would leave the GDN state describing tokens that are not
+            # being committed, and recurrent state cannot be rewound. Abandon the round
+            # instead: restore the pre-verify state and restage the target's own token,
+            # which the next forward re-derives and accepts.
+            self._restore_spec_linear_state(req)
+            req.reject_and_restage(torch.tensor(correction, dtype=req.input_ids.dtype))
+            self.token_pool[req.table_idx, req.cached_len + 1] = correction
+            req.spec_rejects += 1
+            return []
+        staged_device_len = req.device_len
+        req.accept(accepted, torch.tensor(correction, dtype=req.input_ids.dtype))
+        self.cache_manager.rollback_speculative(req, staged_device_len)
+        # The forward reads its ids from the GPU pool; accept() only wrote the host buffer.
+        self.token_pool[req.table_idx, req.cached_len] = correction
+        if draft_tokens_cpu is not None:
+            # The head's prediction at the row we committed at is the token two past it,
+            # which is exactly the next round's draft.
+            req.pending_draft = int(draft_tokens_cpu[off + accepted])
+        req.spec_rejects = 0
+        self._spec_accepted += accepted
+        return drafts[:accepted] + [correction]
+
+    def _stage_speculation(self, batch: Batch) -> None:
+        """Turn a decode batch into a verify batch by staging each request's draft.
+
+        Runs before ``_prepare_batch`` so the staged position is covered by the page
+        allocation. The batch moves onto the prefill path: its requests now extend by more
+        than one token, and the decode path is one-token-per-request throughout -- the GDN
+        metadata builder assumes it, and so does the CUDA graph.
+
+        Only greedy requests speculate for now: a verify forward samples several rows per
+        request, and the per-request sampling tensors are sized one-per-request.
+        """
+        # getattr: the cost-accounting tests drive _schedule_next_batch on a partial
+        # scheduler that never built an engine.
+        if getattr(getattr(self, "engine", None), "mtp_head", None) is None:
+            return
+        if not batch.is_decode:
+            return
+        pool = self.engine.linear_state_pool
+        staged = 0
+        for req in batch.reqs:
+            draft = req.pending_draft
+            req.pending_draft = None
+            if req.spec_draft_len:
+                if req.spec_rejects >= _SPEC_MAX_REJECTS:
+                    # A restaged draft that keeps failing would retire nothing, round after
+                    # round. Drop it and take a plain step; the discarded correction is
+                    # simply re-derived, so nothing is lost but the speculation.
+                    req.drop_drafts()
+                    req.spec_rejects = 0
+                    continue
+                # Restaged by a rejection: the draft is already in place and in the pool.
+                staged += 1
+            elif (
+                draft is not None
+                and req.sampling_params.is_greedy
+                and req.spec_capacity >= 1
+                and req.spec_rejects < _SPEC_MAX_REJECTS
+            ):
+                req.reserve_drafts(1)
+                req.write_draft(0, torch.tensor(draft, dtype=self.token_pool.dtype))
+                # The forward reads its ids from the GPU pool, not from the host buffer.
+                self.token_pool[req.table_idx, req.device_len - 1] = draft
+                staged += 1
+            else:
+                req.spec_rejects = 0
+                continue
+            if pool is not None and not self._snapshot_linear_state(req, pool):
+                # No spare slot for the rollback snapshot: run this request unspeculated
+                # rather than risk state we cannot restore.
+                req.drop_drafts()
+                staged -= 1
+        if staged == len(batch.reqs) and staged:
+            batch.phase = "prefill"
+            batch.is_spec_verify = True
+        elif staged:
+            # Mixed batch: un-stage rather than run some requests unverified.
+            for req in batch.reqs:
+                req.drop_drafts()
+
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
         self.engine.graph_runner.pad_batch(batch)
         self._forward_iter += 1
@@ -810,6 +992,14 @@ class Scheduler(SchedulerIOMixin):
             # This batch's padded per-row page-table rows. Backends that snapshot the table for
             # a captured replay (DSV4) read them in prepare_metadata / prepare_for_replay.
             batch.active_table_idx = input_mapping[0].view(-1)
+        # The draft head runs over this forward's hidden states, inside its batch context.
+        if self.engine.mtp_head is not None:
+            batch.capture_hidden = True
+        if batch.is_spec_verify:
+            # Every staged row is scored: each judges a draft, and the last predicts past
+            # them. The default prefill gather keeps only each request's last row.
+            rows = sum(r.extend_len for r in batch.padded_reqs)
+            batch.logits_indices = torch.arange(rows, device=self.device)
         self.engine.attn_backend.prepare_metadata(batch)
         return ForwardInput(
             batch=batch,
@@ -836,6 +1026,7 @@ class Scheduler(SchedulerIOMixin):
         )
         if batch is None:
             return None
+        self._stage_speculation(batch)
         forward_input = self._prepare_batch(batch)
         self._report_prompt_admissions(batch)
         return forward_input
@@ -869,7 +1060,10 @@ class Scheduler(SchedulerIOMixin):
         if self.toolcall_anchor_id is not None and not batch.is_prefill:
             self.cache_manager.snapshot_toolcall_anchor(batch.reqs)
         forward_output = self.engine.forward_batch(batch, sample_args)
-        self.token_pool[output_mapping] = forward_output.next_tokens_gpu
+        if not batch.is_spec_verify:
+            # A verify batch sampled one token per staged row, not one per request, so it
+            # has no single token to write back here. Acceptance writes the one it commits.
+            self.token_pool[output_mapping] = forward_output.next_tokens_gpu
         self.decode_manager.filter_reqs(forward_input.batch.reqs)
         return forward_output
 

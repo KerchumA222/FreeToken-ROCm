@@ -293,6 +293,11 @@ class ForwardOutput(NamedTuple):
     next_tokens_gpu: torch.Tensor
     next_tokens_cpu: torch.Tensor
     copy_done_event: torch.cuda.Event
+    # Draft head predictions, one per forwarded row: row t predicts the token two past
+    # index t. None unless speculation is on. The row a speculation commits at is the one
+    # whose prediction becomes the next round's draft.
+    draft_tokens_gpu: torch.Tensor | None = None
+    draft_tokens_cpu: torch.Tensor | None = None
 
 
 class Engine:
@@ -333,6 +338,17 @@ class Engine:
         logger.info_rank0(f"Host memory before loading weights: {host_mem_summary()}")
         self.model.load_state_dict(self._load_weight_state_dict(config))
         finalize_quant(self.model)
+        # The speculative draft head, built beside the model rather than inside it (it is a
+        # separate model borrowing the target's embedding and LM head). It has to exist
+        # before the MoE offload cache is built: its block owns a routed bank of its own,
+        # and the cache is attached by walking the modules that need it.
+        from freetoken.speculative.build import build_mtp_head
+
+        self.mtp_head = build_mtp_head(
+            config.model_path, config.model_config, device=self.device, dtype=config.dtype
+        )
+        if self.mtp_head is not None:
+            finalize_quant(self.mtp_head)
         post_weights_free = self._sync_get_memory()[0]
         logger.info_rank0(f"Host memory after loading weights:  {host_mem_summary()}")
         self._weights_bytes = self._baseline_free - post_weights_free
@@ -767,7 +783,12 @@ class Engine:
         # captured and re-run on every decode replay.
         cache.collect_stats = config.moe_collect_stats
         layers = attach_offload_moe_cache(self.model, cache)
-        assert len(layers) == config.model_config.num_moe_layers
+        if self.mtp_head is not None:
+            layers += attach_offload_moe_cache(self.mtp_head, cache)
+        assert len(layers) == config.model_config.num_moe_layers, (
+            f"{len(layers)} MoE layers attached, config says "
+            f"{config.model_config.num_moe_layers}"
+        )
         if cache.decode_target in ("cpu", "hybrid"):
             self._init_cpu_moe_executor(config, cache, layers)
         self.ctx.moe_offload_cache = cache
@@ -1050,25 +1071,73 @@ class Engine:
             moe_offload_cache=self.moe_offload_cache,
         )
 
+    def _draft_tokens(self, batch: Batch, next_tokens: torch.Tensor) -> torch.Tensor:
+        """Run the draft head over every row this forward produced.
+
+        The head at index ``t`` consumes the target's hidden state there and the token at
+        ``t+1``. Within a request's extent that next token is simply the following row;
+        for its last row it is the token the target just sampled, which is why this runs
+        after the sampler. Must be called inside the forward's batch context -- the head
+        is a decoder block and reads the live attention metadata."""
+        hidden = batch.hidden_states
+        ids = batch.input_ids[: hidden.shape[0]].to(torch.int64)
+        shifted = torch.empty_like(ids)
+        # A verify batch sampled one token per row; every other batch sampled one per
+        # request. Indexing the per-row case by request would feed the head the wrong
+        # token at each request's last row.
+        per_row = next_tokens.numel() == ids.shape[0]
+        last_rows: list[int] = []
+        offset = 0
+        for i, req in enumerate(batch.reqs):
+            n = req.extend_len
+            last = offset + n - 1
+            if n > 1:
+                shifted[offset:last] = ids[offset + 1 : last + 1]
+            shifted[last] = next_tokens[last] if per_row else next_tokens[i]
+            last_rows.append(last)
+            offset += n
+        # Recorded here because complete_one() below moves extend_len off its forward value.
+        batch.draft_last_rows = last_rows
+        out = self.mtp_head.forward(hidden, self.model.model.embed_tokens.forward(shifted))
+        return self.model.lm_head.forward(out).argmax(dim=-1).to(torch.int32)
+
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
         use_graph = self.graph_runner.can_use_cuda_graph(batch)
+        draft_tokens_gpu = None
         with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, use_graph):
             logits = self.graph_runner.replay(batch) if use_graph else self.model.forward()
+            # Sampling is inside the context because the draft head below needs both its
+            # result and the live attention metadata.
+            # A verify batch scores every staged row, not one per request: each row either
+            # judges a draft or is the token past the last of them.
+            rows = logits.shape[0] if batch.is_spec_verify else batch.size
+            next_tokens_gpu = self.sampler.sample(logits[:rows], args).to(torch.int32)
+            if self.mtp_head is not None and batch.capture_hidden:
+                draft_tokens_gpu = self._draft_tokens(batch, next_tokens_gpu)
         if self.cpu_moe_executor is not None:
             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
             # -> stale expert outputs) as a loud error instead of silent corruption.
             self.cpu_moe_executor.raise_if_unhealthy()
 
-        for req in batch.reqs:
-            req.complete_one()
+        if not batch.is_spec_verify:
+            # A verify batch advances by however many tokens acceptance commits, which is
+            # not known until the drafts are judged; Req.accept does it there instead.
+            for req in batch.reqs:
+                req.complete_one()
 
-        batch_logits = logits[: batch.size]
-        next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
+        draft_tokens_cpu = (
+            draft_tokens_gpu.to("cpu", non_blocking=True)
+            if draft_tokens_gpu is not None
+            else None
+        )
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
-        return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+        return ForwardOutput(
+            next_tokens_gpu, next_tokens_cpu, copy_done_event,
+            draft_tokens_gpu, draft_tokens_cpu,
+        )
 
     @torch.inference_mode()
     def _warmup_prefill(self) -> None:
