@@ -80,11 +80,19 @@ class Qwen4ExpMTPHead(BaseOP):
         )
 
     def forward(
-        self, hidden: torch.Tensor, token_embed: torch.Tensor, batch: "Batch"
+        self, hidden: torch.Tensor, token_embed: torch.Tensor, batch: "Batch | None" = None
     ) -> torch.Tensor:
         """``hidden`` [T, hc*hidden] is the trunk's wide residual at t, ``token_embed``
         [T, hidden] the embedding of the token at t+1; returns [T, hidden] for the
-        trunk's lm_head."""
+        trunk's lm_head.
+
+        ``batch`` defaults to the active one so every family's head takes the same call:
+        this architecture's decoder layer wants it explicitly, where Qwen3.5's reads the
+        context itself."""
+        if batch is None:
+            from freetoken.core import get_global_ctx
+
+            batch = get_global_ctx().batch
         tokens = hidden.shape[0]
         h = self.hnorm.forward(hidden).view(tokens, self.hc_count, self.hidden_size)
         e = self.enorm.forward(token_embed).unsqueeze(1).expand(-1, self.hc_count, -1)

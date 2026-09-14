@@ -92,6 +92,7 @@ class GgufExpertStore:
         num_experts: int,
         bank_types: dict[str, int],
         num_layers: int | None = None,
+        draft_path: str | None = None,
     ):
         self.model_path = model_path
         self.num_experts = int(num_experts)
@@ -111,7 +112,14 @@ class GgufExpertStore:
         # and re-iterating from each one tagged every part with the outer shard instead
         # of its own, which addressed the right offset in the wrong file -- invisible on
         # a single-file GGUF, wrong on every split one.
-        for t in iter_gguf_tensors(model_path):
+        from itertools import chain
+
+        # A sidecar MTP head keeps the draft block's bank in its own file; each tensor
+        # carries the shard it lives in, so the two streams address correctly.
+        streams = [iter_gguf_tensors(model_path)]
+        if draft_path:
+            streams.append(iter_gguf_tensors(draft_path))
+        for t in chain.from_iterable(streams):
             if not t.name.startswith("blk."):
                 continue
             suffix = t.name.split(".", 2)[2]

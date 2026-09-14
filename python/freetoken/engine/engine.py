@@ -575,7 +575,8 @@ class Engine:
         _gu, _dn = (_names * 2)[:2] if len(_names) == 1 else _names[:2]
         bank_types = {"gate_up": _by_name[_gu], "down": _by_name[_dn]}
         store = GgufExpertStore(
-            config.model_path, mc.num_experts, bank_types, mc.num_addressable_layers
+            config.model_path, mc.num_experts, bank_types, mc.num_addressable_layers,
+            draft_path=mc.speculative_draft_path,
         )
         requantized = store.requantized_layers()
         if requantized:
