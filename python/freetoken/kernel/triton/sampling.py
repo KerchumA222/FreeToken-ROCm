@@ -525,8 +525,24 @@ _COOPERATIVE_DISABLED = set()
 _COOP_CTAS_PER_SM = 2  # the fused kernels use ~80 regs/thread at 8 warps; 4/SM fails the cooperative launch
 
 
+@cache
+def _cooperative_supported(device) -> bool:
+    """Whether a multi-CTA cooperative launch may be attempted on this device.
+
+    Never on HIP. gfx1030 reports its 60 CUs as 30 WGPs, and neither budget is
+    safe: 2 CTAs/WGP is rejected outright with hipErrorCooperativeLaunchTooLarge,
+    and 1 CTA/WGP is *accepted* and then hangs, because fewer blocks are resident
+    than the grid barrier waits for. Neither is recoverable at runtime -- the
+    rejection poisons the HIP context so the retry in _exact_launch inherits a dead
+    stream, and the hang never returns to be caught at all. force_single runs the
+    same kernel with one CTA per row for identical results, so HIP takes that path
+    from the start.
+    """
+    return not torch.version.hip
+
+
 def _fused_plan(B, V, device, force_single=False):
-    if force_single:
+    if force_single or not _cooperative_supported(device):
         return 1, V
     # the cooperative launch needs the whole grid co-resident, so cap B*G by an occupancy budget instead of _plan's one CTA per SM
     g_by_sm = max(1, (_COOP_CTAS_PER_SM * _num_sm(device)) // B)
@@ -578,6 +594,13 @@ def _cooperative_key(probs, kernel, tk, draw):
 
 
 def _is_cooperative_launch_error(exc):
+    # ROCm's launcher reports a failed cooperative launch as a bare SystemError
+    # ("returned a result with an exception set") from the knobs hook loop, with the
+    # real message already consumed -- there is no string to match on. Any SystemError
+    # out of the launch is therefore treated as this failure: the retry below runs the
+    # same kernel with one CTA per row, so a misclassified error still raises there.
+    if isinstance(exc, SystemError):
+        return True
     message = str(exc).lower()
     return "cooperative" in message or "too many resources requested for launch" in message
 
@@ -588,7 +611,7 @@ def _exact_launch(probs, kernel, tk, tp, draw, seed, offset):
     G, _ = _fused_plan(*probs.shape, probs.device, force_single)
     try:
         return _fused_launch(probs, kernel, tk, tp, draw, seed, offset, force_single)
-    except RuntimeError as exc:
+    except (RuntimeError, SystemError) as exc:
         if force_single or G == 1 or not _is_cooperative_launch_error(exc):
             raise
         _COOPERATIVE_DISABLED.add(key)
