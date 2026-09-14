@@ -144,7 +144,7 @@ def _act_and_mul(
     block_d = min(triton.next_power_of_2(d), 1024 if M >= 4096 else 512)
     num_stages = 2 if block_d == 1024 else 3
     _act_and_mul_kernel[grid](
-        o2, x2, d, alpha, limit, ACT=kind, ENABLE_PDL=pdl, launch_pdl=pdl,
+        o2, x2, d, alpha, limit, ACT=kind, ENABLE_PDL=pdl, **({'launch_pdl': pdl} if pdl else {}),
         BLOCK_D=block_d, num_warps=4, num_stages=num_stages,
     )
     return out

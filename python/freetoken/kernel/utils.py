@@ -19,9 +19,20 @@ _TRUE_VALUES = {"1", "true", "yes", "on"}
 DEFAULT_INCLUDE = [str(KERNEL_PATH / "include")]
 DEFAULT_CFLAGS = ["-std=c++20", "-O3"]
 # patched: hipcc/clang rejects nvcc-only flags; MSVC-style args break on Windows HIP builds
+def _is_rocm_build() -> bool:
+    # HIP_PATH is unset for a wheel-installed ROCm, and setting it makes torch's
+    # cpp_extension think it is on Windows (clang++.EXE). Ask torch instead.
+    try:
+        import torch
+
+        return torch.version.hip is not None
+    except Exception:
+        return bool(os.environ.get("HIP_PATH"))
+
+
 DEFAULT_CUDA_CFLAGS = (
     ["-std=c++20", "-O3"]
-    if os.environ.get("HIP_PATH")
+    if _is_rocm_build()
     else ["-std=c++20", "-O3", "--expt-relaxed-constexpr"]
 )
 DEFAULT_LDFLAGS = []
