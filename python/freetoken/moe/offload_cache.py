@@ -1122,14 +1122,36 @@ class OffloadMoeCache:
         graph-safe version of this is the flag handshake the CPU MoE executor already
         uses; that is a later change, not a different design.
         """
-        n = int(self.num_indices.item())
+        n_host, src_host, out_host, event = self._admit_staging()
+        # One stall per layer instead of three. The count and the index vector are
+        # staged together and waited on once; the slot rewrite goes back as an async
+        # copy out of pinned memory, which the expert GEMM is already ordered after by
+        # the stream they share, so it costs no stall at all. src_indices is a few KB
+        # -- copying all of it is cheaper than the extra round trip that learning n
+        # first would cost.
+        n_host.copy_(self.num_indices, non_blocking=True)
+        src_host.copy_(self.src_indices, non_blocking=True)
+        event.record()
+        event.synchronize()
+        n = int(n_host[0])
         if n <= 0:
             return
-        experts = self.src_indices[:n].tolist()
-        slots = self.host_tier.ensure(layer_id, experts)
-        self.src_indices[:n].copy_(
-            torch.tensor(slots, dtype=self.src_indices.dtype), non_blocking=False
-        )
+        slots = self.host_tier.ensure(layer_id, src_host[:n].tolist())
+        out_host[:n] = torch.as_tensor(slots, dtype=out_host.dtype)
+        self.src_indices[:n].copy_(out_host[:n], non_blocking=True)
+
+    def _admit_staging(self):
+        """Pinned host mirrors of (num_indices, src_indices) plus the slot write-back
+        buffer and the event that orders them. Allocated once, reused every layer:
+        pageable staging would force a synchronous copy and undo the point of this."""
+        staging = getattr(self, "_admit_bufs", None)
+        if staging is None:
+            n_host = torch.empty_like(self.num_indices, device="cpu").pin_memory()
+            src_host = torch.empty_like(self.src_indices, device="cpu").pin_memory()
+            out_host = torch.empty_like(self.src_indices, device="cpu").pin_memory()
+            staging = (n_host, src_host, out_host, torch.cuda.Event())
+            self._admit_bufs = staging
+        return staging
 
     def ensure_experts_hybrid(self, layer_id: int, expert_ids: torch.Tensor) -> None:
         """Capped-fetch LRU for the hybrid backend.
