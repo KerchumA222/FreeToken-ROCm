@@ -24,7 +24,9 @@ class SchedulerIOMixin:
         sync_all_ranks: Function to synchronize all ranks on CPU side.
     """
 
-    def __init__(self, config: SchedulerConfig, tp_cpu_group: torch.distributed.ProcessGroup):
+    def __init__(
+        self, config: SchedulerConfig, tp_cpu_group: torch.distributed.ProcessGroup | None
+    ):
         tp_info = config.tp_info
         self.tp_cpu_group: Final = tp_cpu_group
         if config.offline_mode:
@@ -74,7 +76,11 @@ class SchedulerIOMixin:
         raise NotImplementedError("should be implemented")
 
     def sync_all_ranks(self) -> None:
-        self.tp_cpu_group.barrier().wait()
+        # None when torch.distributed is unavailable; only ever single-rank then,
+        # so there is nothing to synchronize. The multi-rank broadcasts below are
+        # unreachable in that case and need no guard.
+        if self.tp_cpu_group is not None:
+            self.tp_cpu_group.barrier().wait()
 
     def _recv_msg_single_rank(self, blocking: bool = False) -> List[BaseBackendMsg]:
         pending_msgs: List[BaseBackendMsg] = []

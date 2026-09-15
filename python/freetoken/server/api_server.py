@@ -1,10 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import sys
-if sys.platform == 'win32':
-    # patched: zmq.asyncio requires a Selector loop; Windows defaults to Proactor
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 import contextlib
 import json
 import os
@@ -61,6 +57,10 @@ _MODEL_SAMPLING: Dict[str, Any] = {}
 # shutdown is treated as expected — no ERROR log, no "failed" latch. See run_backend_supervisor.
 _SHUTTING_DOWN = threading.Event()
 BACKEND_DEATH_EXIT_GRACE_S = 10.0
+# zmq.asyncio needs add_reader. Windows Proactor does not implement it; uvicorn's
+# "auto" loop is a Proactor there, so name the selector loop as a loop_factory
+# import string (uvicorn >= 0.36) instead of mutating the process-wide policy.
+UVICORN_LOOP = "asyncio:SelectorEventLoop" if os.name == "nt" else "auto"
 
 
 def get_global_state() -> FrontendManager:
@@ -899,7 +899,7 @@ def _serve_and_run_shell(host: str, port: int) -> None:
     netloc = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
     origin = resolve_server_url(f"http://{netloc}").origin
 
-    server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, access_log=False))
+    server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, access_log=False, loop=UVICORN_LOOP))
     thread = threading.Thread(target=server.run, name="freetoken-uvicorn", daemon=True)
     thread.start()
     _install_shell_stop_handlers()
@@ -1038,4 +1038,4 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
         _serve_and_run_shell(host, port)
         return
     # uvicorn stays on the main thread (signal handling unchanged); ^C reaches the worker group.
-    uvicorn.run(app, host=host, port=port)
+    uvicorn.run(app, host=host, port=port, loop=UVICORN_LOOP)
