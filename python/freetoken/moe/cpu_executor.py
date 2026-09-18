@@ -88,14 +88,74 @@ def compiled_extension_supports(activation: str) -> bool:
     return _ACT_IDS[activation] <= getattr(_cpu_moe, "max_generic_act_id", lambda: 2)()
 
 
+def _windows_physical_core_cpus() -> list[int]:
+    """One logical CPU per physical core on Windows.
+
+    ``GetLogicalProcessorInformationEx(RelationProcessorCore)`` returns one record
+    per physical core, each carrying a group affinity mask over that core's SMT
+    siblings; the lowest set bit is the core's representative CPU. Processor
+    groups are 64 CPUs wide, which is how the ids flatten into the same numbering
+    the Linux branch uses. The whole machine is reported: Windows affinity is
+    per-group and ``_cpu_moe`` does not pin threads there anyway
+    (``CPU_MOE_HAS_AFFINITY`` is Linux-only).
+    """
+    import ctypes
+
+    class GroupAffinity(ctypes.Structure):
+        _fields_ = [
+            ("Mask", ctypes.c_size_t),
+            ("Group", ctypes.c_uint16),
+            ("Reserved", ctypes.c_uint16 * 3),
+        ]
+
+    class ProcessorRelationship(ctypes.Structure):
+        _fields_ = [
+            ("Flags", ctypes.c_uint8),
+            ("EfficiencyClass", ctypes.c_uint8),
+            ("Reserved", ctypes.c_uint8 * 20),
+            ("GroupCount", ctypes.c_uint16),
+            ("GroupMask", GroupAffinity * 1),
+        ]
+
+    class ProcessorInfoEx(ctypes.Structure):
+        _fields_ = [
+            ("Relationship", ctypes.c_uint32),
+            ("Size", ctypes.c_uint32),
+            ("Processor", ProcessorRelationship),
+        ]
+
+    relation_processor_core = 0
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    size = ctypes.c_uint32(0)
+    kernel32.GetLogicalProcessorInformationEx(relation_processor_core, None, ctypes.byref(size))
+    buffer = (ctypes.c_char * size.value)()
+    if not kernel32.GetLogicalProcessorInformationEx(
+        relation_processor_core, buffer, ctypes.byref(size)
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+    cpus: list[int] = []
+    offset = 0
+    while offset < size.value:
+        record = ProcessorInfoEx.from_buffer(buffer, offset)
+        affinity = record.Processor.GroupMask[0]
+        if affinity.Mask:
+            lowest = (affinity.Mask & -affinity.Mask).bit_length() - 1
+            cpus.append(affinity.Group * 64 + lowest)
+        offset += record.Size
+    return sorted(cpus)
+
+
 def physical_core_cpus() -> list[int]:
     """One logical CPU per physical core, restricted to this process's affinity.
 
     MoE decode is memory-bandwidth-bound, so SMT siblings only contend for the
     same core's load ports without adding bandwidth. Picking one logical CPU per
     physical core (and pinning to it) gives the best, most stable bandwidth.
-    Falls back to the full affinity set when sysfs topology is unavailable.
+    Falls back to the full affinity set when the topology is unavailable.
     """
+    if os.name == "nt":
+        return _windows_physical_core_cpus()
     try:
         allowed = sorted(os.sched_getaffinity(0))
     except AttributeError:
