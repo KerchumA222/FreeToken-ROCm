@@ -427,7 +427,13 @@ class Engine:
             # Prefill runs on the first comma part; warm its autotune cache.
             self._warmup_prefill()
 
-    def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
+    def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup | None:
+        # TheRock's ROCm Windows wheels are built USE_DISTRIBUTED=0, so
+        # torch.distributed is a stub. A single rank has nothing to communicate,
+        # so run without a process group; callers guard on None.
+        if config.tp_info.size == 1 and not torch.distributed.is_available():
+            logger.info_rank0("torch.distributed unavailable; running single-rank without a process group")
+            return None
         if config.tp_info.size == 1 or config.use_pynccl:
             torch.distributed.init_process_group(
                 backend="gloo",
@@ -664,9 +670,10 @@ class Engine:
         torch.cuda.reset_peak_memory_stats(self.device)
         free_memory = get_free_memory(self.device)
         free_mem_tensor = torch.tensor([free_memory, -free_memory], device="cpu", dtype=torch.int64)
-        torch.distributed.all_reduce(
-            free_mem_tensor, op=torch.distributed.ReduceOp.MIN, group=self.tp_cpu_group
-        )
+        if self.tp_cpu_group is not None:
+            torch.distributed.all_reduce(
+                free_mem_tensor, op=torch.distributed.ReduceOp.MIN, group=self.tp_cpu_group
+            )
         min_free_memory = int(free_mem_tensor[0].item())
         max_free_memory = -int(free_mem_tensor[1].item())
         if max_free_memory - min_free_memory > 2 * 1024 * 1024 * 1024:
@@ -960,7 +967,8 @@ class Engine:
 
     def shutdown(self) -> None:
         self.graph_runner.destroy_cuda_graphs()
-        torch.distributed.destroy_process_group()
+        if self.tp_cpu_group is not None:
+            torch.distributed.destroy_process_group()
         destroy_distributed()
 
 

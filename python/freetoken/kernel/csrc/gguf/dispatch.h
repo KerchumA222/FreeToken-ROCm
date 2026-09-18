@@ -11,12 +11,23 @@
 #endif
 
 // Warp-shuffle wrappers the donor pulls from sgl-kernel's utils.h (CUDA variants).
+//
+// HIP's __shfl_xor_sync static_asserts sizeof(mask) == 8 -- its lane masks are
+// 64-bit because CDNA is wave64 -- while the donor passes CUDA's 32-bit
+// uint32_t(-1). Widen the mask on ROCm. Every call site passes all-ones, so the
+// extra bits are inert on a wave32 part like gfx1151.
+#ifdef __HIP_PLATFORM_AMD__
+#define SGLANG_SHFL_MASK_T unsigned long long
+#else
+#define SGLANG_SHFL_MASK_T unsigned int
+#endif
 #ifndef SGLANG_SHFL_XOR_SYNC
-#define SGLANG_SHFL_XOR_SYNC(mask, var, lane_mask) __shfl_xor_sync((mask), (var), (lane_mask))
+#define SGLANG_SHFL_XOR_SYNC(mask, var, lane_mask) \
+  __shfl_xor_sync((SGLANG_SHFL_MASK_T)(mask), (var), (lane_mask))
 #endif
 #ifndef SGLANG_SHFL_XOR_SYNC_WIDTH
 #define SGLANG_SHFL_XOR_SYNC_WIDTH(mask, var, lane_mask, width) \
-  __shfl_xor_sync((mask), (var), (lane_mask), (width))
+  __shfl_xor_sync((SGLANG_SHFL_MASK_T)(mask), (var), (lane_mask), (width))
 #endif
 
 #define DISPATCH_CASE_FLOAT_TYPES(...)                 \

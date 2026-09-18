@@ -15,6 +15,15 @@
 // stored bf16 to match the GPU decode path. ISA is chosen once at construction
 // (AVX-512-BF16 dpbf16 -> AVX-512F widening -> AVX2+FMA -> scalar).
 
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN 1
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX 1
+#endif
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
@@ -29,8 +38,18 @@
 #include <thread>
 #include <vector>
 
+#if defined(__HIP_PLATFORM_AMD__) || defined(USE_ROCM)
+#include <freetoken/hip_compat.cuh>
+#else
 #include <cuda_runtime_api.h>
+#endif
 #include <torch/extension.h>
+
+#if defined(_WIN32)
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
 
 #if defined(__linux__)
 #include <pthread.h>
@@ -568,13 +587,11 @@ float dot_nvfp4_i8_avx512vnni(const uint8_t* packed, const uint8_t* scale, float
 // probed functionally at startup (memops_probe); anything unsupported (Windows WDDM,
 // vGPU, old drivers) falls back to the cudaLaunchHostFunc path.
 #if defined(_WIN32)
-#include <windows.h>
 static void* cumemop_dlopen() { return (void*)::LoadLibraryA("nvcuda.dll"); }
 static void* cumemop_dlsym(void* h, const char* n) {
   return (void*)::GetProcAddress((HMODULE)h, n);
 }
 #else
-#include <dlfcn.h>
 static void* cumemop_dlopen() {
   void* h = dlopen("libcuda.so.1", RTLD_LAZY | RTLD_LOCAL);
   if (h == nullptr) h = dlopen("libcuda.so", RTLD_LAZY | RTLD_LOCAL);

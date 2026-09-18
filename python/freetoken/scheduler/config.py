@@ -3,18 +3,7 @@
 from dataclasses import dataclass, field
 
 from freetoken.engine import EngineConfig
-
-def _zmq_addr(name: str) -> str:
-    """patched: ipc:// is unsupported on Windows; use localhost TCP there."""
-    import hashlib
-    import os
-    import sys
-
-    if sys.platform == "win32":
-        # patched: name-only hash - all workers must derive the SAME port
-        port = 29876 + int(hashlib.sha1(name.encode()).hexdigest()[:6], 16) % 20000
-        return f"tcp://127.0.0.1:{port}"
-    return f"ipc:///tmp/{name}"
+from freetoken.utils.mp import zmq_addr
 
 
 def _get_pid_suffix() -> str:
@@ -36,15 +25,15 @@ class SchedulerConfig(EngineConfig):
 
     @property
     def zmq_backend_addr(self) -> str:
-        return _zmq_addr("freetoken_0")
+        return zmq_addr(0, self._unique_suffix)
 
     @property
     def zmq_detokenizer_addr(self) -> str:
-        return _zmq_addr("freetoken_1")
+        return zmq_addr(1, self._unique_suffix)
 
     @property
     def zmq_scheduler_broadcast_addr(self) -> str:
-        return _zmq_addr("freetoken_2")
+        return zmq_addr(2, self._unique_suffix)
 
     @property
     def max_forward_len(self) -> int:

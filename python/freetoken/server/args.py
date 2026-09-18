@@ -9,18 +9,7 @@ import torch
 from freetoken.distributed import DistributedInfo
 from freetoken.scheduler import SchedulerConfig
 from freetoken.utils import init_logger
-
-def _zmq_addr(name: str) -> str:
-    """patched: ipc:// is unsupported on Windows; use localhost TCP there."""
-    import hashlib
-    import os
-    import sys
-
-    if sys.platform == "win32":
-        # patched: name-only hash - all workers must derive the SAME port
-        port = 29876 + int(hashlib.sha1(name.encode()).hexdigest()[:6], 16) % 20000
-        return f"tcp://127.0.0.1:{port}"
-    return f"ipc:///tmp/{name}"
+from freetoken.utils.mp import zmq_addr
 
 
 @dataclass(frozen=True)
@@ -58,13 +47,13 @@ class ServerArgs(SchedulerConfig):
 
     @property
     def zmq_frontend_addr(self) -> str:
-        return _zmq_addr("freetoken_3")
+        return zmq_addr(3, self._unique_suffix)
 
     @property
     def zmq_tokenizer_addr(self) -> str:
         if self.share_tokenizer:
             return self.zmq_detokenizer_addr
-        result = _zmq_addr("freetoken_4")
+        result = zmq_addr(4, self._unique_suffix)
         assert result != self.zmq_detokenizer_addr
         return result
 
