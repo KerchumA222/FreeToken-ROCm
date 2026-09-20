@@ -315,6 +315,10 @@ __all__ = [
 ]
 
 
+# Cap on the fp32 transient of one gguf-py fallback dequant slab.
+_DEQUANT_SLAB_BYTES = 256 << 20
+
+
 def dequant_any(t, out_dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
     """Dequantize any GgufTensor to a flat bf16 tensor in torch storage order.
 
@@ -328,14 +332,25 @@ def dequant_any(t, out_dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
         return dequantize(t.packed().reshape(-1), gt, out_dtype).reshape(t.shape)
     except (KeyError, NotImplementedError):
         import gguf
-        import numpy as np
 
+        # gguf-py's reference dequantizer materializes the WHOLE tensor as fp32 --
+        # for a 248k-row vocab head that is a 1.9 GiB spike to produce a 0.9 GiB bf16
+        # result, at the point in the load where host RAM is scarcest. Quant blocks
+        # never span a row, so dequantize row-slabs into the output instead and keep
+        # the fp32 transient bounded.
         qt = gguf.GGMLQuantizationType(gt)
-        vals = gguf.dequantize(t.packed().numpy(), qt)
+        packed = t.packed()  # [rows, row_bytes]
+        rows = packed.shape[0]
+        n_fast = int(t.shape[-1])
         numel = 1
         for d in t.shape:
             numel *= d
-        assert vals.size == numel, f"{vals.size} != {numel} for {t.name}"
-        return torch.from_numpy(vals.reshape(t.shape)).to(out_dtype)
+        assert rows * n_fast == numel, f"{rows} x {n_fast} != {numel} for {t.name}"
+        out = torch.empty((rows, n_fast), dtype=out_dtype)
+        slab = max(1, _DEQUANT_SLAB_BYTES // max(1, n_fast * 4))
+        for i in range(0, rows, slab):
+            chunk = packed[i : i + slab].numpy()
+            out[i : i + slab] = torch.from_numpy(gguf.dequantize(chunk, qt)).to(out_dtype)
+        return out.reshape(t.shape)
 
 

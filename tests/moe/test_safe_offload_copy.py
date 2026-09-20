@@ -87,6 +87,53 @@ class SafeOffloadCopyTests(unittest.TestCase):
         safe_copy.assert_not_called()
         self.assertEqual(fast_copy.call_count, len(cache.banks))
 
+    def test_hip_runtime_mapping_keeps_the_fast_path_without_the_extension(self):
+        """The ROCm/Windows port never builds _pinned_tensor, but the mapping still works.
+
+        Requiring the extension pinned this port to the staged safe copy, whose
+        ``.item()`` is illegal under CUDA-graph capture -- so graphs could not be
+        captured and decode stayed eager. hipHostGetDevicePointer is the same evidence
+        ``OffloadMoeCache`` already builds its fused source pointers from.
+        """
+        cache = _cache()
+
+        def _translate(dev_ref, host_ptr, flags):
+            dev_ref._obj.value = 0x205C80000
+            return 0
+
+        hip = mock.Mock()
+        hip.hipHostGetDevicePointer.side_effect = _translate
+        with (
+            mock.patch.dict(os.environ, {SAFE_OFFLOAD_COPY_ENV: ""}),
+            mock.patch("freetoken.moe.offload_cache.sys.platform", "win32"),
+            mock.patch.object(torch.version, "hip", "test-rocm"),
+            mock.patch("freetoken.kernel.pinned._load_pinned_extension", return_value=None),
+            mock.patch("freetoken.kernel.pinned._hip_runtime", return_value=hip),
+            mock.patch("freetoken.kernel.pinned._host_ptr_identity", return_value=False),
+            mock.patch.object(cache, "_copy_missing_safe") as safe_copy,
+            mock.patch("freetoken.kernel.fast_index_copy_jit") as fast_copy,
+        ):
+            self.assertFalse(cache.should_use_safe_offload_copy(0))
+            cache.copy_missing()
+
+        safe_copy.assert_not_called()
+        self.assertEqual(fast_copy.call_count, len(cache.banks))
+
+    def test_hip_runtime_that_cannot_translate_still_selects_safe_copy(self):
+        """Negative control for the test above: same setup, translation refused."""
+        cache = _cache()
+        hip = mock.Mock()
+        hip.hipHostGetDevicePointer.return_value = 1  # hipErrorInvalidValue
+        with (
+            mock.patch.dict(os.environ, {SAFE_OFFLOAD_COPY_ENV: ""}),
+            mock.patch("freetoken.moe.offload_cache.sys.platform", "win32"),
+            mock.patch.object(torch.version, "hip", "test-rocm"),
+            mock.patch("freetoken.kernel.pinned._load_pinned_extension", return_value=None),
+            mock.patch("freetoken.kernel.pinned._hip_runtime", return_value=hip),
+            mock.patch("freetoken.kernel.pinned._host_ptr_identity", return_value=False),
+        ):
+            self.assertTrue(cache.should_use_safe_offload_copy(0))
+
     def test_force_override_selects_safe_copy_for_mapped_windows_rocm(self):
         cache = _cache()
         with (

@@ -137,7 +137,8 @@ class DecodeTraceTests(unittest.TestCase):
 
         self.assertEqual(calls, [])
 
-    def test_host_mapping_preflight_extension_missing_is_unsafe(self):
+    def test_host_mapping_preflight_no_mapping_mechanism_is_unsafe(self):
+        """No extension and no HIP runtime: nothing can translate a host VA."""
         cache = _host_cache(torch.empty(4, dtype=torch.uint8))
         output = io.StringIO()
         with (
@@ -146,6 +147,7 @@ class DecodeTraceTests(unittest.TestCase):
             mock.patch.object(decode_trace.sys, "platform", "win32"),
             mock.patch.object(torch.version, "hip", "test-rocm"),
             mock.patch("freetoken.kernel.pinned._load_pinned_extension", return_value=None),
+            mock.patch("freetoken.kernel.pinned._hip_runtime", return_value=None),
             redirect_stderr(output),
         ):
             self.assertTrue(decode_trace.begin_first_decode(_batch("decode")))
@@ -158,7 +160,83 @@ class DecodeTraceTests(unittest.TestCase):
         self.assertIn("pinned_extension_loaded=false", marker)
         self.assertIn("device_ptr=unavailable", marker)
         self.assertIn("safe_for_gpu_deref=false", marker)
+        self.assertIn("mapping_source=pinned_extension_missing", marker)
         self.assertIn("reason=pinned_extension_missing", marker)
+
+    def test_host_mapping_preflight_unregistered_banks_are_unsafe_without_the_extension(self):
+        """The HIP runtime can translate, but these banks were never registered.
+
+        This is the case the old probe answered correctly for the wrong reason: it
+        reported "extension missing" and stopped, so a genuinely-mapped bank on the
+        ROCm/Windows port (where the extension is never built) was called unsafe too.
+        """
+        cache = _host_cache(torch.empty(4, dtype=torch.uint8))
+        hip = mock.Mock()
+        hip.hipHostGetDevicePointer.return_value = 1  # hipErrorInvalidValue
+        output = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, {decode_trace.TRACE_ENV: "1"}),
+            mock.patch.object(decode_trace, "_stream_fields", return_value={"stream": "test"}),
+            mock.patch.object(decode_trace.sys, "platform", "win32"),
+            mock.patch.object(torch.version, "hip", "test-rocm"),
+            mock.patch("freetoken.kernel.pinned._load_pinned_extension", return_value=None),
+            mock.patch("freetoken.kernel.pinned._hip_runtime", return_value=hip),
+            mock.patch("freetoken.kernel.pinned._host_ptr_identity", return_value=False),
+            redirect_stderr(output),
+        ):
+            self.assertTrue(decode_trace.begin_first_decode(_batch("decode")))
+            with self.assertRaisesRegex(RuntimeError, "host_device_mapping_failed"):
+                decode_trace.preflight_windows_rocm_host_mapping(cache, 0)
+
+        marker = next(
+            line for line in output.getvalue().splitlines() if "stage=host_mapping_preflight" in line
+        )
+        self.assertIn("pinned_extension_loaded=false", marker)
+        self.assertIn("mapped_bank_count=0", marker)
+        self.assertIn("safe_for_gpu_deref=false", marker)
+        self.assertIn("mapping_source=hip_runtime", marker)
+
+    def test_host_mapping_preflight_hip_runtime_mapping_is_safe_without_the_extension(self):
+        """A bank the HIP runtime does translate is safe, extension or no extension.
+
+        This is what unblocks CUDA-graph capture on the ROCm/Windows port: an unsafe
+        verdict forces the staged safe-copy path, which calls ``.item()`` and cannot be
+        captured.
+        """
+        source = torch.empty(4, dtype=torch.uint8)
+        cache = _host_cache(source)
+        mapped = 0x205C80000
+
+        def _translate(dev_ref, host_ptr, flags):
+            dev_ref._obj.value = mapped
+            return 0
+
+        hip = mock.Mock()
+        hip.hipHostGetDevicePointer.side_effect = _translate
+        output = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, {decode_trace.TRACE_ENV: "1"}),
+            mock.patch.object(decode_trace, "_stream_fields", return_value={"stream": "test"}),
+            mock.patch.object(decode_trace.sys, "platform", "win32"),
+            mock.patch.object(torch.version, "hip", "test-rocm"),
+            mock.patch("freetoken.kernel.pinned._load_pinned_extension", return_value=None),
+            mock.patch("freetoken.kernel.pinned._hip_runtime", return_value=hip),
+            mock.patch("freetoken.kernel.pinned._host_ptr_identity", return_value=False),
+            redirect_stderr(output),
+        ):
+            self.assertTrue(decode_trace.begin_first_decode(_batch("decode")))
+            self.assertTrue(decode_trace.preflight_windows_rocm_host_mapping(cache, 0))
+
+        marker = next(
+            line for line in output.getvalue().splitlines() if "stage=host_mapping_preflight" in line
+        )
+        self.assertIn("pinned_extension_loaded=false", marker)
+        self.assertIn("mapped_bank_count=1", marker)
+        self.assertIn(f"host_ptr={hex(source.data_ptr())}", marker)
+        self.assertIn(f"device_ptr={hex(mapped)}", marker)
+        self.assertIn("safe_for_gpu_deref=true", marker)
+        self.assertIn("mapping_source=hip_runtime", marker)
+        self.assertIn("reason=ok", marker)
 
     def test_host_mapping_preflight_unavailable_mapping_is_unsafe(self):
         cache = _host_cache(torch.empty(4, dtype=torch.uint8))

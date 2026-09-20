@@ -21,12 +21,16 @@ import ctypes
 import math
 import mmap
 import os
+import logging
 import queue
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 _BLK = 4096  # O_DIRECT alignment (page size)
 
@@ -51,6 +55,67 @@ _DEFAULT_CHUNK = 8 << 20
 
 # Hold the mmaps for the process lifetime; the offload cache reads from these banks forever.
 _LIVE_BUFFERS: list[mmap.mmap] = []
+
+
+_PINNED_BYTES = 0
+_PINNED_COUNT = 0
+_PINNED_LOCK = threading.Lock()
+
+
+def _note_pinned(nbytes: int) -> None:
+    global _PINNED_BYTES, _PINNED_COUNT
+    with _PINNED_LOCK:
+        _PINNED_BYTES += nbytes
+        _PINNED_COUNT += 1
+
+
+def host_mem_summary() -> str:
+    """One-line host memory state, for naming which budget a pin failure exhausted.
+
+    Windows separates *physical* from *commit* (RAM + pagefile); a pin can fail with
+    tens of GiB of RAM still free because the commit limit is what ran out. POSIX
+    reports MemAvailable and Committed_AS from /proc/meminfo.
+    """
+    G = float(2**30)
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+
+        class _MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", wintypes.DWORD), ("dwMemoryLoad", wintypes.DWORD),
+                ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.GlobalMemoryStatusEx.argtypes = [ctypes.POINTER(_MEMORYSTATUSEX)]
+        k32.GlobalMemoryStatusEx.restype = wintypes.BOOL
+        ms = _MEMORYSTATUSEX()
+        ms.dwLength = ctypes.sizeof(ms)
+        if not k32.GlobalMemoryStatusEx(ctypes.byref(ms)):
+            return "host mem: unavailable"
+        return (
+            f"host mem: availPhys={ms.ullAvailPhys / G:.2f} GiB of "
+            f"{ms.ullTotalPhys / G:.2f}, availCommit={ms.ullAvailPageFile / G:.2f} GiB "
+            f"of {ms.ullTotalPageFile / G:.2f} (raise the pagefile if commit is what "
+            f"ran out), load={ms.dwMemoryLoad}%"
+        )
+    try:
+        info = {}
+        with open("/proc/meminfo") as f:
+            for line in f:
+                k, _, v = line.partition(":")
+                info[k] = int(v.split()[0]) * 1024
+        return (
+            f"host mem: MemAvailable={info.get('MemAvailable', 0) / G:.2f} GiB of "
+            f"{info.get('MemTotal', 0) / G:.2f}, "
+            f"Committed_AS={info.get('Committed_AS', 0) / G:.2f} GiB"
+        )
+    except OSError:
+        return "host mem: unavailable"
 
 
 class HostBank:
@@ -88,10 +153,25 @@ class HostBank:
         try:
             host_register(self.addr, len(self._buf))
         except RuntimeError as exc:
+            # A bare "register failed" is unfalsifiable: the runtime returns
+            # hipErrorInvalidValue/cudaErrorInvalidValue for a bad argument AND for
+            # "cannot lock these pages", and in practice it is always the latter.
+            # Name the actual budget that ran out so the next reader does not have to
+            # re-derive it -- on Windows the binding limit is usually COMMIT (banks are
+            # pagefile-backed sections and are charged commit even though, once pinned,
+            # they can never be paged out), not free physical RAM.
             raise RuntimeError(
-                f"cudaHostRegister failed for {len(self._buf) / 2**30:.1f} GiB"
+                f"cudaHostRegister failed for {len(self._buf) / 2**30:.1f} GiB after "
+                f"{_PINNED_COUNT} bank(s), {_PINNED_BYTES / 2**30:.1f} GiB already "
+                f"pinned in this process; {host_mem_summary()}"
             ) from exc
         self._pinned = True
+        _note_pinned(len(self._buf))
+        if _PINNED_COUNT % 16 == 0:
+            logger.info(
+                "pinned %d host banks, %.2f GiB; %s",
+                _PINNED_COUNT, _PINNED_BYTES / 2**30, host_mem_summary(),
+            )
 
     def release(self) -> None:
         """Drop the buffer's resident pages (address space stays valid; contents
@@ -121,10 +201,13 @@ def alloc_layer_banks(
     """Allocate per-layer host banks: ``{name: ([num_experts, ...] row shape, dtype)}``
     -> one independently allocated (page-aligned, independently pin/lock-able)
     ``HostBank`` per layer per name."""
-    return {
+    logger.info("allocating %d host bank(s); %s", num_layers * len(specs), host_mem_summary())
+    banks = {
         name: [HostBank(shape, dtype) for _ in range(num_layers)]
         for name, (shape, dtype) in specs.items()
     }
+    logger.info("host banks allocated (lazy); %s", host_mem_summary())
+    return banks
 
 
 def pin_banks(banks: dict[str, HostBank | list[HostBank]]) -> None:

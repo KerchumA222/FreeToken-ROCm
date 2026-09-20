@@ -1,7 +1,10 @@
 """GGUF adapter for Qwen3.5/3.6 hybrid MoE (llama.cpp arch ``qwen35moe``).
 
-Layer kinds follow ``qwen35moe.full_attention_interval`` (layer ``i`` is full
-attention iff ``(i+1) % interval == 0``; the rest are GDN linear-attention).
+Layer kinds come from the header's tensor names -- a block with ``blk.i.ssm_*`` is
+GDN linear-attention, one without is full attention -- falling back to
+``qwen35moe.full_attention_interval`` (full iff ``(i+1) % interval == 0``) when a file
+carries no ssm tensors at all. ``nextn_predict_layers`` trailing blocks are MTP draft
+heads, not model layers, and are dropped: see :func:`_num_model_layers`.
 Non-expert tensors dequantize to bf16 under FreeToken's HF names; the routed
 experts stay in their native GGUF quant blocks and stream through the ``q4_0``
 expert-bank path (generalized: any MMVQ-covered ggml type; a bank whose type is
@@ -16,11 +19,14 @@ sampled tensors):
 - Linear layers store the GDN in_proj split as ``attn_qkv`` (conv_dim),
   ``attn_gate`` (value_dim), ``ssm_beta``/``ssm_alpha`` (num_v_heads each);
   FreeToken's fused ``in_proj`` concat order is qkv | z | b | a.
+- Every value-head-indexed axis is stored in llama.cpp's **tiled** order, not HF's
+  grouped one, and has to be un-tiled at load -- see :func:`_untile_v_heads`.
 - Gemma-style ``+1`` is already baked into attn/post/output norms and q/k norms
   at conversion time (values center on 1.0) -> load as-is; ``ssm_norm`` is a
   plain gated RMS norm weight (no +1).
 - ``ssm_a`` stores ``-exp(A_log)`` (all values negative) -> recover
-  ``A_log = log(-a)``; ``ssm_dt.bias`` is the fp32 ``dt_bias`` verbatim.
+  ``A_log = log(-a)``; ``ssm_dt`` (spelled ``ssm_dt.bias`` in some conversions) is
+  the fp32 ``dt_bias`` verbatim.
 - GDN geometry from the ssm KVs: num_key_heads = ``ssm.group_count``,
   num_value_heads = ``ssm.time_step_rank``, key_head_dim = ``ssm.state_size``,
   value_head_dim = ``ssm.inner_size // ssm.time_step_rank``.
@@ -52,6 +58,7 @@ from freetoken.models.gguf.dequant import (
 )
 from freetoken.models.gguf.reader import (
     GgufTensor,
+    PageReleaser,
     iter_gguf_tensors,
     load_gguf_metadata,
 )
@@ -82,13 +89,91 @@ def _is_full_attention(layer: int, interval: int) -> bool:
     return (layer + 1) % interval == 0
 
 
-def _expert_types(model_path: str) -> tuple[dict[str, dict[int, int]], dict[str, int]]:
+def _num_model_layers(md: dict, prefix: str) -> int:
+    """``block_count`` minus the trailing MTP draft blocks, which are not model layers.
+
+    ``<arch>.nextn_predict_layers`` blocks at the end of the stack are multi-token-
+    prediction draft heads. llama.cpp counts them in ``block_count`` -- Ornith-1.5-35B-A3B
+    reports 41 blocks for a 40-layer model -- and gives them ordinary ``blk.40.attn_*`` /
+    ``blk.40.ffn_*_exps`` names plus a handful of ``blk.40.nextn.*`` tensors. FreeToken has
+    no speculative decoder anywhere in ``engine/`` or ``scheduler/``, so an MTP block can
+    only be dropped, the way the safetensors loader drops ``mtp.`` tensors. Counting it as
+    a 41st layer instead would append a draft head to the main stack.
+    """
+    block_count = int(md[f"{prefix}.block_count"])
+    return block_count - int(md.get(f"{prefix}.nextn_predict_layers", 0) or 0)
+
+
+def _layer_types(model_path: str, num_layers: int, interval: int) -> list[str]:
+    """Per-layer kind from the header's tensor names, falling back to ``interval``.
+
+    ``full_attention_interval`` describes a repeating *pattern*, and it types any stack
+    that is not purely that pattern wrong -- silently, because an unexpected tensor used
+    to be dropped rather than raised. The names say it outright and cost one header read:
+    a GDN layer has ``blk.i.ssm_*``, a full-attention layer does not. A file with no ssm
+    tensors at all (metadata-only shims, synthetic fixtures) keeps the old behaviour.
+    """
+    from freetoken.models.gguf.reader import gguf_tensor_names
+
+    by_interval = [
+        "full_attention" if _is_full_attention(i, interval) else "linear_attention"
+        for i in range(num_layers)
+    ]
+    ssm = {
+        int(n.split(".")[1])
+        for n in gguf_tensor_names(model_path)
+        if n.startswith("blk.") and ".ssm_" in n
+    }
+    if not ssm:
+        return by_interval
+    types = ["linear_attention" if i in ssm else "full_attention" for i in range(num_layers)]
+    if types != by_interval:
+        logger.info(
+            "qwen35moe GGUF: layer kinds taken from tensor names, not the "
+            "full_attention_interval=%d pattern (they disagree on layers %s)",
+            interval,
+            [i for i in range(num_layers) if types[i] != by_interval[i]],
+        )
+    return types
+
+
+def _head_count(value, what: str) -> int:
+    """Collapse a possibly per-layer head count to the model-wide one.
+
+    llama.cpp writes ``attention.head_count[_kv]`` as an array with one entry per
+    block for hybrid models, and stores 0 on the GDN linear-attention layers
+    (which have no attention heads at all). Real Qwen3.5/3.6 files therefore hand
+    us e.g. ``[0, 0, 0, 2, 0, 0, 0, 2, ...]`` where the synthetic fixtures had a
+    scalar. Take the value the full-attention layers agree on; a scalar passes
+    through unchanged.
+    """
+    if not isinstance(value, (list, tuple)):
+        return int(value)
+    counts = {int(v) for v in value if int(v)}
+    if len(counts) != 1:
+        raise ValueError(
+            f"qwen35moe GGUF: {what} = {list(value)} - FreeToken needs a single "
+            f"head count shared by every full-attention layer, got {sorted(counts)}"
+        )
+    return counts.pop()
+
+
+def _expert_types(
+    model_path: str, num_layers: int
+) -> tuple[dict[str, dict[int, int]], dict[str, int]]:
     """Per-layer ggml types of the routed expert tensors, and the resolved bank
-    type per bank (uniform type, else Q8_0 promotion)."""
+    type per bank (uniform type, else Q8_0 promotion).
+
+    ``num_layers`` excludes MTP draft blocks -- they carry routed experts of their own,
+    and letting one into the uniformity vote could promote (and so re-quantize) the whole
+    bank for a block that is never loaded.
+    """
     per: dict[str, dict[int, int]] = {s: {} for s in _EXPERT_SUFFIXES}
     for t in iter_gguf_tensors(model_path):
         if t.name.startswith("blk.") and t.name.split(".", 2)[2] in per:
-            per[t.name.split(".", 2)[2]][int(t.name.split(".")[1])] = t.ggml_type
+            layer = int(t.name.split(".")[1])
+            if layer < num_layers:
+                per[t.name.split(".", 2)[2]][layer] = t.ggml_type
 
     # Mixed-type banks are requantized to one type at load; gguf-py can only
     # quantize the classic types, so Q5_1 (6 bpw) is the default promotion target
@@ -126,12 +211,9 @@ def parse_gguf_config(shim: "GgufConfigShim") -> "ModelConfig":
     def g(key: str, default=None):
         return m.get(f"{prefix}.{key}", default)
 
-    num_layers = int(g("block_count"))
+    num_layers = _num_model_layers(m, prefix)
     interval = int(g("full_attention_interval", 4))
-    layer_types = [
-        "full_attention" if _is_full_attention(i, interval) else "linear_attention"
-        for i in range(num_layers)
-    ]
+    layer_types = _layer_types(shim.model_path, num_layers, interval)
     head_dim = int(g("attention.key_length"))
     rotary_dim = int(g("rope.dimension_count", head_dim))
     num_v_heads = int(g("ssm.time_step_rank"))
@@ -139,8 +221,8 @@ def parse_gguf_config(shim: "GgufConfigShim") -> "ModelConfig":
     # no text_config attr: parse_config's getattr then falls back to the namespace itself
     hf_like = SimpleNamespace(
         num_hidden_layers=num_layers,
-        num_attention_heads=int(g("attention.head_count")),
-        num_key_value_heads=int(g("attention.head_count_kv")),
+        num_attention_heads=_head_count(g("attention.head_count"), "attention.head_count"),
+        num_key_value_heads=_head_count(g("attention.head_count_kv"), "attention.head_count_kv"),
         head_dim=head_dim,
         hidden_size=int(g("embedding_length")),
         intermediate_size=int(g("feed_forward_length", 0)),
@@ -173,10 +255,43 @@ def parse_gguf_config(shim: "GgufConfigShim") -> "ModelConfig":
     # Routed experts ride the (generalized) q4_0 GGUF bank path.
     object.__setattr__(config, "expert_quant", "q4_0")
     object.__setattr__(config, "moe_weight_format", "q4_0")
-    per_layer, bank_types = _expert_types(shim.model_path)
+    per_layer, bank_types = _expert_types(shim.model_path, num_layers)
     object.__setattr__(config, "gguf_expert_bank_types", bank_types)
     object.__setattr__(config, "gguf_expert_layer_types", per_layer)
     return config
+
+
+def _untile_v_heads(
+    t: torch.Tensor, dim: int, num_k_heads: int, num_v_per_k: int, head_dim: int
+) -> torch.Tensor:
+    """GGUF *tiled* value-head order -> HF *grouped* order along ``dim``.
+
+    GDN has fewer key heads than value heads (16 vs 32 here), so every value-head-indexed
+    axis needs a convention for which key head a value head belongs to. HF groups them --
+    ``[G0_v0..v(r-1), G1_v0..v(r-1), ...]``, value head ``h`` under key head ``h // r`` --
+    but llama.cpp's qwen35/qwen35moe converter (``_LinearAttentionVReorderBase``) rewrites
+    them tiled, ``[G0_v0, G1_v0, ..., G0_v1, G1_v1, ...]``, so a plain ggml broadcast can
+    stand in for an interleaved repeat.
+
+    FreeToken's fla kernels use the HF convention on both paths -- chunk prefill
+    (``fla/chunk_o.py``: ``i_h // (H // Hg)``) and fused decode
+    (``fla/fused_sigmoid_gating_recurrent.py``: ``i_hv // (HV // H)``) -- so leaving the
+    GGUF order in place pairs *every* value head with the wrong key head, on 30 of this
+    model's 40 layers. Output stays fluent-shaped and is semantically dead. This is the
+    inverse of the converter's permutation; it applies to every affected tensor (qkv's v
+    rows, z, b, a, A_log, dt_bias, conv1d's v channels, out_proj's columns) or to none.
+    """
+    shape = list(t.shape)
+    if dim < 0:
+        dim += len(shape)
+    assert shape[dim] == num_k_heads * num_v_per_k * head_dim, (
+        f"axis {dim} of {tuple(shape)} is not "
+        f"{num_k_heads} x {num_v_per_k} x {head_dim} value-head rows"
+    )
+    t = t.reshape(*shape[:dim], num_v_per_k, num_k_heads, head_dim, *shape[dim + 1 :])
+    perm = list(range(t.dim()))
+    perm[dim], perm[dim + 1] = perm[dim + 1], perm[dim]
+    return t.permute(*perm).contiguous().reshape(*shape)
 
 
 def _to_bf16(t: GgufTensor) -> torch.Tensor:
@@ -190,8 +305,7 @@ _SUFFIX_MAP = {
     "attn_output.weight": "self_attn.o_proj.weight",
     "attn_q_norm.weight": "self_attn.q_norm.weight",  # +1 baked at conversion
     "attn_k_norm.weight": "self_attn.k_norm.weight",
-    "ssm_norm.weight": "linear_attn.norm.weight",
-    "ssm_out.weight": "linear_attn.out_proj.weight",
+    "ssm_norm.weight": "linear_attn.norm.weight",  # per-head-dim: no value-head order
     "ffn_gate_inp.weight": "mlp.gate.weight",
     "ffn_down_shexp.weight": "mlp.shared_expert.down_proj.weight",
 }
@@ -217,11 +331,38 @@ def iter_gguf_weights(
     assert include_non_moe
     _require_tp1("weights")
 
-    interval = int(load_gguf_metadata(model_path).get(
-        "qwen35moe.full_attention_interval", 4
-    ))
+    md = load_gguf_metadata(model_path)
+    arch = str(md.get("general.architecture", "qwen35moe"))
+    interval = int(md.get(f"{arch}.full_attention_interval", 4))
+    num_layers = _num_model_layers(md, arch)
+    layer_types = _layer_types(model_path, num_layers, interval)
+
+    # GDN value-head order (see _untile_v_heads). llama.cpp's converter always reorders
+    # when num_k_heads != num_v_heads and does not record that it did, so un-tiling is the
+    # default; a file that explicitly says it did not reorder is honoured.
+    num_k = int(md.get(f"{arch}.ssm.group_count", 0))
+    num_v = int(md.get(f"{arch}.ssm.time_step_rank", 0))
+    untile = (
+        num_k > 0
+        and num_v > num_k
+        and num_v % num_k == 0
+        and bool(md.get(f"{arch}.ssm.v_head_reordered", True))
+    )
+    v_per_k = num_v // num_k if untile else 1
+    head_v = int(md[f"{arch}.ssm.inner_size"]) // num_v if untile else 0
+    key_dim = num_k * int(md[f"{arch}.ssm.state_size"]) if untile else 0
+
+    def untile_v(w: torch.Tensor, dim: int = 0, head_dim: int | None = None) -> torch.Tensor:
+        if not untile:
+            return w
+        return _untile_v_heads(w, dim, num_k, v_per_k, head_v if head_dim is None else head_dim)
 
     fuse: dict[tuple[int, str], dict[str, torch.Tensor]] = {}
+    # Anything in the model stack that matches no rule below. Dropping such a tensor in
+    # silence leaves part of a layer at its init values and the model answers fluent
+    # nonsense -- the same failure shape as the value-head bug, and how the extra Ornith
+    # block went unnoticed. Collected, then raised.
+    unhandled: list[str] = []
 
     def feed_fused(
         layer: int, group: str, slots: tuple[str, ...], slot: str, val: torch.Tensor, out_name: str
@@ -242,6 +383,8 @@ def iter_gguf_weights(
             yield "lm_head.weight", _to_bf16(t)
         elif name.startswith("blk."):
             layer = int(name.split(".")[1])
+            if layer >= num_layers:
+                continue  # MTP draft block -- see _num_model_layers
             suffix = name.split(".", 2)[2]
             stem = f"model.layers.{layer}."
             if suffix in _EXPERT_SUFFIXES:
@@ -250,28 +393,49 @@ def iter_gguf_weights(
                 # stored as -exp(A_log); FreeToken keeps A_log (fp32)
                 a = dequant_any(t).to(torch.float32)
                 assert (a < 0).all(), f"{name}: expected -exp(A_log) (negative values)"
-                yield stem + "linear_attn.A_log", torch.log(-a)
+                yield stem + "linear_attn.A_log", untile_v(torch.log(-a), head_dim=1)
                 continue
-            if suffix == "ssm_dt.bias":
-                yield stem + "linear_attn.dt_bias", dequant_any(t).to(torch.float32)
+            # Real Qwen3.5/3.6 conversions name this bias bare `ssm_dt` (the way
+            # `ssm_a` is bare); other files spell it `ssm_dt.bias`. Either way it is
+            # the fp32 dt_bias vector, one entry per value head.
+            if suffix in ("ssm_dt.bias", "ssm_dt"):
+                yield stem + "linear_attn.dt_bias", untile_v(
+                    dequant_any(t).to(torch.float32), head_dim=1
+                )
                 continue
             if suffix == "ssm_conv1d.weight":
-                # ggml [K, conv_dim] -> torch (conv_dim, K) -> module [conv_dim, 1, K]
-                yield stem + "linear_attn.conv1d.weight", _to_bf16(t).unsqueeze(1).contiguous()
+                # ggml [K, conv_dim] -> torch (conv_dim, K) -> module [conv_dim, 1, K].
+                # Channels run q | k | v; only the v block carries value-head order.
+                w = _to_bf16(t)
+                if untile:
+                    w = torch.cat([w[: 2 * key_dim], untile_v(w[2 * key_dim :])], dim=0)
+                yield stem + "linear_attn.conv1d.weight", w.unsqueeze(1).contiguous()
+                continue
+            if suffix == "ssm_out.weight":
+                # [hidden, value_dim]: the INPUT columns are value-head ordered.
+                yield stem + "linear_attn.out_proj.weight", untile_v(_to_bf16(t), dim=1)
                 continue
             if suffix == "ffn_gate_inp_shexp.weight":
                 yield stem + "mlp.shared_expert_gate.weight", _to_bf16(t).reshape(1, -1)
                 continue
             proj = suffix.rsplit(".weight", 1)[0]
-            if proj in _QKV_SLOTS and _is_full_attention(layer, interval):
+            if proj in _QKV_SLOTS and layer_types[layer] == "full_attention":
                 yield from feed_fused(
                     layer, "qkv", _QKV_SLOTS, proj, _to_bf16(t),
                     stem + "self_attn.qkv_proj.weight",
                 )
                 continue
-            if proj in _IN_PROJ_SLOTS and not _is_full_attention(layer, interval):
+            if proj in _IN_PROJ_SLOTS and layer_types[layer] == "linear_attention":
+                w = _to_bf16(t)
+                if untile:
+                    if proj == "attn_qkv":  # rows q | k | v; only v is value-head ordered
+                        w = torch.cat([w[: 2 * key_dim], untile_v(w[2 * key_dim :])], dim=0)
+                    elif proj == "attn_gate":  # z, one row block per value head
+                        w = untile_v(w)
+                    else:  # ssm_beta / ssm_alpha: one scalar row per value head
+                        w = untile_v(w, head_dim=1)
                 yield from feed_fused(
-                    layer, "in_proj", _IN_PROJ_SLOTS, proj, _to_bf16(t),
+                    layer, "in_proj", _IN_PROJ_SLOTS, proj, w,
                     stem + "linear_attn.in_proj.weight",
                 )
                 continue
@@ -282,11 +446,18 @@ def iter_gguf_weights(
                 )
                 continue
             rel = _SUFFIX_MAP.get(suffix)
-            if rel is not None:
-                yield stem + rel, _to_bf16(t)
+            if rel is None:
+                unhandled.append(name)
+                continue
+            yield stem + rel, _to_bf16(t)
 
     leftovers = sorted(fuse)
     assert not leftovers, f"incomplete fused groups: {leftovers}"
+    assert not unhandled, (
+        f"qwen35moe GGUF: {len(unhandled)} tensor(s) in the {num_layers}-layer model "
+        f"stack match no rule and would be dropped, leaving those layers partly "
+        f"uninitialized: {unhandled[:8]}"
+    )
 
 
 # --------------------------------------------------------------------------------------
@@ -350,6 +521,10 @@ def load_q4_0_expert_sources(
     def _load(sink) -> None:
         # 3 writes/layer: gate half, up half, down
         tracker = LayerCompletionTracker(3, hb, sink) if sink is not None else None
+        # Every expert byte is copied out of the mapping, so the mapped source pages
+        # would otherwise sit resident alongside the banks -- the whole checkpoint,
+        # twice, in host RAM. Give each consumed region back as we go.
+        releaser = PageReleaser(model_path)
         for t in iter_gguf_tensors(model_path):
             if not t.name.startswith("blk."):
                 continue
@@ -357,6 +532,8 @@ def load_q4_0_expert_sources(
             if suffix not in _EXPERT_SUFFIXES:
                 continue
             layer = int(t.name.split(".")[1])
+            if layer >= L:
+                continue  # MTP draft block -- see _num_model_layers
             if suffix == "ffn_gate_exps.weight":
                 banks["gate_up"][layer][:, :I].copy_(
                     _packed_as(t, types["gate_up"]).reshape(E, I, gu_bytes)
@@ -370,6 +547,7 @@ def load_q4_0_expert_sources(
                     _packed_as(t, types["down"]).reshape(E, H, dn_bytes)
                 )
             seen[suffix].add(layer)
+            releaser.note(t.rows * t.row_bytes)
             if tracker is not None:
                 tracker.note(layer)
 

@@ -14,6 +14,7 @@ import functools
 import os
 import re
 import struct
+import sys
 from dataclasses import dataclass
 from typing import Any, Iterator
 
@@ -217,6 +218,92 @@ def _iter_shard_tensors(model_path: str) -> Iterator[GgufTensor]:
         )
 
 
+def release_mapped_pages(model_path: str) -> int:
+    """Drop the GGUF's already-read file pages from this process's working set.
+
+    The reader maps every shard (``np.memmap``) and hands out zero-copy views, so a
+    consumer that copies the whole file out -- the expert-bank fill is exactly that --
+    ends up holding the bytes *twice*: once as the mapped source pages, once as the
+    destination bank. On a 19 GiB MoE checkpoint that doubling is the difference
+    between loading and dying on ``cudaHostRegister`` with ``availPhys`` at zero.
+
+    Trimming is safe at any point: the mapping stays valid and any live view keeps
+    working -- a later read just soft-faults the page back from standby (or re-reads
+    it from disk). Call it once a region has been consumed, never mid-tensor.
+
+    Returns the number of shard mappings trimmed.
+    """
+    trimmed = 0
+    for shard in gguf_shard_paths(model_path):
+        reader = _reader(shard)
+        data = getattr(reader, "data", None)
+        if data is None or data.nbytes == 0:
+            continue
+        if _release_pages(data.ctypes.data, data.nbytes):
+            trimmed += 1
+    return trimmed
+
+
+def _release_pages(addr: int, nbytes: int) -> bool:
+    """Working-set trim for one mapped range. Windows: ``VirtualUnlock`` over a range
+    that was never ``VirtualLock``ed fails with ERROR_NOT_LOCKED (158) but still
+    removes the range's pages from the working set -- that documented side effect is
+    the only user-mode way to give mapped file pages back. POSIX: ``MADV_DONTNEED``.
+    """
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.VirtualUnlock.argtypes = [wintypes.LPVOID, ctypes.c_size_t]
+        k32.VirtualUnlock.restype = wintypes.BOOL
+        k32.VirtualUnlock(ctypes.c_void_p(addr), ctypes.c_size_t(nbytes))
+        return True  # ERROR_NOT_LOCKED is the expected return; the trim still happened
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        page = os.sysconf("SC_PAGE_SIZE")
+        start = (addr + page - 1) // page * page
+        length = (addr + nbytes - start) // page * page
+        if length <= 0:
+            return False
+        return libc.madvise(ctypes.c_void_p(start), ctypes.c_size_t(length), 4) == 0  # MADV_DONTNEED
+    except Exception:  # best-effort: never fail a load over a memory hint
+        return False
+
+
+class PageReleaser:
+    """Byte-budgeted caller of :func:`release_mapped_pages`.
+
+    A bank fill copies the whole checkpoint out of the mapping, so without this the
+    process holds the file twice. Trimming on every tensor would walk the whole
+    mapping's page tables 80+ times; trimming once per ``budget`` of consumed bytes
+    (default 2 GiB, ``FT_GGUF_TRIM_BYTES=0`` disables) caps the extra residency at
+    roughly the budget for a handful of calls.
+
+    Use ``note(nbytes)`` once a region is fully consumed -- never while a view into
+    it is still being read.
+    """
+
+    __slots__ = ("_path", "_budget", "_pending")
+
+    def __init__(self, model_path: str, budget: int | None = None):
+        self._path = model_path
+        if budget is None:
+            budget = int(os.environ.get("FT_GGUF_TRIM_BYTES", 2 << 30))
+        self._budget = budget
+        self._pending = 0
+
+    def note(self, nbytes: int) -> None:
+        if self._budget <= 0:
+            return
+        self._pending += nbytes
+        if self._pending >= self._budget:
+            self._pending = 0
+            release_mapped_pages(self._path)
+
+
 def gguf_tensor_names(model_path: str) -> set[str]:
     return {
         t.name for shard in gguf_shard_paths(model_path) for t in _reader(shard).tensors
@@ -235,4 +322,6 @@ __all__ = [
     "gguf_architecture",
     "iter_gguf_tensors",
     "gguf_tensor_names",
+    "release_mapped_pages",
+    "PageReleaser",
 ]
