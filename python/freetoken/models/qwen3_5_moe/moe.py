@@ -16,6 +16,19 @@ if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
 
 
+_SMALL_ROUTER_ROWS = 4
+
+
+def _router_linear(gate: LinearReplicated, x: torch.Tensor) -> torch.Tensor:
+    """The router GEMVs ([E, H] and [1, H]) at decode batch sizes. rocBLAS picks large
+    Tensile GEMM tiles for these on RDNA (118 us for the [256, 2048] router on an
+    RX 6800, 40 layers a token); a broadcast multiply-and-sum reads the same bytes in
+    15 us with the same fp32-accumulated result."""
+    if torch.version.hip is not None and x.shape[0] <= _SMALL_ROUTER_ROWS:
+        return (x.unsqueeze(1) * gate.weight).sum(-1)
+    return gate.forward(x)
+
+
 class _SharedExpert(BaseOP):
     """Always-present shared SwiGLU expert of width ``shared_expert_intermediate_size``."""
 
@@ -75,9 +88,9 @@ class Qwen3_5MoE(BaseOP):
         # Compute the router + shared expert BEFORE the routed experts: the fused MoE
         # kernel may write into ``hidden_states`` in place, which would corrupt the
         # shared expert's input (HF also evaluates the shared expert first).
-        router_logits = self.gate.forward(hidden_states)
+        router_logits = _router_linear(self.gate, hidden_states)
         shared = self.shared_expert.forward(hidden_states)
-        shared = shared * torch.sigmoid(self.shared_expert_gate.forward(hidden_states))
+        shared = shared * torch.sigmoid(_router_linear(self.shared_expert_gate, hidden_states))
         routed = self.experts.forward(hidden_states=hidden_states, router_logits=router_logits)
         return (routed + shared).view(num_tokens, hidden_dim)
 
