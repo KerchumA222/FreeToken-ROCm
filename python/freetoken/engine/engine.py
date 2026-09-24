@@ -275,19 +275,76 @@ def _make_dummy_weight_state_dict(
     return state_dict
 
 
+def _gguf_merge_groups(model) -> Dict[str, Tuple[str, ...]]:
+    """state-dict key -> the keys of its run, for packed GGUF slots that finalize will merge
+    into one GEMV (``merge_runs``). Uploading a run as one buffer keeps the merge from
+    leaving freed slot tensors as holes between live weights, which the auto-sized MoE
+    cache would otherwise lose."""
+    from freetoken.layers.base import BaseOP, OPList
+    from freetoken.layers.quantization.linear.gguf import merge_runs
+
+    groups: Dict[str, Tuple[str, ...]] = {}
+
+    def walk(op, prefix: str) -> None:
+        if isinstance(op, OPList):  # names its children <prefix>.<i>, as its state_dict does
+            for i, child in enumerate(op.op_list):
+                walk(child, f"{prefix}.{i}" if prefix else str(i))
+            return
+        slots = getattr(op, "gguf_slots", None)
+        if slots and len(slots) > 1:
+            for names, _ in merge_runs(slots, op.gguf_types):
+                if len(names) > 1:
+                    keys = tuple(f"{prefix}.{n}" if prefix else n for n in names)
+                    for k in keys:
+                        groups[k] = keys
+        for name, v in vars(op).items():
+            if name.startswith("_"):
+                continue
+            if isinstance(v, BaseOP):
+                walk(v, f"{prefix}.{name}" if prefix else name)
+            elif isinstance(v, (list, tuple)):
+                for i, item in enumerate(v):
+                    if isinstance(item, BaseOP):
+                        walk(item, f"{prefix}.{name}.{i}" if prefix else f"{name}.{i}")
+
+    walk(model, "")
+    # Only runs whose names the model's own state dict uses; anything else uploads as is.
+    known = set(model.state_dict())
+    return {k: g for k, g in groups.items() if all(x in known for x in g)}
+
+
 def _materialize_loaded_weight_state_dict(
     model_state: Dict[str, torch.Tensor],
     weights: Iterable[Tuple[str, torch.Tensor]],
     *,
     device: torch.device,
+    merge_groups: Dict[str, Tuple[str, ...]] | None = None,
 ) -> Dict[str, torch.Tensor]:
     state_dict: Dict[str, torch.Tensor] = {}
+    pending: Dict[Tuple[str, ...], Dict[str, torch.Tensor]] = {}
     for key, weight in weights:
+        group = (merge_groups or {}).get(key)
+        if group is not None and weight.dtype == torch.uint8 and weight.dim() == 2:
+            buf = pending.setdefault(group, {})
+            buf[key] = weight
+            if len(buf) == len(group):
+                del pending[group]
+                parts = [buf[k] for k in group]
+                merged = torch.cat([p.cpu() for p in parts], dim=0).to(device=device)
+                off = 0
+                for k, p in zip(group, parts):
+                    state_dict[k] = merged[off : off + p.shape[0]]
+                    off += p.shape[0]
+            continue
         expected = model_state.get(key)
         if expected is None:
             state_dict[key] = weight.to(device=device)
         else:
             state_dict[key] = weight.to(device=device, dtype=expected.dtype)
+    # A run that never completed (a checkpoint without every slot) uploads slot by slot.
+    for buf in pending.values():
+        for k, w in buf.items():
+            state_dict[k] = w.to(device=device)
     return state_dict
 
 
@@ -518,6 +575,7 @@ class Engine:
                 include_moe_experts=not is_offload_moe_strategy(config.moe_strategy),
             ),
             device=self.device,
+            merge_groups=_gguf_merge_groups(self.model),
         )
 
 

@@ -36,6 +36,17 @@ def _is_packed(ggml_type: int) -> bool:
     return ggml_type not in _UNQUANTIZED
 
 
+def merge_runs(slots, types) -> list[tuple[list[str], int]]:
+    """Adjacent packed slots sharing a ggml type, which run as one GEMV."""
+    runs: list[tuple[list[str], int]] = []
+    for n, t in zip(slots, types):
+        if runs and _is_packed(t) and runs[-1][1] == t:
+            runs[-1][0].append(n)
+        else:
+            runs.append(([n], t))
+    return runs
+
+
 class MmvqGgufLinearKernel(LinearKernel):
     """llama.cpp's MMVQ/MMQ pair: q8_1 activations dotted against the packed blocks."""
 
@@ -48,19 +59,21 @@ class MmvqGgufLinearKernel(LinearKernel):
         the small slots (a GDN in_proj's 32-row beta/alpha) run far below bandwidth.
         Rows of one type concatenate cleanly; the slot tensors become views into the
         merged buffer, so the weights are not held twice."""
-        runs: list[tuple[list[str], int]] = []
-        for n, t in zip(layer.gguf_slots, layer.gguf_types):
-            if runs and _is_packed(t) and runs[-1][1] == t:
-                runs[-1][0].append(n)
-            else:
-                runs.append(([n], t))
         merged = []
-        for names, t in runs:
+        for names, t in merge_runs(layer.gguf_slots, layer.gguf_types):
             if len(names) == 1:
                 merged.append((names[0], t))
                 continue
             parts = [getattr(layer, n) for n in names]
-            buf = torch.cat(parts, dim=0)
+            base = parts[0]._base
+            if (base is not None and all(p._base is base for p in parts)
+                    and base.shape[0] == sum(p.shape[0] for p in parts)
+                    and base.data_ptr() == parts[0].data_ptr()):
+                # Already uploaded as one buffer (the engine's loader concatenates runs on
+                # the host, so no holes are left in the allocator's segments).
+                buf = base
+            else:
+                buf = torch.cat(parts, dim=0)
             off = 0
             for n, p in zip(names, parts):
                 setattr(layer, n, buf[off : off + p.shape[0]])
