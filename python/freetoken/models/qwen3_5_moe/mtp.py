@@ -131,7 +131,13 @@ def iter_gguf_mtp_weights(model_path: str, prefix: str = "mtp"):
     """
     from freetoken.models.gguf.reader import iter_gguf_tensors
 
-    from .gguf import _SUFFIX_MAP, _to_bf16
+    from .gguf import _SUFFIX_MAP, _is_packable, _to_bf16
+
+    # Served packed exactly when gguf_module_types lists the module packed: a single
+    # tensor when its type is packable, a fused group when every slot's is.
+    packed_single = {"nextn.eh_proj.weight": "eh_proj.weight",
+                     "attn_output.weight": "layer.self_attn.o_proj.weight",
+                     "ffn_down_shexp.weight": "layer.mlp.shared_expert.down_proj.weight"}
 
     layer = mtp_draft_layer(model_path)
     if layer is None:
@@ -150,22 +156,31 @@ def iter_gguf_mtp_weights(model_path: str, prefix: str = "mtp"):
         seen.add(suffix)
         if suffix in _BORROWED:
             continue                      # the head uses the target's copy
+        if suffix in packed_single and _is_packable(t.ggml_type):
+            yield f"{prefix}.{packed_single[suffix]}", t.packed()
+            continue
         if suffix in _NEXTN_MAP:
             yield f"{prefix}.{_NEXTN_MAP[suffix]}", _to_bf16(t)
             continue
-        if suffix in qkv_slots:
-            buf = fuse.setdefault("qkv", {})
-            buf[suffix] = _to_bf16(t)
-            if len(buf) == 3:
-                yield (f"{prefix}.layer.self_attn.qkv_proj.weight",
-                       torch.cat([buf[s] for s in qkv_slots], dim=0).contiguous())
-            continue
-        if suffix in shexp_slots:
-            buf = fuse.setdefault("shexp", {})
-            buf[suffix] = _to_bf16(t)
-            if len(buf) == 2:
-                yield (f"{prefix}.layer.mlp.shared_expert.gate_up_proj.weight",
-                       torch.cat([buf[s] for s in shexp_slots], dim=0).contiguous())
+        for group, slots, module in (
+            ("qkv", qkv_slots, "layer.self_attn.qkv_proj"),
+            ("shexp", shexp_slots, "layer.mlp.shared_expert.gate_up_proj"),
+        ):
+            if suffix in slots:
+                buf = fuse.setdefault(group, {})
+                buf[suffix] = t
+                if len(buf) == len(slots):
+                    parts = [buf[s] for s in slots]
+                    if all(_is_packable(p.ggml_type) for p in parts):
+                        for i, p in enumerate(parts):
+                            yield f"{prefix}.{module}.weight_{i}", p.packed()
+                    else:
+                        yield (f"{prefix}.{module}.weight",
+                               torch.cat([_to_bf16(p) for p in parts], dim=0).contiguous())
+                break
+        else:
+            group = None
+        if group is not None:
             continue
         if suffix == "ffn_gate_inp_shexp.weight":
             yield f"{prefix}.layer.mlp.shared_expert_gate.weight", _to_bf16(t).reshape(1, -1)

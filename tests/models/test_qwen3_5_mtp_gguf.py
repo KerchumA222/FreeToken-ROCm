@@ -78,18 +78,39 @@ def test_the_draft_block_joins_the_full_attention_group(config):
     assert out.gguf_expert_bank_types == config.gguf_expert_bank_types
 
 
+def _packed_types():
+    """ggml type per head tensor the reader hands over packed (Q8_0 et al.)."""
+    from freetoken.models.gguf.reader import iter_gguf_tensors
+    from freetoken.models.qwen3_5_moe.gguf import _is_packable
+
+    stem = "blk.40."
+    return {t.name[len(stem):]: t.ggml_type for t in iter_gguf_tensors(MODEL)
+            if t.name.startswith(stem) and _is_packable(t.ggml_type)}
+
+
 def test_the_head_translates_to_the_modules_that_build_it(config):
+    from freetoken.models.gguf.dequant import row_bytes
     from freetoken.models.qwen3_5_moe.mtp import iter_gguf_mtp_weights
 
     got = {name: tuple(t.shape) for name, t in iter_gguf_mtp_weights(MODEL)}
+    packed = _packed_types()
     hidden = config.hidden_size
-    assert got["mtp.eh_proj.weight"] == (hidden, 2 * hidden)
+    # Packed projections arrive as [rows, row_bytes] block bytes, like the target's.
+    eh = packed.get("nextn.eh_proj.weight")
+    assert got["mtp.eh_proj.weight"] == (
+        (hidden, row_bytes(2 * hidden, eh)) if eh is not None else (hidden, 2 * hidden))
     for norm in ("mtp.enorm.weight", "mtp.hnorm.weight", "mtp.shared_head_norm.weight"):
         assert got[norm] == (hidden,)
     # q is doubled by the attention output gate, then k and v at one head_dim per kv head.
     g = [gr for gr in config.attention_groups if hasattr(gr, "num_kv_heads")][0]
-    q_rows = 2 * config.num_qo_heads * g.head_dim
-    assert got["mtp.layer.self_attn.qkv_proj.weight"] == (q_rows + 2 * g.num_kv_heads * g.head_dim, hidden)
+    rows = (2 * config.num_qo_heads * g.head_dim, g.num_kv_heads * g.head_dim,
+            g.num_kv_heads * g.head_dim)
+    slots = ("attn_q.weight", "attn_k.weight", "attn_v.weight")
+    if all(s in packed for s in slots):
+        for i, (s, r) in enumerate(zip(slots, rows)):
+            assert got[f"mtp.layer.self_attn.qkv_proj.weight_{i}"] == (r, row_bytes(hidden, packed[s]))
+    else:
+        assert got["mtp.layer.self_attn.qkv_proj.weight"] == (sum(rows), hidden)
     assert got["mtp.layer.mlp.shared_expert_gate.weight"] == (1, hidden)
     # The routed experts are the bank reader's job, not this iterator's.
     assert not [k for k in got if "experts" in k]
@@ -144,7 +165,15 @@ def head(config):
         set_tp_info(rank=0, size=1)
     except Exception:  # already set by another test in this session
         pass
-    spec_config = _with_full_attention(config, config.num_layers)
+    from dataclasses import replace
+
+    from freetoken.layers.quantization.configs.gguf import GgufConfig, gguf_quantization_config
+    from freetoken.models.qwen3_5_moe.gguf import gguf_module_types
+
+    # Built with the checkpoint's gguf quant dialect, as the engine builds it: the head's
+    # packable projections are served packed and the modules must expect block bytes.
+    quant = GgufConfig(gguf_quantization_config(gguf_module_types(MODEL)))
+    spec_config = _with_full_attention(replace(config, quant=quant), config.num_layers)
     # The engine builds every model under the compute dtype; without it the norms would
     # come out fp32 and reject the checkpoint's bf16.
     with torch_dtype(torch.bfloat16):

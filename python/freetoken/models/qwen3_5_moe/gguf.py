@@ -290,11 +290,17 @@ def gguf_module_types(
     for layer, types in by_layer.items():
         g = types.get
         if layer >= draft_layer:
-            # Only the routed bank: the head's dense tensors are delivered dequantized by
-            # iter_gguf_mtp_weights, so claiming them packed here would build modules that
-            # expect block bytes and then be handed bf16.
             add("mtp.layer.mlp.experts",
                 [g("ffn_gate_exps.weight"), g("ffn_down_exps.weight")])
+            # The head's dense projections, served packed exactly when
+            # iter_gguf_mtp_weights hands them over packed (the same per-tensor test).
+            add("mtp.eh_proj", [g("nextn.eh_proj.weight")])
+            add("mtp.layer.self_attn.qkv_proj",
+                [g("attn_q.weight"), g("attn_k.weight"), g("attn_v.weight")])
+            add("mtp.layer.self_attn.o_proj", [g("attn_output.weight")])
+            add("mtp.layer.mlp.shared_expert.gate_up_proj",
+                [g("ffn_gate_shexp.weight"), g("ffn_up_shexp.weight")])
+            add("mtp.layer.mlp.shared_expert.down_proj", [g("ffn_down_shexp.weight")])
             continue
         stem = f"model.layers.{layer}."
         if _is_full_attention(layer, interval):
