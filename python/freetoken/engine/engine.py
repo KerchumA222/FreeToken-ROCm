@@ -21,6 +21,7 @@ from freetoken.moe import is_offload_moe_strategy
 from freetoken.moe.expert_banks import load_expert_banks
 from freetoken.moe.host_banks import PinFailed
 from freetoken.speculative import trace as spec_trace
+from freetoken.engine import decode_profile
 from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache
 from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
 
@@ -1142,6 +1143,7 @@ class Engine:
         assert torch.cuda.current_stream() == self.stream
         use_graph = self.graph_runner.can_use_cuda_graph(batch)
         draft_tokens_gpu = None
+        decode_profile.step(batch)
         with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, use_graph):
             logits = self.graph_runner.replay(batch) if use_graph else self.model.forward()
             # Sampling is inside the context because the draft head below needs both its

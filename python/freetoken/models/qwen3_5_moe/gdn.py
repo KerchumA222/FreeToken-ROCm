@@ -81,6 +81,28 @@ class Qwen3_5GatedDeltaNet(BaseOP):
             self.value_dim, hidden_size, has_bias=False,
             quant_config=quant_config, prefix=f"{prefix}.out_proj",
         )
+        # A GGUF checkpoint's value heads are permuted into the kernel's order on load
+        # (see gguf._v_head_permutation). A dense out_proj gets its input columns permuted
+        # to match; a packed one cannot (columns live inside quant blocks), so it keeps
+        # the checkpoint's order and its input is permuted back here instead.
+        self._unpermute_out_in = False
+        self._out_in_index = None
+        if getattr(self.out_proj, "gguf_types", None) is not None:
+            from .gguf import _v_head_permutation
+
+            self._unpermute_out_in = _v_head_permutation(num_v_heads, num_k_heads) is not None
+
+    def _out_input_index(self, device) -> torch.Tensor:
+        """Kernel-order position of each checkpoint-order out_proj input column: original
+        value head ``h`` sits at kernel head ``(h % HK) * rep + h // HK``. Built with device
+        arithmetic so a first call inside graph capture needs no host copy."""
+        if self._out_in_index is None:
+            hk, dv = self.num_k_heads, self.head_v_dim
+            rep = self.num_v_heads // hk
+            h = torch.arange(self.num_v_heads, device=device)
+            j = (h % hk) * rep + h // hk
+            self._out_in_index = (j[:, None] * dv + torch.arange(dv, device=device)).reshape(-1)
+        return self._out_in_index
 
     def _gate_params(self, a: torch.Tensor, b: torch.Tensor):
         beta = b.sigmoid()
@@ -197,6 +219,8 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         core_out = core_out.reshape(-1, self.head_v_dim)
         z = z.reshape(-1, self.head_v_dim)
         out = self.norm.forward(core_out, z).reshape(total, -1)
+        if self._unpermute_out_in:
+            out = out.index_select(1, self._out_input_index(out.device))
         return self.out_proj.forward(out)
 
 

@@ -76,14 +76,14 @@ _EXPERT_SUFFIXES = ("ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps
 # does here (Q4_K: 273 MiB packed against 970 MiB dequantized).
 _PACKABLE_DENSE = ("output.weight", "token_embd.weight")
 
-# Per-layer projections servable from their packed blocks. Deliberately excludes
-# everything the GDN head-order fix touches: a row permutation is fine on packed
-# data (rows are whole quant blocks) but ssm_out needs its *columns* reordered, and
-# columns live inside a block. Those stay on the bf16 path until the permutation
-# moves out of the weight and into the kernel output. See _v_head_permutation.
+# Per-layer projections servable from their packed blocks. The GDN head-order fix
+# (_v_head_permutation) permutes in_proj's *rows*, which is fine on packed data (rows
+# are whole quant blocks). ssm_out would need its *columns* reordered, which live inside
+# a block, so it is served unpermuted and the GDN module un-permutes its input instead.
 _PACKABLE_LAYER = (
     "attn_q", "attn_k", "attn_v", "attn_output",
     "ffn_gate_shexp", "ffn_up_shexp", "ffn_down_shexp",
+    "attn_qkv", "attn_gate", "ssm_beta", "ssm_alpha", "ssm_out",
 )
 # fused module -> (slot name, gguf tensor) in concat order
 _PACKED_QKV = (("q", "attn_q"), ("k", "attn_k"), ("v", "attn_v"))
@@ -301,6 +301,9 @@ def gguf_module_types(
             add(stem + "self_attn.qkv_proj",
                 [g("attn_q.weight"), g("attn_k.weight"), g("attn_v.weight")])
             add(stem + "self_attn.o_proj", [g("attn_output.weight")])
+        else:
+            add(stem + "linear_attn.in_proj", [g(f"{s}.weight") for s in _IN_PROJ_SLOTS])
+            add(stem + "linear_attn.out_proj", [g("ssm_out.weight")])
         add(stem + "mlp.shared_expert.gate_up_proj",
             [g("ffn_gate_shexp.weight"), g("ffn_up_shexp.weight")])
         add(stem + "mlp.shared_expert.down_proj", [g("ffn_down_shexp.weight")])
@@ -482,7 +485,8 @@ def iter_gguf_weights(
                     )
                 continue
             if proj in _IN_PROJ_SLOTS and not _is_full_attention(layer, interval):
-                val = _to_bf16(t)
+                packed = packed_group(layer, [(s, s) for s in _IN_PROJ_SLOTS])
+                val = t.packed() if packed else _to_bf16(t)
                 if v_perm is not None:
                     if proj == "attn_qkv":
                         val = _fix_v_rows(val)            # [q | k | v]
@@ -490,10 +494,18 @@ def iter_gguf_weights(
                         val = _permute_head_rows(val, v_perm, d_v)   # z, per value head
                     else:
                         val = val[v_perm]                 # ssm_beta / ssm_alpha
+                if packed:
+                    i = _IN_PROJ_SLOTS.index(proj)
+                    yield f"{stem}linear_attn.in_proj.weight_{i}", val.contiguous()
+                    continue
                 yield from feed_fused(
                     layer, "in_proj", _IN_PROJ_SLOTS, proj, val,
                     stem + "linear_attn.in_proj.weight",
                 )
+                continue
+            if suffix == "ssm_out.weight" and name in dtypes:
+                # Packed and unpermuted: Qwen3_5GatedDeltaNet reorders its input instead.
+                yield stem + "linear_attn.out_proj.weight", t.packed()
                 continue
             if suffix == "ssm_out.weight" and v_perm is not None:
                 # [hidden, value_dim]: reorder the input columns to match
