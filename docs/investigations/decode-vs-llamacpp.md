@@ -67,3 +67,29 @@ A depth-1 verify round costs ~1.6x a decode step here against ~1.46x for llama.c
 per-round GPU work is ~20 ms, leaving ~1 ms of host work in the non-overlapped
 speculative loop. The draft head's chained steps are single-request only; batched chains
 need per-request KV ranges in the step's attention metadata.
+
+## Qwen3.8-Flash-Next IQ2_S-Q2SYM on the disk tier
+
+The same changes, on the disk-bound 61.3 GiB checkpoint with the recorded service settings
+(`--moe-backend offload --moe-cache-auto --moe-host-cache-size 2048 --ple-backend disk
+--memory-ratio 0.96`, `FREETOKEN_DISK_TIER_GRAPH=1`, graph bs 1), runner
+[`benchmark_disk_tier_graph.py`](benchmark_disk_tier_graph.py). The control is the
+pre-session tree (64efe1e) run the same day, since page-cache state moves these numbers
+by several percent between days (the 2026-09-18 figures above were 14.10 / 15.88).
+
+| Benchmark | 64efe1e (same day) | Current | Change |
+|---|---:|---:|---:|
+| 48-token repeated prompt, LRU | 18.56 | 19.64 | +5.8% |
+| 512-token hash-table prompt, LRU | 13.16 | 14.30 | +8.7% |
+| 512-token prompt, frequency 0.95 | 14.45 | 15.36 | +6.3% |
+
+GPU expert slots: 8230 (control) vs 8202. Before the merged-slot upload fix the current
+tree lost 170 slots to allocator holes and the long prompts gained only 0.6-1.7%.
+
+MTP still does not pay here. With a symmetric-Q2_0 sidecar built for this checkpoint
+(`mtp-Qwen3.8-Flash-Next-IQ2XSQ2SYM.gguf`, same patched llama-q4e command with the
+sidecar as input), depth 1 measured 14.29 (short) / 11.16 (long) at 0.817 drafts
+accepted per round: a verify moves two tokens' routed experts, which is the scarce
+resource on this configuration. qwen4_exp also carries per-request PLE slot state that the
+per-row GDN rollback does not snapshot, so it runs the older snapshot-and-restage verify
+(eager, one draft).
