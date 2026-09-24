@@ -6,6 +6,7 @@ from freetoken.core import get_global_ctx
 from freetoken.kernel.causal_conv1d import causal_conv1d_decode, causal_conv1d_varlen
 from freetoken.layers import BaseOP, GatedRMSNorm, LinearColParallelMerged, LinearReplicated
 from freetoken.layers.quantization import QuantConfig
+from freetoken.models.qwen3_5_moe.gdn import Qwen3_5GatedDeltaNet
 from freetoken.models.qwen3_5_moe.gdn_kernels import gdn_decode_fla, gdn_prefill_chunk_fla
 
 
@@ -84,6 +85,10 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
             quant_config=quant_config, prefix=f"{prefix}.out_proj",
         )
 
+    # Same parameters and kernels as Qwen3.5's GDN, so the same speculative verify path.
+    supports_verify_rows = True
+    _verify = Qwen3_5GatedDeltaNet._verify
+
     def _gate_params(self, a: torch.Tensor, b: torch.Tensor):
         beta = b.sigmoid()
         g = -self.A_log.exp() * F.softplus(a.float() + self.dt_bias)
@@ -151,7 +156,10 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
         z = z.reshape(total, self.num_v_heads, self.head_v_dim)
         li = pool.local_index(self.layer_id)
 
-        if batch.is_decode:
+        rows = getattr(batch, "spec_uniform_rows", 0)
+        if batch.is_spec_verify and rows and pool.has_spec and fla.track_dst is None:
+            core_out = self._verify(conv_in, a, b, total // rows, rows, pool, li, fla, dtype)
+        elif batch.is_decode:
             # Fused fla decode kernel: gating + in-kernel l2norm + recurrent update +
             # per-request state read/write-by-index, all in one kernel (no gather/scatter,
             # no clone, no external l2norm). q/k stay at num_k_heads (kernel handles GQA).

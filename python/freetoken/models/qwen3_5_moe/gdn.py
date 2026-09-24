@@ -104,6 +104,11 @@ class Qwen3_5GatedDeltaNet(BaseOP):
             self._out_in_index = (j[:, None] * dv + torch.arange(dv, device=device)).reshape(-1)
         return self._out_in_index
 
+    # Runs a uniform speculative verify batch row by row through the decode kernels and
+    # records per-row state (``_verify``); the engine only allocates the per-step buffers
+    # when every linear-attention layer does.
+    supports_verify_rows = True
+
     def _gate_params(self, a: torch.Tensor, b: torch.Tensor):
         beta = b.sigmoid()
         g = -self.A_log.exp() * F.softplus(a.float() + self.dt_bias)

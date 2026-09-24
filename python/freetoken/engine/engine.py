@@ -404,8 +404,9 @@ class Engine:
                 slot_states=config.model_config.slot_states,
             )
             self.ctx.linear_state_pool = self.linear_state_pool
-            if self.mtp_head is not None:
-                # A verify of k drafts rolls back to at most row k - 1.
+            if self.mtp_head is not None and _gdn_supports_verify_rows(self.model):
+                # A verify of k drafts rolls back to at most row k - 1. A model whose GDN
+                # cannot record per-row state keeps the snapshot-and-restage rollback.
                 self.linear_state_pool.alloc_spec(config.max_running_req, max(1, self.spec_k))
         else:
             self.linear_state_pool = None
@@ -1688,6 +1689,30 @@ def offload_expert_method(config: EngineConfig):
     with torch.device("meta"), torch_dtype(config.dtype):
         model = create_model(config.model_config)
     return shared_offload_method(model)
+
+
+def _gdn_supports_verify_rows(model) -> bool:
+    """Whether every linear-attention (GDN) op in ``model`` runs the per-row verify."""
+    from freetoken.layers.base import BaseOP
+
+    seen, ops = set(), []
+
+    def walk(op):
+        if id(op) in seen:
+            return
+        seen.add(id(op))
+        if hasattr(op, "_conv_weight") and hasattr(op, "A_log"):
+            ops.append(op)
+        for v in vars(op).values():
+            if isinstance(v, BaseOP):
+                walk(v)
+            elif isinstance(v, (list, tuple)):
+                for item in v:
+                    if isinstance(item, BaseOP):
+                        walk(item)
+
+    walk(model)
+    return bool(ops) and all(getattr(op, "supports_verify_rows", False) for op in ops)
 
 
 def _adjust_config(config: EngineConfig):
