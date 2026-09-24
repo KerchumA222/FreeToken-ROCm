@@ -196,3 +196,35 @@ def test_the_draft_block_gets_a_bank_slot_only_when_speculation_is_on(config):
 
     speculating = replace(config, num_speculative_tokens=2)
     assert speculating.num_moe_layers == config.num_layers + 1
+
+
+def test_the_expert_piece_reader_skips_the_draft_block_when_speculation_is_off(monkeypatch):
+    """The streaming reader must bound blocks the same way the complete-bank loader does:
+    with speculation off, ``blk.40``'s routed bank has no slot, and yielding it fails bank
+    construction with "expert piece out of range: layer 40". Synthetic tensors, no
+    checkpoint needed."""
+    from types import SimpleNamespace
+
+    import torch
+
+    import freetoken.models.qwen3_5_moe.gguf as g
+
+    E, H, I, L = 2, 32, 32, 3
+    types = {"gate_up": 2, "down": 2}  # Q4_0: 18 bytes per 32 values
+    rb = g.row_bytes(32, 2)
+    tensors = [
+        SimpleNamespace(name=f"blk.{li}.{s}")
+        for li in range(L + 1)
+        for s in ("ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight")
+    ]
+    monkeypatch.setattr(g, "_iter_expert_tensors", lambda path, cfg: iter(tensors))
+    monkeypatch.setattr(g, "_bank_types", lambda cfg: types)
+    monkeypatch.setattr(g, "_packed_as", lambda t, ty: torch.zeros(E * 32 * rb, dtype=torch.uint8))
+
+    def layers(addressable):
+        cfg = SimpleNamespace(num_addressable_layers=addressable, num_layers=L, num_experts=E,
+                              hidden_size=H, moe_intermediate_size=I)
+        return [li for li, *_ in g.iter_gguf_expert_pieces("unused", cfg)]
+
+    assert layers(L) == list(range(L))
+    assert layers(L + 1) == list(range(L + 1))

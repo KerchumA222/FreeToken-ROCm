@@ -635,17 +635,18 @@ class CacheManager:
         return allocated
 
     def rollback_speculative(self, req: Req, staged_device_len: int) -> None:
-        """Return the pages for staged positions acceptance did not keep.
+        """Return the pages the verify forward allocated past the post-acceptance
+        ``cached_len``.
 
-        ``staged_device_len`` is the request's ``device_len`` as the verify forward saw it;
-        everything from the post-acceptance ``device_len`` up to it is now unused. Taking
-        the old length rather than a count of rejected drafts is deliberate: the correction
-        token occupies the first rejected draft's position, so the number of freeable
-        positions is one less than the number of drafts rejected -- and at depth 1 it is
-        zero. Freeing by the draft count instead hands the allocator a slot that was never
-        this request's, which corrupts whichever request receives it next.
+        ``allocate_paged`` allocates fresh pages for ``[cached_len, device_len)`` on every
+        forward, so between forwards a request must own pages for exactly
+        ``[0, cached_len)``. The verify forward allocated up to ``staged_device_len``;
+        whatever lies at or past the new ``cached_len`` -- rejected drafts, and the slot
+        the pending correction will be re-forwarded into -- is allocated again next
+        forward and leaks if it is not returned here. That includes a reject-and-restage,
+        where ``cached_len`` does not move at all.
         """
-        first = div_ceil(req.device_len, self.page_size)
+        first = div_ceil(req.cached_len, self.page_size)
         last = div_ceil(staged_device_len, self.page_size)
         if last <= first:
             return

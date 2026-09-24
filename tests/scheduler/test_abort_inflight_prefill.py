@@ -72,6 +72,7 @@ def _setup():
         _last_data=None,
     )
     stub._free_req_resources = lambda req: Scheduler._free_req_resources(stub, req)
+    stub._commit_token = lambda *a: Scheduler._commit_token(stub, *a)
     return pool, cm, tm, dm, pm, sent, stub
 
 

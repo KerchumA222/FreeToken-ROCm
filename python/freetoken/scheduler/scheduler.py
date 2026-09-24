@@ -871,7 +871,9 @@ class Scheduler(SchedulerIOMixin):
             # instead: restore the pre-verify state and restage the target's own token,
             # which the next forward re-derives and accepts.
             self._restore_spec_linear_state(req)
+            staged_device_len = req.device_len
             req.reject_and_restage(torch.tensor(correction, dtype=req.input_ids.dtype))
+            self.cache_manager.rollback_speculative(req, staged_device_len)
             self.token_pool[req.table_idx, req.cached_len + 1] = correction
             req.spec_rejects += 1
             return []

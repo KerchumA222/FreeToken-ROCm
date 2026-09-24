@@ -747,7 +747,9 @@ def iter_gguf_expert_pieces(model_path: str, config, *, parallel: bool = False,
     as the complete-bank loader does; that is also what makes them unreadable by the
     disk tier, which needs the file bytes to *be* the bank bytes.
     """
-    L, E = config.num_layers, config.num_experts
+    # Block-index bound, as in the complete-bank loader: an MTP checkpoint's draft block
+    # sits past the trunk and has no bank slot unless speculation is on.
+    L, E = config.num_addressable_layers, config.num_experts
     H, I = config.hidden_size, config.moe_intermediate_size
     types = _bank_types(config)
     gu_bytes = row_bytes(H, types["gate_up"])
@@ -761,6 +763,8 @@ def iter_gguf_expert_pieces(model_path: str, config, *, parallel: bool = False,
         if suffix not in _EXPERT_SUFFIXES:
             continue
         layer = int(t.name.split(".")[1])
+        if layer >= L:
+            continue
         buf = pending.setdefault(layer, {})
         if suffix == "ffn_down_exps.weight":
             buf["down"] = _packed_as(t, types["down"]).reshape(E, H, dn_bytes)

@@ -20,6 +20,7 @@ from freetoken.models import create_model, load_weight
 from freetoken.moe import is_offload_moe_strategy
 from freetoken.moe.expert_banks import load_expert_banks
 from freetoken.moe.host_banks import PinFailed
+from freetoken.speculative import trace as spec_trace
 from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache
 from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
 
@@ -1149,6 +1150,8 @@ class Engine:
             # judges a draft or is the token past the last of them.
             rows = logits.shape[0] if batch.is_spec_verify else batch.size
             next_tokens_gpu = self.sampler.sample(logits[:rows], args).to(torch.int32)
+            if spec_trace.enabled():
+                spec_trace.record(batch, logits, rows)
             if self.mtp_head is not None and batch.capture_hidden:
                 draft_tokens_gpu = self._draft_tokens(batch, next_tokens_gpu)
         if self.cpu_moe_executor is not None:

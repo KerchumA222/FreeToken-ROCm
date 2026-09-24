@@ -27,7 +27,9 @@ class SamplingParams:
 
     @property
     def is_greedy(self) -> bool:
-        return (self.temperature <= 0.0 or self.top_k == 1) and self.top_p == 1.0
+        # top_p cannot change an argmax (the top token is always in the nucleus), and a
+        # model-default top_p lands on requests that asked for temperature 0.
+        return self.temperature <= 0.0 or self.top_k == 1
 
 
 @dataclass(eq=False)
