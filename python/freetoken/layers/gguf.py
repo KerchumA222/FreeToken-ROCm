@@ -223,6 +223,10 @@ class GgufLMHead(BaseOP):
         x = batch.select_output_rows(x)
         return fused_mul_mat_gguf(x, self.qweight, self._quant_type)
 
+    def forward_rows(self, x: torch.Tensor) -> torch.Tensor:
+        """Logits for exactly these rows, without the batch's output-row selection."""
+        return fused_mul_mat_gguf(x, self.qweight, self._quant_type)
+
 
 class GGUFEmbedding(BaseOP):
     """Vocab embedding stored as a native GGUF block-quantized table.

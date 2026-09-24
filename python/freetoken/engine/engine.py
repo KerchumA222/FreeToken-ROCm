@@ -1162,6 +1162,20 @@ class Engine:
             batch.draft_last_rows = last_rows
             tokens = next_tokens[: ids.shape[0]].to(torch.int64)
             out = self.mtp_head.forward(hidden, self.model.model.embed_tokens.forward(tokens))
+            rows = getattr(batch, "spec_uniform_rows", 0)
+            forward_rows = getattr(self.model.lm_head, "forward_rows", None)
+            if getattr(self.model.lm_head, "tp_size", 1) != 1:
+                forward_rows = None
+            if rows == 2 and forward_rows is not None:
+                # Only the row acceptance stops at yields the next draft, and a GEMV over a
+                # large vocabulary costs per row on GPUs without a native dp4a. At depth 1
+                # that row is 1 when the target's draw at row 0 matches the staged draft.
+                bs = out.shape[0] // rows
+                accepted = (tokens.view(bs, rows)[:, 0] == ids.view(bs, rows)[:, 1]).long()
+                sel = torch.arange(bs, device=out.device) * rows + accepted
+                draft = forward_rows(out.index_select(0, sel)).argmax(dim=-1).to(torch.int32)
+                # Per-row layout for the scheduler, which reads the row it commits at.
+                return draft.repeat_interleave(rows)
             return self.model.lm_head.forward(out).argmax(dim=-1).to(torch.int32)
         last_rows: list[int] = []
         offset = 0

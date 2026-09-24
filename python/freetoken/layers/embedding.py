@@ -145,3 +145,10 @@ class ParallelLMHead(VocabParallelEmbedding):
         output_tensor = output_tensor.permute(1, 0, 2).contiguous()
         output_tensor = output_tensor.reshape(input_shape[:1] + (self.tp_size * input_shape[1],))
         return output_tensor[:, : self.num_embeddings]
+
+    def forward_rows(self, x: torch.Tensor) -> torch.Tensor:
+        """Logits for exactly these rows, without the batch's output-row selection (TP=1)."""
+        assert self.tp_size == 1
+        if self.tied_embedding is not None:
+            return F.linear(x, self.tied_embedding.weight, self.bias)
+        return self.quant_method.apply(self, x)
