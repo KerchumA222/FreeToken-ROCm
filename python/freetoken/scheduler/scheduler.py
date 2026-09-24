@@ -777,7 +777,17 @@ class Scheduler(SchedulerIOMixin):
         if req.linear_slot_idx is None:
             return True                      # not a hybrid model: nothing recurrent to save
         if req.spec_state_slot is None:
+            # Finished requests donate GDN snapshots to the prefix tree; reclaim one from
+            # there like every other slot allocation, or speculation silently stops once
+            # the tree has absorbed the spare slots.
+            self.cache_manager.ensure_mamba_slots(1)
             if pool.num_free_slots < 1:
+                if not getattr(self, "_warned_spec_no_slot", False):
+                    self._warned_spec_no_slot = True
+                    logger.warning(
+                        "speculative decoding skipped: no GDN state slot for the rollback "
+                        "snapshot"
+                    )
                 return False
             req.spec_state_slot = pool.alloc(1)[0]
         pool.copy_from(req.linear_slot_idx, req.spec_state_slot)
