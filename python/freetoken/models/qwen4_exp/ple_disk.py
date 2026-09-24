@@ -305,6 +305,26 @@ class DiskRowTable:
             ))
             for req in batch.padded_reqs
         ]
+        if use_graph:
+            # A verify graph: its tokens are on the host already, but the graph pinned
+            # buffer and the flag are shared with the previous graph, so fill only once
+            # that one has finished with them (the decode path's readback-event ordering).
+            self._readback_event.record(torch.cuda.current_stream(self._device))
+
+            def _complete() -> None:
+                try:
+                    self._readback_event.synchronize()
+                    self.fill(runs, graph=True)
+                except BaseException:
+                    from freetoken.kernel import _ple_store
+
+                    _ple_store.signal_flag(self._flag.data_ptr())
+                    raise
+
+            if self._wait_sync:
+                return _complete
+            _complete()
+            return None
         self.fill(runs, graph=False)
         return None
 

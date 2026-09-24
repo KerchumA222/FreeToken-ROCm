@@ -88,6 +88,9 @@ class QSASparseMetadata(BaseAttnMetadata):
     cmp_rows:         torch.Tensor | None = None  # [T] int32, compressed slab destination
     ring_rows:        torch.Tensor | None = None  # [T] int32, flat ring row or -1
     positions:        torch.Tensor | None = None  # [T] int32, logical query positions
+    # Uniform speculative verify (every request R rows). The rows still run as one ragged
+    # extend -- the name is the graph runner's gate for a capturable verify.
+    rows_as_decode:   bool = False
     # fmt: on
 
     def get_last_indices(self, bs: int) -> torch.Tensor:
@@ -191,6 +194,9 @@ class QSASparseAttnBackend(BaseAttnBackend):
             kv_len_cpu=kv_len,
         )
         batch.attn_metadata = md
+        md.rows_as_decode = bool(
+            getattr(batch, "is_spec_verify", False) and getattr(batch, "spec_uniform_rows", 0)
+        )
         if not is_decode:
             table_idx = torch.tensor([r.table_idx for r in reqs], **_CPU_PINNED)
             token_to_req = torch.repeat_interleave(
@@ -479,6 +485,9 @@ class QSASparseAttnBackend(BaseAttnBackend):
             "pooled": empty(max_bs, self.index_head_dim, dtype=self.dtype),
             "first_pos": empty(max_bs, dtype=torch.int32),
             "q_index": empty(max_bs, self.index_heads, self.index_head_dim, dtype=self.dtype),
+            # verify graphs: bs * R rows; decode's token_to_req/cu_seqlens stay arange
+            "v_token_to_req": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
+            "v_cu_seqlens": torch.zeros(max_bs + 1, dtype=torch.int32, device=self.device),
         }
         if topk_scratch:
             self._graph["topk_scratch"] = empty(chunk, topk_scratch, dtype=torch.int32)
@@ -498,6 +507,51 @@ class QSASparseAttnBackend(BaseAttnBackend):
         assert isinstance(md, QSASparseMetadata)
         assert batch.active_table_idx is not None, "decode batch is missing its page-table rows"
         self._stage_decode(md, batch.padded_size, batch.active_table_idx.to(torch.int64))
+
+    def _stage_verify(self, md: QSASparseMetadata, bs: int, rows: int) -> None:
+        """Copy an eagerly built verify metadata onto the static buffers a verify graph
+        reads, and point the metadata at them."""
+        g = self._graph
+        g["block_table"][:bs].copy_(md.block_table)
+        g["kvlen"][:bs].copy_(md.seq_lens)
+        g["table_idx"][:bs].copy_(md.ring_slots)
+        g["v_token_to_req"][:rows].copy_(md.token_to_req)
+        g["v_cu_seqlens"][: bs + 1].copy_(md.cu_seqlens)
+        md.block_table = g["block_table"][:bs]
+        md.seq_lens = g["kvlen"][:bs]
+        md.ring_slots = g["table_idx"][:bs]
+        md.token_to_req = g["v_token_to_req"][:rows]
+        md.cu_seqlens = g["v_cu_seqlens"][: bs + 1]
+
+    def prepare_for_capture_rows(self, batch: Batch, rows: int) -> None:
+        """Capture a uniform speculative verify: ``batch.size`` requests of
+        ``spec_uniform_rows`` rows, the same ragged extend the eager verify runs, on static
+        buffers."""
+        bs = batch.size
+        R = rows // bs
+        dummy = batch.padded_reqs[0]
+        qo = torch.arange(0, (bs + 1) * R, R, dtype=torch.int32)
+        kv_len = torch.full((bs,), dummy.device_len, dtype=torch.int32)
+        md = QSASparseMetadata(
+            is_decode=False,
+            last_indices=(qo[1:] - 1).to(self.device),
+            qo_indptr_cpu=qo.pin_memory(),
+            kv_len_cpu=kv_len.pin_memory(),
+            rows_as_decode=True,
+        )
+        table_idx = torch.full((bs,), dummy.table_idx, dtype=torch.int32, device=self.device)
+        md.ring_slots = table_idx
+        md.block_table = self._block_table(table_idx.to(torch.int64))
+        md.seq_lens = kv_len.to(self.device)
+        md.token_to_req = torch.arange(rows, dtype=torch.int32, device=self.device) // R
+        md.cu_seqlens = qo.to(self.device)
+        self._stage_verify(md, bs, rows)
+        batch.attn_metadata = md
+
+    def prepare_for_replay_rows(self, batch: Batch, rows: int) -> None:
+        md = batch.attn_metadata
+        assert isinstance(md, QSASparseMetadata) and md.rows_as_decode
+        self._stage_verify(md, batch.size, rows)
 
     def reset_capture(self) -> None:
         super().reset_capture()

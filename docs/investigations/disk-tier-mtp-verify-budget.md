@@ -1,7 +1,8 @@
 # MTP on the disk tier: per-row rollback and a verify expert budget (Qwen3.8-Flash-Next)
 
-**Status:** per-row rollback for qwen4_exp is on (a win). The verify budget
-(`FT_VERIFY_BUDGET`, off by default) loses at every budget tried. Measured 2026-09-24 on
+**Status:** per-row rollback and QSA verify graphs are on. MTP depth 1 runs +25% over
+plain decode. The verify budget (`FT_VERIFY_BUDGET`, off by default) loses at every budget
+tried. Measured 2026-09-24 on
 the RX 6800, `Qwen3.8-Flash-Next-IQ2_S-Q2SYM`, with the same disk-tier service as
 [disk-tier-expert-prefetch.md](disk-tier-expert-prefetch.md), MTP depth 1, symmetric
 Q2_0 sidecar `mtp-Qwen3.8-Flash-Next-IQ2XSQ2SYM.gguf`.
@@ -55,16 +56,35 @@ layer (row 0's own misses), and per-layer read time is dominated by round-trip l
 by the number of experts. Killing the draft throws away acceptance while keeping the
 ~50 ms verify overhead.
 
-That overhead most likely comes from QSA running verify eagerly. It has no
-`prepare_for_capture_rows`, so verify rows take the extend path outside a CUDA graph,
-while plain decode replays a graph. Not yet measured directly. QSA's extend path is also
-behind the small logit drift between MTP and plain decode on this model. The drift
-predates this work; `FT_SPEC_ROLLBACK=snapshot` shows the same drift: median 0.11,
-p99 1.44, max 2.5.
+The overhead was QSA running verify eagerly: it had no `prepare_for_capture_rows`, so
+verify rows took the ragged extend path outside a CUDA graph while plain decode replayed a
+graph.
+
+## Verify graphs for QSA
+
+QSA now captures a uniform verify (`prepare_for_capture_rows`/`prepare_for_replay_rows`).
+The captured forward runs the same ragged extend as the eager one, with its addressing
+restaged onto static buffers per replay. Two PLE pieces had to become capture-safe:
+
+- a uniform verify builds its `PLEMetadata` from the FLA metadata (no host staging, no
+  fresh mask) and caches its conv indices on the device;
+- the disk PLE backend stages a verify graph's tokens into the graph's pinned buffer,
+  ordered after the previous graph like decode.
+
+| MTP depth 1 | short tok/s | long tok/s |
+|---|---:|---:|
+| plain decode | 19.6 | 14.1 |
+| eager verify | 18.20 | 14.48 |
+| **graph verify** | **24.51** | **17.35** |
+
+Acceptance is unchanged (0.768 a round). The divergence harness gives the same drift
+against plain decode as eager verify, so capture changes nothing numerically. That drift
+(median 0.125, p99 1.93, max 3.3) comes from QSA's extend path selecting blocks slightly
+differently from its decode path. It predates this work: `FT_SPEC_ROLLBACK=snapshot`
+shows the same drift.
 
 ## Next
 
-QSA rows-as-decode support (`prepare_for_capture_rows`) would graph-capture verify and
-remove the extend/decode drift. With ~0.77 acceptance and a verify round near plain-decode
-cost, MTP could reach up to ~1.7x plain on the disk tier. That ceiling is optimistic: it
-assumes the draft's extra reads cost nothing.
+Depth 2 does not start on this model yet: the draft chain feeds the head its own narrow
+`[T, hidden]` output, where the head wants the wide `[T, hc*hidden]` residual. The chain
+also builds Triton metadata for each step, and the MTP layer here is QSA.

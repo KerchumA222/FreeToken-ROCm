@@ -348,6 +348,20 @@ def build_ple_metadata(
         )
 
     lens = [r.extend_len for r in reqs]
+    rows = getattr(batch, "spec_uniform_rows", 0)
+    if rows and getattr(batch, "is_spec_verify", False) and fla is not None:
+        # Uniform verify (eager or graph): every request continues its own state, so there
+        # is no fresh mask and nothing staged from the host -- capture-safe.
+        slots = fla.cache_indices.long()
+        return PLEMetadata(
+            input_ids=batch.input_ids,
+            cu_seqlens=fla.cu_seqlens,
+            seq_lens=(rows,) * slots.numel(),
+            ngram_context=context_pool.index_select(0, slots).long(),
+            state_slots=slots,
+            fresh_slots=None,
+            is_decode=False,
+        )
     if fla is not None and fla.has_initial_state is not None:
         cu = fla.cu_seqlens
         slots = fla.cache_indices.long()
@@ -368,6 +382,10 @@ def build_ple_metadata(
         fresh_slots=fresh,
         is_decode=batch.is_decode,
     )
+
+
+# (lens, state_len, device) -> _prefill_indices of a uniform verify; the model's PLE layers share state_len.
+_VERIFY_INDICES: dict = {}
 
 
 def _verify_context():
@@ -735,7 +753,22 @@ class PLELayer(BaseOP):
             spec[:num_reqs, step] = win.permute(1, 0, 2).to(spec.dtype)
 
     def _prefill_indices(self, lens: List[int], device: torch.device):
-        """Columns of the packed history: this forward's outputs, the state block, the next state block."""
+        """Columns of the packed history: this forward's outputs, the state block, the next state block.
+
+        Uniform verify shapes are cached on the device: a verify graph reads them, so they
+        must outlive the capture (and not be a pinned H2D recorded into it)."""
+        key = (tuple(lens), self.state_len, device)
+        cached = _VERIFY_INDICES.get(key)
+        if cached is not None:
+            return cached
+        batch, _ = _verify_context()
+        uniform = bool(getattr(batch, "spec_uniform_rows", 0) and getattr(batch, "is_spec_verify", False))
+        out = self._build_prefill_indices(lens, device)
+        if uniform:
+            _VERIFY_INDICES[key] = out
+        return out
+
+    def _build_prefill_indices(self, lens: List[int], device: torch.device):
         state_len = self.state_len
         counts = torch.tensor(lens, dtype=torch.int64)
         cu = torch.cat([counts.new_zeros(1), counts.cumsum(0)])
