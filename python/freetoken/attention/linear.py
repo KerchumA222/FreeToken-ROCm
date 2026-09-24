@@ -78,7 +78,10 @@ def build_fla_metadata(batch: "Batch", device: torch.device) -> FLAMetadata:
     fresh = [gdn_slot(r) for r in reqs if r.cached_len == 0]
     fresh_host = torch.tensor(fresh, dtype=torch.int64, **pin) if fresh else None
 
-    track = _build_track_metadata(reqs, cu_host, device, pin)
+    # A verify batch extends by a handful of rows and never crosses a snapshot boundary.
+    track = (_build_track_metadata(reqs, cu_host, device, pin) if not batch.is_spec_verify
+             else dict(track_dst=None, track_h_row=None, track_conv_src=None,
+                       track_boundary_row=None))
 
     return FLAMetadata(
         cu_seqlens=cu_host.to(device, non_blocking=True),

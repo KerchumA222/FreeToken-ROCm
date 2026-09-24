@@ -523,7 +523,7 @@ def causal_conv1d_varlen(
 
 
 def causal_conv1d_decode(
-    x: torch.Tensor,                # [batch, conv_dim]
+    x: torch.Tensor,                # [batch, conv_dim], or [batch, conv_dim, seqlen] (may be strided)
     conv_state: torch.Tensor,       # [num_slots, conv_dim, state_len>=kernel-1] (in place)
     weight: torch.Tensor,           # [conv_dim, kernel]
     conv_state_indices: torch.Tensor,  # [batch] int32
@@ -534,7 +534,9 @@ def causal_conv1d_decode(
     if isinstance(activation, bool):
         activation = "silu" if activation else None
 
-    x = x.unsqueeze(-1)  # [batch, dim, 1]
+    multi = x.dim() == 3
+    if not multi:
+        x = x.unsqueeze(-1)  # [batch, dim, 1]
     batch, dim, seqlen = x.shape
     _, width = weight.shape
     assert 2 <= width <= 4, f"causal_conv1d triton fallback supports width 2..4, got {width}"
@@ -589,7 +591,7 @@ def causal_conv1d_decode(
         num_warps=4,
         num_stages=2,
     )
-    return out.squeeze(-1)
+    return out if multi else out.squeeze(-1)
 
 
 # ---------------------------------------------------------------------------

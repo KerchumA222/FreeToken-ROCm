@@ -45,6 +45,7 @@ logger = init_logger(__name__)
 # position. A mismatch under this means some state the verify forward advanced is not
 # being rolled back, which isolates rollback bugs from draft quality.
 import os as _os
+import time
 
 # Consecutive rejections after which a request stops speculating for a step. Guards
 # against a request whose draft never verifies spinning on zero-progress rounds.
@@ -476,7 +477,13 @@ class Scheduler(SchedulerIOMixin):
         pool: weights + KV + MoE cache + graphs). 0 on CPU. Cheap, no device sync."""
         if self.device.type != "cuda":
             return 0
-        return torch.cuda.memory_reserved(self.device)
+        # memory_reserved() builds torch's whole allocator stats dict (~0.2 ms); the reply
+        # stamp only needs it to be recent, not per decode step.
+        now = time.monotonic()
+        cached = getattr(self, "_gpu_mem_cache", None)
+        if cached is None or now - cached[0] > 0.5:
+            cached = self._gpu_mem_cache = (now, torch.cuda.memory_reserved(self.device))
+        return cached[1]
 
     def _process_one_msg(self, msg: BaseBackendMsg) -> None:
         if isinstance(msg, BatchBackendMsg):

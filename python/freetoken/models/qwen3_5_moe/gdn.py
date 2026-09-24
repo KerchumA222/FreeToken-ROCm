@@ -152,15 +152,20 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         can roll back to its last accepted row (``LinearStatePool.restore_spec``)."""
         from .gdn_kernels import gdn_verify_fla
 
+        from freetoken.kernel.triton.causal_conv1d_triton import causal_conv1d_decode
+
         idx = fla.cache_indices
-        conv_rows = conv_in.view(n, rows, self.conv_dim)
         conv_state = pool.conv_states[li]
-        mixed_rows = []
-        for s in range(rows):
-            mixed_rows.append(self._conv_decode(conv_rows[:, s].contiguous(), idx, pool))
-            if s < rows - 1:
-                pool.spec_conv[li, :n, s].copy_(conv_state.index_select(0, idx.long()))
-        mixed = torch.stack(mixed_rows, dim=1).reshape(n * rows, self.conv_dim)
+        # [n, conv_dim, rows] view of the verify rows: one conv update over each request's
+        # rows, strided rather than copied.
+        x = conv_in.view(n, rows, self.conv_dim).transpose(1, 2)
+        prior = conv_state.index_select(0, idx.long())      # window before this verify
+        out = causal_conv1d_decode(x, conv_state, self._conv_weight(), idx)
+        # The window after row s: the prior window shifted left by s + 1, then rows 0..s.
+        km1 = prior.shape[-1]
+        for s in range(rows - 1):
+            pool.spec_conv[li, :n, s] = torch.cat([prior, x[..., : s + 1]], dim=-1)[..., -km1:]
+        mixed = out.transpose(1, 2).reshape(n * rows, self.conv_dim)
         total = n * rows
         qf, kf, vf = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
         q = qf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)
