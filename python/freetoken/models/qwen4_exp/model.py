@@ -15,6 +15,8 @@ immediate combine::
 
 from __future__ import annotations
 
+import os
+
 from typing import TYPE_CHECKING, List
 
 import torch
@@ -87,6 +89,31 @@ class Qwen4ExpDecoderLayer(BaseOP):
         return self.mlp_hyper_connection.combine(hidden, self.mlp.forward(block_input), inject)
 
 
+def _wire_expert_lookahead(layers) -> None:
+    """FT_PREFETCH=<layers ahead>,<experts>[,<min router prob>]: give each MoE block the router ``d`` layers
+    ahead, so it can predict that layer's experts from its own input and start their
+    disk reads early (disk-tier offload only). Routing measured on Qwen3.8-Flash-Next:
+    a router applied 1-2 layers early recalls 75-89% of the next token's newly needed
+    experts at 20-30 predictions (docs/investigations/route_prediction.py)."""
+    spec = os.environ.get("FT_PREFETCH", "")
+    if not spec:
+        return
+    parts = spec.split(",")
+    d, k = int(parts[0]), int(parts[1])
+    p_min = float(parts[2]) if len(parts) > 2 else 0.0
+    for i, layer in enumerate(layers):
+        if i + d < len(layers):
+            layer.mlp._lookahead = _Lookahead(i + d, layers[i + d].mlp, k, p_min)
+
+
+class _Lookahead:
+    """A plain holder (not a tuple, list or op) so module walkers -- the offload-cache
+    attach, finalize, state dicts -- do not descend into another layer's block."""
+
+    def __init__(self, target: int, block, k: int, p_min: float = 0.0) -> None:
+        self.target, self.block, self.k, self.p_min = target, block, k, p_min
+
+
 class Qwen4ExpModel(BaseOP):
     def __init__(self, config: ModelConfig, *, prefix: str = "model") -> None:
         self.hc_count = config.qwen4_args.hc_count
@@ -118,6 +145,7 @@ class Qwen4ExpModel(BaseOP):
         self.hyper_connection_mixer = GatedResidual(config, use_combine=False, prefix=f"{prefix}.hyper_connection_mixer")
         # plain tuple (not an OP child), so it never shows up in the state dict
         self._ple = tuple(layer.ple for layer in self.layers.op_list if layer.ple is not None)
+        _wire_expert_lookahead(self.layers.op_list)
 
     @property
     def ple_layers(self) -> List[PLELayer]:

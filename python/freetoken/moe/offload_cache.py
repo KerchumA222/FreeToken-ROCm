@@ -1179,6 +1179,24 @@ class OffloadMoeCache:
         if self.host_tier is not None:
             self._admit_to_host_tier(layer_id)
 
+    # Width of the per-layer staging for predicted experts (lookahead prefetch).
+    PREFETCH_MAX = 64
+
+    def stage_prefetch(self, layer_id: int, target_layer: int, expert_ids: torch.Tensor) -> None:
+        """Predicted experts of ``target_layer`` (int32 on the device, -1 = skip), to start
+        reading into the host tier during ``layer_id``'s admission, ahead of the layer
+        that will ask for them. Staged by the MoE block before its experts run."""
+        if self.host_tier is None:
+            return
+        n = min(int(expert_ids.numel()), self.PREFETCH_MAX)
+        if not hasattr(self, "_prefetch_stage"):
+            self._prefetch_stage = {}
+        self._prefetch_stage[layer_id] = (target_layer, expert_ids.reshape(-1)[:n], n)
+
+    def _take_prefetch(self, layer_id: int):
+        stage = getattr(self, "_prefetch_stage", None)
+        return stage.pop(layer_id, None) if stage else None
+
     def _admit_to_host_tier(self, layer_id: int) -> None:
         """Make this step's GPU misses resident in the host pool and rewrite
         ``src_indices`` from expert rows to the host slots holding them.
@@ -1199,12 +1217,17 @@ class OffloadMoeCache:
         # first would cost.
         n_host.copy_(self.num_indices, non_blocking=True)
         src_host.copy_(self.src_indices, non_blocking=True)
+        pf = self._take_prefetch(layer_id)
         event.record()
         event.synchronize()
         n = int(n_host[0])
+        current = src_host[:n].tolist() if n > 0 else []
+        if pf is not None:
+            target, ids, k = pf
+            self.host_tier.prefetch(target, ids.tolist(), keep=[(layer_id, e) for e in current])
         if n <= 0:
             return
-        slots = self.host_tier.ensure(layer_id, src_host[:n].tolist())
+        slots = self.host_tier.ensure(layer_id, current)
         out_host[:n] = torch.as_tensor(slots, dtype=out_host.dtype)
         self.src_indices[:n].copy_(out_host[:n], non_blocking=True)
 
@@ -1236,6 +1259,7 @@ class OffloadMoeCache:
                 "n": alloc_pinned_tensor(1, dtype=torch.int64),
                 "src": alloc_pinned_tensor(width, dtype=torch.int32),
                 "out": alloc_pinned_tensor(width, dtype=torch.int32),
+                "pf": alloc_pinned_tensor(self.PREFETCH_MAX, dtype=torch.int32),
             }
             for t in bufs.values():
                 t.zero_()
@@ -1252,8 +1276,16 @@ class OffloadMoeCache:
                 # inference-mode context. Its pinned buffers were created there.
                 with torch.inference_mode():
                     n = int(bufs["n"][0])
+                    current = bufs["src"][:n].tolist() if n > 0 else []
+                    target = bufs.get("pf_target")
+                    if target is not None:
+                        # Start the predicted reads first: they overlap this layer's own.
+                        self.host_tier.prefetch(
+                            target, bufs["pf"][: bufs["pf_n"]].tolist(),
+                            keep=[(layer_id, e) for e in current],
+                        )
                     if n > 0:
-                        slots = self.host_tier.ensure(layer_id, bufs["src"][:n].tolist())
+                        slots = self.host_tier.ensure(layer_id, current)
                         bufs["out"][:n] = torch.as_tensor(slots, dtype=torch.int32)
             except BaseException as exc:  # never unwind into the driver
                 if self._admit_error is None:
@@ -1283,6 +1315,12 @@ class OffloadMoeCache:
         stream = torch.cuda.current_stream().cuda_stream
         b["n"].copy_(self.num_indices, non_blocking=True)
         b["src"].copy_(self.src_indices, non_blocking=True)
+        pf = self._take_prefetch(layer_id)
+        if pf is not None:
+            # The target layer and count are fixed per captured graph; the ids are not.
+            target, ids, k = pf
+            b["pf"][:k].copy_(ids, non_blocking=True)
+            b["pf_target"], b["pf_n"] = target, k
         graph_host.launch_host_func(stream, b["cb"])
         self.src_indices.copy_(b["out"], non_blocking=True)
         if layer_id not in self._admit_order:

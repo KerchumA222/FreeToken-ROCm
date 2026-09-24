@@ -42,6 +42,7 @@ pool size. A device-side host tier should use CLOCK.
 from __future__ import annotations
 
 import os
+import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -65,6 +66,10 @@ class HostTierStats:
     reads: int = 0
     stalled_ensures: int = 0
     ensures: int = 0
+    read_seconds: float = 0.0
+    prefetched: int = 0          # reads issued ahead of their layer
+    prefetch_used: int = 0       # of those, found by the layer's ensure
+    prefetch_wait_seconds: float = 0.0
 
     def as_dict(self) -> dict[str, float]:
         touched = self.hits + self.misses
@@ -119,6 +124,14 @@ class HostExpertCache:
         self._free: list[int] = list(range(self.capacity))
         self._id_of_slot: list[int] = [MISS] * self.capacity
         self._pool = ThreadPoolExecutor(max_workers=max(1, workers)) if workers > 1 else None
+        # Prefetches still in flight or not yet claimed: flat id -> (slot, futures, clock
+        # at issue). Their slots are in neither the LRU nor the free list, so nothing can
+        # evict a row a read is still writing.
+        self._inflight: dict[int, tuple[int, list, int]] = {}
+        # Prefetches whose layer has already been ensured without using them: returned
+        # to the LRU (cold end) as soon as their reads finish.
+        self._stale: set[int] = set()
+        self._clock = 0
 
     # ---- lookup ---------------------------------------------------------------
 
@@ -157,12 +170,15 @@ class HostExpertCache:
         """
         ids = [int(e) for e in expert_ids]
         self.stats.ensures += 1
+        self._clock += 1
         slots: list[int] = []
         protected: set[int] = set()
         missing: list[tuple[int, int]] = []           # (position, expert)
 
         for pos, e in enumerate(ids):
             fid = self._fid(layer, e)
+            if fid in self._inflight:
+                self._land_prefetch(fid, wait=True)
             slot = self._lru.get(fid, MISS)
             if slot != MISS:
                 self._lru.move_to_end(fid)
@@ -174,6 +190,7 @@ class HostExpertCache:
                 slots.append(MISS)
                 missing.append((pos, e))
 
+        self._retire_layer_prefetches(layer)
         if not missing:
             return slots
 
@@ -195,11 +212,13 @@ class HostExpertCache:
             expert, slot, name = job
             self.store.read_expert(name, layer, expert, self.banks[name][slot].numpy())
 
+        t0 = time.perf_counter()
         if self._pool is not None and len(jobs) > 1:
             list(self._pool.map(fill, jobs))
         else:
             for job in jobs:
                 fill(job)
+        self.stats.read_seconds += time.perf_counter() - t0
 
         for pos, e, slot in claims:
             fid = self._fid(layer, e)
@@ -207,7 +226,88 @@ class HostExpertCache:
             self._id_of_slot[slot] = fid
             slots[pos] = slot
             self.stats.reads += len(self.banks)
+        self._maybe_log_stats()
         return slots
+
+    # ---- prefetch --------------------------------------------------------------
+
+    def prefetch(self, layer: int, expert_ids: Iterable[int], *,
+                 keep: Iterable[tuple[int, int]] = ()) -> None:
+        """Start reading these experts into the pool without waiting.
+
+        For routing predicted ahead of its layer: the layer's own ``ensure`` then waits
+        only for whatever of its reads is still in flight instead of issuing them.
+        Experts already resident or in flight are skipped. Slots of predictions that
+        are never used age back into the LRU cold end (``_sweep_prefetches``)."""
+        if self._pool is None:
+            return
+        self._sweep_prefetches()
+        # (layer, expert) pairs an ensure is about to use: never evicted for a guess.
+        protected = {self._lru[f] for f in (self._fid(l, x) for l, x in keep) if f in self._lru}
+        for e in expert_ids:
+            e = int(e)
+            if e < 0:
+                continue
+            fid = self._fid(layer, e)
+            if fid in self._lru or fid in self._inflight:
+                continue
+            if len(self._inflight) >= max(2, self.capacity // 4):
+                return                      # never let guesses crowd out the pool
+            try:
+                slot = self._claim_slot(protected)
+            except RuntimeError:
+                return                      # nothing evictable: skip the guess, not the step
+            futs = [self._pool.submit(self.store.read_expert, name, layer, e,
+                                      self.banks[name][slot].numpy())
+                    for name in self.banks]
+            self._inflight[fid] = (slot, futs, self._clock)
+            self.stats.prefetched += 1
+
+    def _retire_layer_prefetches(self, layer: int) -> None:
+        """This layer's ensure has run: predictions for it that it did not use are wrong,
+        and give their slots back once their reads finish."""
+        lo, hi = layer * self.num_experts, (layer + 1) * self.num_experts
+        self._stale.update(f for f in self._inflight if lo <= f < hi)
+
+    def _land_prefetch(self, fid: int, *, wait: bool, cold: bool = False) -> bool:
+        slot, futs, _ = self._inflight[fid]
+        if not wait and not all(f.done() for f in futs):
+            return False
+        t0 = time.perf_counter()
+        for f in futs:
+            f.result()
+        if wait:
+            self.stats.prefetch_wait_seconds += time.perf_counter() - t0
+            self.stats.prefetch_used += 1
+        del self._inflight[fid]
+        self._stale.discard(fid)
+        self._lru[fid] = slot
+        if cold:
+            self._lru.move_to_end(fid, last=False)
+        self._id_of_slot[slot] = fid
+        return True
+
+    def _sweep_prefetches(self) -> None:
+        """Give finished wrong predictions back to the LRU, at its cold end, so a miss
+        costs a slot only until its read completes."""
+        # A layer with no GPU misses never calls ensure, so age out its guesses too.
+        self._stale.update(f for f, (_s, _f, t) in self._inflight.items() if self._clock - t > 96)
+        for fid in list(self._stale):
+            self._land_prefetch(fid, wait=False, cold=True)
+
+    def _maybe_log_stats(self) -> None:
+        """FT_TIER_STATS=<ensures>: log and reset the counters every that many ensures."""
+        every = int(os.environ.get("FT_TIER_STATS", "0") or 0)
+        if every and self.stats.ensures >= every:
+            s = self.stats
+            logger.info(
+                f"host tier: {s.ensures} ensures, {s.stalled_ensures} stalled "
+                f"({s.stalled_ensures / s.ensures:.1%}), {s.misses} expert misses of "
+                f"{s.hits + s.misses}, {s.read_seconds:.3f} s in disk reads; "
+                f"prefetched {s.prefetched}, used {s.prefetch_used}, "
+                f"{s.prefetch_wait_seconds:.3f} s waiting on them"
+            )
+            self.stats = HostTierStats()
 
     def read_into(self, layer: int, experts: Sequence[int], dst: dict) -> None:
         """Read these experts straight into ``dst[bank][i]``, bypassing the pool.
@@ -302,6 +402,10 @@ class HostExpertCache:
     # ---- lifecycle ------------------------------------------------------------
 
     def reset(self) -> None:
+        for _slot, futs, _t in self._inflight.values():
+            for f in futs:
+                f.result()
+        self._inflight.clear()
         self._lru.clear()
         self._free = list(range(self.capacity))
         self._id_of_slot = [MISS] * self.capacity

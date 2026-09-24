@@ -7,6 +7,7 @@ it took to get there.
 from __future__ import annotations
 
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pytest
@@ -362,3 +363,46 @@ def test_cpu_native_row_bound_uses_host_capacity_but_keeps_logical_experts():
 
     assert cache.num_experts == 128
     assert _native_num_experts(cache) == 7
+
+
+def test_prefetched_experts_serve_correct_bytes_without_a_second_read(store, expected_expert):
+    with HostExpertCache(store, E, capacity=E * L, pin=False, workers=4) as c:
+        c.prefetch(1, [0, 2])
+        reads_before = c.stats.reads
+        slots = c.ensure(1, [0, 2])
+        _check(c, expected_expert, 1, [0, 2], slots)
+        assert c.stats.prefetched == 2 and c.stats.prefetch_used == 2
+        assert c.stats.reads == reads_before and c.stats.stalled_ensures == 0
+
+
+def test_prefetch_never_evicts_what_the_same_step_ensures(store, expected_expert):
+    with HostExpertCache(store, E, capacity=2, pin=False, workers=4) as c:
+        c.ensure(0, [0, 1])
+        c.prefetch(1, [3], keep=[(0, 0), (0, 1)])   # no evictable slot left for the guess
+        assert c.stats.prefetched == 0
+        c.prefetch(1, [3], keep=[(0, 1)])
+        assert c.stats.prefetched == 1
+        _check(c, expected_expert, 0, [1], c.ensure(0, [1]))
+
+
+def test_unused_prefetches_return_to_the_lru(store):
+    with HostExpertCache(store, E, capacity=4, pin=False, workers=4) as c:
+        c.prefetch(0, [1, 2])
+        for _ in range(200):                      # well past the sweep horizon
+            c.ensure(1, [0])
+        c.prefetch(1, [])                         # sweeps
+        assert not c._inflight and c.resident == 3
+
+
+def test_wrong_predictions_do_not_accumulate(store):
+    """Guesses a layer's ensure did not use return to the pool once their reads finish,
+    so a stream of wrong predictions cannot pin every slot."""
+    with HostExpertCache(store, E, capacity=8, pin=False, workers=4) as c:
+        for step in range(50):
+            layer = step % L
+            c.prefetch((layer + 1) % L, range(E))
+            c.ensure(layer, [0])
+        c._pool.shutdown(wait=True)
+        c._pool = ThreadPoolExecutor(max_workers=4)
+        c.prefetch(0, [])                 # sweep now that every read has finished
+        assert len(c._inflight) <= 2
