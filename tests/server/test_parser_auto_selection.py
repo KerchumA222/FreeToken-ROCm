@@ -94,3 +94,55 @@ def test_an_explicit_choice_beats_inference():
         pinned, _ = parse_args(["--model", ANON_PATH, "--reasoning-parser", "qwen3"])
     assert off.reasoning_parser is None
     assert pinned.reasoning_parser == "qwen3"
+
+
+def test_hybrid_fetch_policy_flags_plumb_into_server_args():
+    args, _ = parse_args([
+        "--model", ANON_PATH,
+        "--dtype", "float16",
+        "--moe-hybrid-fetch-policy", "frequency",
+        "--moe-hybrid-frequency-warmup", "17",
+    ])
+    assert args.moe_hybrid_fetch_policy == "frequency"
+    assert args.moe_hybrid_frequency_warmup == 17
+
+
+def test_speculative_draft_flags_plumb_into_server_args():
+    args, _ = parse_args([
+        "--model", ANON_PATH,
+        "--dtype", "float16",
+        "--speculative-draft-tokens", "1",
+        "--speculative-draft-path", "/models/mtp.gguf",
+    ])
+    assert args.speculative_draft_tokens == 1
+    assert args.speculative_draft_path == "/models/mtp.gguf"
+
+
+def test_hybrid_frequency_warmup_must_be_positive():
+    with pytest.raises(SystemExit):
+        parse_args([
+            "--model", ANON_PATH,
+            "--dtype", "float16",
+            "--moe-hybrid-frequency-warmup", "0",
+        ])
+
+
+def test_global_frequency_cache_flags_plumb_and_validate():
+    args, _ = parse_args([
+        "--model", ANON_PATH,
+        "--dtype", "float16",
+        "--moe-cache-policy", "frequency",
+        "--moe-cache-frequency-warmup", "17",
+        "--moe-cache-frequency-protect-fraction", "0.4",
+    ])
+    assert args.moe_cache_policy == "frequency"
+    assert args.moe_cache_frequency_warmup == 17
+    assert args.moe_cache_frequency_protect_fraction == pytest.approx(0.4)
+
+    for value in ("-0.1", "1", "nan", "inf"):
+        with pytest.raises(SystemExit):
+            parse_args([
+                "--model", ANON_PATH,
+                "--dtype", "float16",
+                "--moe-cache-frequency-protect-fraction", value,
+            ])

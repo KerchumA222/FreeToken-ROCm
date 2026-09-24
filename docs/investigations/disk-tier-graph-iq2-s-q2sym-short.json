@@ -1,0 +1,156 @@
+{
+  "mode": "graph",
+  "recorded_at_utc": "2026-09-18T18:26:26.535399+00:00",
+  "endpoint": "http://127.0.0.1:8199/v1/completions",
+  "request": {
+    "model": "Qwen3.8-Flash-Next-IQ2_S-Q2SYM-00001-of-00006.gguf",
+    "prompt": "The capital of France is a city with museums, historic landmarks, and a river running through it. Explain the main attractions in one sentence.",
+    "max_tokens": 48,
+    "temperature": 0,
+    "ignore_eos": true,
+    "stream": true,
+    "stream_options": {
+      "include_usage": true
+    }
+  },
+  "warmup_count": 4,
+  "measured_count": 7,
+  "throughput_method": "(completion_tokens - 1) / (last_text_time - first_text_time); iter_lines(chunk_size=1)",
+  "measured_median_tok_s": 18.345615552694284,
+  "measured_min_tok_s": 18.30448175117952,
+  "measured_max_tok_s": 18.393696936125817,
+  "records": [
+    {
+      "completion_tokens": 47,
+      "decode_seconds_first_text_to_last_text": 4.194421018008143,
+      "decode_tokens_after_first_per_second": 10.966948668840258,
+      "first_text_seconds_from_request": 1.6232079251203686,
+      "done_seconds_from_request": 5.818345449166372,
+      "text_sha256": "cd5210126536878c8d44b369fd436f90acc03cee8483cf7b5f96fdb99a431275",
+      "text": "\n\n<think>\n\n</think>\n\nParis is the capital of France.<|endoftext|><|im_start|>user<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nParis is the capital of France, featuring iconic landmarks like the Eiffel Tower and the Louvre, situated along the",
+      "finish_reason": "length",
+      "index": 0,
+      "phase": "warmup"
+    },
+    {
+      "completion_tokens": 47,
+      "decode_seconds_first_text_to_last_text": 2.7650380621198565,
+      "decode_tokens_after_first_per_second": 16.63629901887623,
+      "first_text_seconds_from_request": 1.4165926098357886,
+      "done_seconds_from_request": 4.182671049842611,
+      "text_sha256": "cd5210126536878c8d44b369fd436f90acc03cee8483cf7b5f96fdb99a431275",
+      "text": "\n\n<think>\n\n</think>\n\nParis is the capital of France.<|endoftext|><|im_start|>user<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nParis is the capital of France, featuring iconic landmarks like the Eiffel Tower and the Louvre, situated along the",
+      "finish_reason": "length",
+      "index": 1,
+      "phase": "warmup"
+    },
+    {
+      "completion_tokens": 47,
+      "decode_seconds_first_text_to_last_text": 2.504592675017193,
+      "decode_tokens_after_first_per_second": 18.366259894808735,
+      "first_text_seconds_from_request": 1.2922676280140877,
+      "done_seconds_from_request": 3.797585655003786,
+      "text_sha256": "cd5210126536878c8d44b369fd436f90acc03cee8483cf7b5f96fdb99a431275",
+      "text": "\n\n<think>\n\n</think>\n\nParis is the capital of France.<|endoftext|><|im_start|>user<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nParis is the capital of France, featuring iconic landmarks like the Eiffel Tower and the Louvre, situated along the",
+      "finish_reason": "length",
+      "index": 2,
+      "phase": "warmup"
+    },
+    {
+      "completion_tokens": 47,
+      "decode_seconds_first_text_to_last_text": 2.5032443539239466,
+      "decode_tokens_after_first_per_second": 18.37615250300793,
+      "first_text_seconds_from_request": 1.284035786986351,
+      "done_seconds_from_request": 3.78797500487417,
+      "text_sha256": "cd5210126536878c8d44b369fd436f90acc03cee8483cf7b5f96fdb99a431275",
+      "text": "\n\n<think>\n\n</think>\n\nParis is the capital of France.<|endoftext|><|im_start|>user<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nParis is the capital of France, featuring iconic landmarks like the Eiffel Tower and the Louvre, situated along the",
+      "finish_reason": "length",
+      "index": 3,
+      "phase": "warmup"
+    },
+    {
+      "completion_tokens": 47,
+      "decode_seconds_first_text_to_last_text": 2.513045746134594,
+      "decode_tokens_after_first_per_second": 18.30448175117952,
+      "first_text_seconds_from_request": 1.33236478199251,
+      "done_seconds_from_request": 3.8462115731090307,
+      "text_sha256": "cd5210126536878c8d44b369fd436f90acc03cee8483cf7b5f96fdb99a431275",
+      "text": "\n\n<think>\n\n</think>\n\nParis is the capital of France.<|endoftext|><|im_start|>user<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nParis is the capital of France, featuring iconic landmarks like the Eiffel Tower and the Louvre, situated along the",
+      "finish_reason": "length",
+      "index": 4,
+      "phase": "measured"
+    },
+    {
+      "completion_tokens": 47,
+      "decode_seconds_first_text_to_last_text": 2.5033021138515323,
+      "decode_tokens_after_first_per_second": 18.375728500954,
+      "first_text_seconds_from_request": 1.2891073690261692,
+      "done_seconds_from_request": 3.793162267887965,
+      "text_sha256": "cd5210126536878c8d44b369fd436f90acc03cee8483cf7b5f96fdb99a431275",
+      "text": "\n\n<think>\n\n</think>\n\nParis is the capital of France.<|endoftext|><|im_start|>user<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nParis is the capital of France, featuring iconic landmarks like the Eiffel Tower and the Louvre, situated along the",
+      "finish_reason": "length",
+      "index": 5,
+      "phase": "measured"
+    },
+    {
+      "completion_tokens": 47,
+      "decode_seconds_first_text_to_last_text": 2.5008566880133003,
+      "decode_tokens_after_first_per_second": 18.393696936125817,
+      "first_text_seconds_from_request": 1.313203452853486,
+      "done_seconds_from_request": 3.8147372319363058,
+      "text_sha256": "cd5210126536878c8d44b369fd436f90acc03cee8483cf7b5f96fdb99a431275",
+      "text": "\n\n<think>\n\n</think>\n\nParis is the capital of France.<|endoftext|><|im_start|>user<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nParis is the capital of France, featuring iconic landmarks like the Eiffel Tower and the Louvre, situated along the",
+      "finish_reason": "length",
+      "index": 6,
+      "phase": "measured"
+    },
+    {
+      "completion_tokens": 47,
+      "decode_seconds_first_text_to_last_text": 2.5084703909233212,
+      "decode_tokens_after_first_per_second": 18.33786843426454,
+      "first_text_seconds_from_request": 1.2803268991410732,
+      "done_seconds_from_request": 3.7894731590058655,
+      "text_sha256": "cd5210126536878c8d44b369fd436f90acc03cee8483cf7b5f96fdb99a431275",
+      "text": "\n\n<think>\n\n</think>\n\nParis is the capital of France.<|endoftext|><|im_start|>user<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nParis is the capital of France, featuring iconic landmarks like the Eiffel Tower and the Louvre, situated along the",
+      "finish_reason": "length",
+      "index": 7,
+      "phase": "measured"
+    },
+    {
+      "completion_tokens": 47,
+      "decode_seconds_first_text_to_last_text": 2.50741109601222,
+      "decode_tokens_after_first_per_second": 18.345615552694284,
+      "first_text_seconds_from_request": 1.329277491895482,
+      "done_seconds_from_request": 3.837398522067815,
+      "text_sha256": "cd5210126536878c8d44b369fd436f90acc03cee8483cf7b5f96fdb99a431275",
+      "text": "\n\n<think>\n\n</think>\n\nParis is the capital of France.<|endoftext|><|im_start|>user<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nParis is the capital of France, featuring iconic landmarks like the Eiffel Tower and the Louvre, situated along the",
+      "finish_reason": "length",
+      "index": 8,
+      "phase": "measured"
+    },
+    {
+      "completion_tokens": 47,
+      "decode_seconds_first_text_to_last_text": 2.5060736059676856,
+      "decode_tokens_after_first_per_second": 18.355406597180828,
+      "first_text_seconds_from_request": 1.2878562428522855,
+      "done_seconds_from_request": 3.794612840982154,
+      "text_sha256": "cd5210126536878c8d44b369fd436f90acc03cee8483cf7b5f96fdb99a431275",
+      "text": "\n\n<think>\n\n</think>\n\nParis is the capital of France.<|endoftext|><|im_start|>user<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nParis is the capital of France, featuring iconic landmarks like the Eiffel Tower and the Louvre, situated along the",
+      "finish_reason": "length",
+      "index": 9,
+      "phase": "measured"
+    },
+    {
+      "completion_tokens": 47,
+      "decode_seconds_first_text_to_last_text": 2.507586878957227,
+      "decode_tokens_after_first_per_second": 18.34432951696133,
+      "first_text_seconds_from_request": 1.2909071650356054,
+      "done_seconds_from_request": 3.799211452016607,
+      "text_sha256": "cd5210126536878c8d44b369fd436f90acc03cee8483cf7b5f96fdb99a431275",
+      "text": "\n\n<think>\n\n</think>\n\nParis is the capital of France.<|endoftext|><|im_start|>user<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nParis is the capital of France, featuring iconic landmarks like the Eiffel Tower and the Louvre, situated along the",
+      "finish_reason": "length",
+      "index": 10,
+      "phase": "measured"
+    }
+  ]
+}

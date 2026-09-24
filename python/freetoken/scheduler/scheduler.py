@@ -338,6 +338,12 @@ class Scheduler(SchedulerIOMixin):
                 row_offsets.append(off)
                 off += r.extend_len
         copy_done.synchronize()
+        # Graph host nodes swallow exceptions and park them on the cache. Check only
+        # after this batch's copies complete, before committing tokens or cache state.
+        engine = getattr(self, "engine", None)
+        moe_offload_cache = getattr(engine, "moe_offload_cache", None)
+        if moe_offload_cache is not None:
+            moe_offload_cache.raise_admission_error()
         reply: List[DetokenizeMsg] = []
         new_finished_reqs: Set[Req] = set()
         with self.cache_manager.lazy_free_region():

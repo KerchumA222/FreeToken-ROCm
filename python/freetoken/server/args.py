@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import argparse
+import math
 import os
 import re
 from dataclasses import dataclass
@@ -157,6 +158,15 @@ def parse_args(
             raise argparse.ArgumentTypeError("must be in [0, 1]")
         return rate
 
+    def _parse_moe_cache_protect_fraction(value: str) -> float:
+        try:
+            fraction = float(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError("must be a number in [0, 1)") from exc
+        if not math.isfinite(fraction) or not 0 <= fraction < 1:
+            raise argparse.ArgumentTypeError("must be finite and in [0, 1)")
+        return fraction
+
     def _positive_int(value: str) -> int:
         try:
             n = int(value)
@@ -310,6 +320,23 @@ def parse_args(
         type=int,
         default=ServerArgs.max_seq_len_override,
         help="The maximum sequence length override.",
+    )
+
+    parser.add_argument(
+        "--speculative-draft-tokens",
+        type=int,
+        default=ServerArgs.speculative_draft_tokens,
+        help=(
+            "Number of tokens proposed by the checkpoint's MTP draft head per "
+            "speculative step. 0 disables speculative decoding."
+        ),
+    )
+
+    parser.add_argument(
+        "--speculative-draft-path",
+        type=str,
+        default=ServerArgs.speculative_draft_path,
+        help="Path to a separate checkpoint containing the MTP draft head.",
     )
 
     parser.add_argument(
@@ -616,10 +643,30 @@ def parse_args(
     parser.add_argument(
         "--moe-cache-policy",
         default=ServerArgs.moe_cache_policy,
-        choices=["lru"],
-        help="The unified MoE cache eviction policy.",
+        choices=["lru", "frequency"],
+        help=(
+            "The unified MoE cache eviction policy: lru (default), or frequency to "
+            "protect the most frequently routed experts after warmup."
+        ),
     )
-
+    parser.add_argument(
+        "--moe-cache-frequency-warmup",
+        type=_positive_int,
+        default=ServerArgs.moe_cache_frequency_warmup,
+        help=(
+            "Number of calls per MoE layer used to learn the frequency policy before "
+            "the protected set is frozen (default: 128)."
+        ),
+    )
+    parser.add_argument(
+        "--moe-cache-frequency-protect-fraction",
+        type=_parse_moe_cache_protect_fraction,
+        default=ServerArgs.moe_cache_frequency_protect_fraction,
+        help=(
+            "Fraction of the GPU MoE slots to reserve for frequency-ranked experts "
+            "(default: 0.25; must be in [0, 1))."
+        ),
+    )
     # Sizes the *host* tier. Deliberately outside moe_cache_group, which is a
     # mutually exclusive set of three ways to size the GPU tier -- this composes with
     # any of them rather than replacing them.
@@ -670,6 +717,27 @@ def parse_args(
             "-1 (default) = auto: fetch the benched pcie/cpu bandwidth fraction of each "
             "step's misses (perfect overlap; needs an `ft bench bw` profile, else 1). "
             "0 = never fetch (all misses on CPU); large = behaves like plain offload."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-hybrid-fetch-policy",
+        default=ServerArgs.moe_hybrid_fetch_policy,
+        choices=["recency", "frequency", "lowest_id"],
+        help=(
+            "For --moe-strategy hybrid, which capped misses to fetch over PCIe: "
+            "recency (default), frequency (learn the most routed experts during "
+            "the warmup), or lowest_id (routing-blind baseline)."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-hybrid-frequency-warmup",
+        type=_positive_int,
+        default=ServerArgs.moe_hybrid_frequency_warmup,
+        help=(
+            "Number of calls per MoE layer used to learn the frequency policy before "
+            "the learned ranking is frozen (default: 128)."
         ),
     )
 
@@ -759,6 +827,8 @@ def parse_args(
 
     if kwargs["model_path"].startswith("~"):
         kwargs["model_path"] = os.path.expanduser(kwargs["model_path"])
+    if kwargs["speculative_draft_path"] and kwargs["speculative_draft_path"].startswith("~"):
+        kwargs["speculative_draft_path"] = os.path.expanduser(kwargs["speculative_draft_path"])
 
     if kwargs["served_model_name"] is None:
         kwargs["served_model_name"] = (
@@ -833,5 +903,3 @@ def parse_args(
     result = ServerArgs(**kwargs)
     logger.info(f"Parsed arguments:\n{result}")
     return result, run_shell
-
-

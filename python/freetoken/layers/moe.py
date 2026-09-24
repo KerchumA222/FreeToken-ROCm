@@ -437,9 +437,12 @@ class OffloadMoELayer(MoELayer):
         """Hybrid decode: GPU computes cache hits + <=K freshly-fetched experts, the CPU
         computes the overflow misses, overlapped, then the partials merge.
 
-        The CPU pool is kicked off (``decode_submit``) before the GPU PCIe fetch + GEMM so
-        the CPU overflow GEMV runs concurrently with the GPU work. Capture-safe: the
-        routing split is device-side elementwise and the CPU submit/sync are host nodes.
+        The resident/full-bank path kicks off the CPU pool (``decode_submit``) before the
+        GPU PCIe fetch + GEMM so the CPU overflow GEMV runs concurrently with the GPU
+        work. A bounded host tier admits CPU routes from a stream host callback; its
+        callback may evict slots, so its GPU copy is queued first on the same stream.
+        Capture-safe: the routing split is device-side elementwise and the CPU
+        submit/sync are host nodes.
         Each route is computed exactly once -- the GPU weights are zeroed for CPU-assigned
         routes and the CPU ids are -1 for GPU-assigned routes (the C++ kernel skips id<0).
         """
@@ -452,6 +455,11 @@ class OffloadMoELayer(MoELayer):
         on_gpu = topk_ids >= 0
 
         cpu_ids = torch.where(on_gpu, raw.new_full((), -1), raw).contiguous()
+        if cache.host_tier is not None:
+            # The CPU submit callback admits its routes into the bounded host tier and
+            # may evict slots. Queue the GPU copy first so the callback is ordered after
+            # all weight reads from those slots on this stream.
+            cache.copy_missing()
         pending = executor.decode_submit(self.layer_id, hidden_states, topk_weights, cpu_ids)
 
         # Measurement knob: FREETOKEN_HYBRID_OVERLAP=0 syncs the CPU pool *before* the
@@ -460,7 +468,8 @@ class OffloadMoELayer(MoELayer):
             executor.decode_sync(pending) if not _HYBRID_OVERLAP else None
         )
 
-        cache.copy_missing()
+        if cache.host_tier is None:
+            cache.copy_missing()
         gpu_slots = topk_ids.clamp_min(0)  # -1 -> slot 0 (zero-weighted below)
         gpu_w = torch.where(on_gpu, topk_weights, topk_weights.new_zeros(())).contiguous()
         gpu_routed = self._expert_gemm(

@@ -41,11 +41,12 @@ logger = init_logger(__name__)
 # spin-wait kernel; that pinned reported utilization at 99% and laptop CPU/GPU dynamic
 # power schedulers responded by clamping the CPU frequency -- a net decode regression on
 # power-coupled edge devices.) Each (layer, decode batch size) pair gets its own flag
-# slot, so every captured decode graph rides the handshake. Where memops are unavailable
-# (Windows WDDM, vGPU, old drivers -- functionally probed at startup) or the slot
-# capacity is exceeded, decode keeps the host-func path (functional, slower). A Python
-# watchdog thread turns a wedged coordinator into a loud RuntimeError (via err[] +
-# raise_if_unhealthy) instead of an indefinite stream stall.
+# slot, so every captured decode graph rides the handshake. On ROCm the host-func path is
+# selected directly because HIP stream memops are not reliable graph dependencies. Where
+# CUDA memops are unavailable, rejected during graph capture, or the slot capacity is
+# exceeded, decode keeps the host-func path (functional, slower). A Python watchdog
+# thread turns a wedged coordinator into a loud RuntimeError (via err[] +
+# raise_if_unhealthy) instead of an indefinite stall.
 # Caveat: the coordinator busy-polls one core while decode traffic flows (idle backoff
 # otherwise); FREETOKEN_CPU_MOE_FLAG_SYNC=0 opts out entirely.
 _FLAG_SYNC = os.getenv("FREETOKEN_CPU_MOE_FLAG_SYNC", "1") != "0"
@@ -53,6 +54,11 @@ _FLAG_SYNC = os.getenv("FREETOKEN_CPU_MOE_FLAG_SYNC", "1") != "0"
 # sizes plus any eager padded sizes); more than that is unheard of, and the overflow
 # just keeps the host-func path for the extra combos.
 _FLAG_SLOTS_PER_LAYER = 16
+
+
+def _flag_sync_platform_enabled(enabled: bool, device_type: str, is_rocm: bool) -> bool:
+    """HIP stream memops are not reliable graph dependencies on current ROCm."""
+    return enabled and device_type == "cuda" and not is_rocm
 
 # Activation ids must match ActKind in csrc/cpu_moe/cpu_moe_ext.cpp. Id 3 is the
 # clamped (up + 1) swiglu: "swigluoai" runs it in the generic GEMV epilogue,
@@ -70,6 +76,41 @@ _ACT_IDS = {
 
 # Weight-format ids must match WFmt in csrc/cpu_moe/cpu_moe_ext.cpp.
 _WFMT_IDS = {"bf16": 0, "nvfp4": 1, "mxfp4_triton": 2, "ds_fp4": 3, "q4_0": 4}
+
+
+def _remap_host_ids(
+    ids: torch.Tensor, host_tier, layer_id: int, num_experts: int
+) -> None:
+    """Admit unique raw routes and rewrite the pinned route buffer in place."""
+    flat = ids.reshape(-1)
+    raw_ids = flat.tolist()
+    invalid = [int(raw) for raw in raw_ids if int(raw) >= num_experts]
+    if invalid:
+        raise ValueError(
+            f"CPU MoE route id {invalid[0]} is outside [0, {num_experts})"
+        )
+    unique: list[int] = []
+    seen: set[int] = set()
+    for raw in raw_ids:
+        raw = int(raw)
+        if 0 <= raw < num_experts and raw not in seen:
+            seen.add(raw)
+            unique.append(raw)
+    if not unique:
+        return
+    slots = host_tier.ensure(layer_id, unique)
+    if len(slots) != len(unique):
+        raise RuntimeError("host tier returned a slot list with the wrong length")
+    remap = dict(zip(unique, (int(slot) for slot in slots)))
+    for i, raw in enumerate(raw_ids):
+        if 0 <= raw < num_experts:
+            flat[i] = remap[raw]
+
+
+def _native_num_experts(cache) -> int:
+    """Return the row bound used by the native executor for this cache."""
+    host_tier = getattr(cache, "host_tier", None)
+    return int(host_tier.capacity) if host_tier is not None else int(cache.num_experts)
 
 
 def compiled_extension_supports(activation: str) -> bool:
@@ -218,6 +259,7 @@ class CpuMoeExecutor:
         swiglu_alpha: float = 1.702,
         swiglu_limit: float | None = None,
         fmt: str | None = None,
+        ggml_types: tuple[int, int] | None = None,
     ) -> None:
         from freetoken.kernel import _cpu_moe
         from freetoken.moe.legacy_format import canonical_role
@@ -247,34 +289,78 @@ class CpuMoeExecutor:
 
         self.num_layers = int(cache.num_layers)
         self.num_experts = int(cache.num_experts)
+        self.host_tier = getattr(cache, "host_tier", None)
+        self._cache_ref = weakref.ref(cache) if self.host_tier is not None else None
+        self.native_num_experts = _native_num_experts(cache)
+        if self.host_tier is not None:
+            required_slots = min(self.num_experts, int(top_k) * int(max_tokens))
+            if self.native_num_experts < required_slots:
+                raise ValueError(
+                    f"bounded host tier has {self.native_num_experts} slots, but CPU MoE "
+                    f"may route {required_slots} distinct experts in one layer"
+                )
+            from freetoken.moe import graph_host
+
+            if not graph_host.available():
+                raise RuntimeError(
+                    "CPU MoE with a bounded host tier requires graph_host host-function "
+                    "support in the active GPU runtime"
+                )
         self.top_k = int(top_k)
         self.quant_format = fmt
         self.device = device
         self.max_tokens = int(max_tokens)
         self.apply_router_weight_on_input = bool(apply_router_weight_on_input)
+        self.ggml_types = tuple(ggml_types) if ggml_types is not None else (2, 2)
+        if fmt == "q4_0" and self.ggml_types not in ((2, 2), (12, 7)):
+            raise NotImplementedError(
+                "CPU GGUF MoE currently supports Q4_0/Q4_0 or Q4_K/Q5_1 banks, "
+                f"got GGML types {self.ggml_types}"
+            )
+        if fmt == "q4_0" and self.ggml_types != (2, 2):
+            supported = getattr(_cpu_moe, "supports_gguf_q4k_q5_1", lambda: False)()
+            if not supported:
+                raise RuntimeError(
+                    "the compiled _cpu_moe extension lacks Q4_K/Q5_1 CPU support; "
+                    "rebuild it with `python setup.py build_ext --inplace` before "
+                    "serving this GGUF on the cpu/hybrid backend."
+                )
         # The per-layer tensors and their pointer tables must outlive the executor
         # (C++ holds raw addresses into both).
         self._banks: list[torch.Tensor] = []
         ptrs, (self.H, self.I) = self._resolve_banks(
-            {canonical_role(name): per_layer for name, per_layer in cache.bank_sources.items()}, fmt
+            {canonical_role(name): per_layer for name, per_layer in cache.bank_sources.items()},
+            fmt,
+            self.ggml_types,
         )
 
         # Decide the flag handshake up front (env + device + a functional stream-memop
         # probe): its coordinator needs a core of its own, which the auto thread sizing
         # below reserves (a coordinator time-slicing against the GEMV workers measurably
         # destabilizes throughput on fully-subscribed boxes).
-        self._flag_sync = _FLAG_SYNC and device.type == "cuda"
+        is_rocm = torch.version.hip is not None
+        self._flag_sync = _flag_sync_platform_enabled(
+            _FLAG_SYNC, device.type, is_rocm
+        )
         self._cpu_moe = _cpu_moe  # module ref for the decode-path memop calls
+        if _FLAG_SYNC and device.type == "cuda" and is_rocm:
+            logger.info_rank0(
+                "cpu-moe flag handshake is disabled on ROCm because HIP stream memops "
+                "are not reliable graph dependencies; using the cudaLaunchHostFunc sync"
+            )
         if self._flag_sync:
             probe_scratch = alloc_pinned_tensor(1, dtype=torch.int64)
             probe_scratch.zero_()
-            if not _cpu_moe.memops_probe(
-                torch.cuda.current_stream().cuda_stream, probe_scratch.data_ptr()
-            ):
+            probe_stream = torch.cuda.current_stream(device)
+            memops_ok = _cpu_moe.memops_probe(
+                probe_stream.cuda_stream, probe_scratch.data_ptr()
+            )
+            if memops_ok:
+                memops_ok = self._probe_memops_capture(_cpu_moe, probe_scratch, device)
+            if not memops_ok:
                 logger.info_rank0(
-                    "cpu-moe flag handshake unavailable: CUDA stream memory operations "
-                    "are not supported here (Windows WDDM / vGPU / old driver); using "
-                    "the cudaLaunchHostFunc sync"
+                    "cpu-moe flag handshake unavailable or not graph-capturable on this "
+                    "device; using the cudaLaunchHostFunc sync"
                 )
                 self._flag_sync = False
 
@@ -290,7 +376,7 @@ class CpuMoeExecutor:
         self._ext = _cpu_moe.CpuMoeExecutor(
             num_threads=nthreads,
             num_layers=self.num_layers,
-            num_experts=self.num_experts,
+            num_experts=self.native_num_experts,
             top_k=self.top_k,
             hidden_size=self.H,
             inter_size=self.I,
@@ -301,6 +387,11 @@ class CpuMoeExecutor:
             swiglu_alpha=float(swiglu_alpha),
             swiglu_limit=float(swiglu_limit) if swiglu_limit is not None else float("inf"),
             core_ids=core_ids,
+            **(
+                {"ggml_gate_up_type": self.ggml_types[0], "ggml_down_type": self.ggml_types[1]}
+                if fmt == "q4_0" and self.ggml_types != (2, 2)
+                else {}
+            ),
             **ptrs,
         )
         self.num_threads = nthreads
@@ -318,6 +409,9 @@ class CpuMoeExecutor:
 
         self._io: dict[int, dict[str, torch.Tensor]] = {}
         self._tasks: dict[tuple[int, int], int] = {}
+        # ctypes host-function trampolines must outlive every captured graph replay.
+        # Keep one callback per task's layer and batch size, alongside the task itself.
+        self._host_callbacks: dict[tuple[int, int], object] = {}
 
         # Flag-based handshake: mapped-pinned ready/done/err int64 arrays (one slot per
         # (MoE layer, decode batch size) pair, allocated as tasks are created) + a
@@ -378,9 +472,39 @@ class CpuMoeExecutor:
         logger.info_rank0(
             f"CPU MoE executor ready: threads={nthreads} (pinned to cores "
             f"{core_ids[0]}..{core_ids[-1]}) isa={self.isa} fmt={fmt} "
-            f"H={self.H} I={self.I} experts={self.num_experts} layers={self.num_layers} "
+            f"H={self.H} I={self.I} experts={self.num_experts} "
+            f"native_rows={self.native_num_experts} layers={self.num_layers} "
             f"top_k={self.top_k} act={activation} max_tokens={self.max_tokens}"
         )
+
+    @staticmethod
+    def _probe_memops_capture(
+        cpu_moe, scratch: torch.Tensor, device: torch.device
+    ) -> bool:
+        """Require stream writes to be graph nodes, not merely accepted eagerly."""
+        scratch.zero_()
+        try:
+            with torch.cuda.device(device):
+                graph = torch.cuda.CUDAGraph()
+                sink = torch.zeros(1, device=device)
+                stream = torch.cuda.current_stream(device)
+                torch.cuda.synchronize(device)
+                with torch.cuda.graph(graph, stream=stream):
+                    sink.add_(1.0)
+                    # Point both writes at one scratch word: submit leaves it at 1.
+                    cpu_moe.memop_submit(
+                        stream.cuda_stream, scratch.data_ptr(), scratch.data_ptr(), 0
+                    )
+                torch.cuda.synchronize(device)
+                if int(scratch[0]) != 0:
+                    return False  # the memops ran eagerly while capture was open
+                graph.replay()
+                torch.cuda.synchronize(device)
+                return int(scratch[0]) == 1
+        except Exception:
+            return False
+        finally:
+            scratch.zero_()
 
     def _make_table(self, layers: list[torch.Tensor]) -> torch.Tensor:
         """Build a CPU int64 tensor of per-layer base addresses for one bank.
@@ -397,7 +521,9 @@ class CpuMoeExecutor:
         self._banks.extend(layers)
         return table
 
-    def _resolve_banks(self, banks: dict, fmt: str) -> tuple[dict, tuple[int, int]]:
+    def _resolve_banks(
+        self, banks: dict, fmt: str, ggml_types: tuple[int, int] = (2, 2)
+    ) -> tuple[dict, tuple[int, int]]:
         """Return (pointer kwargs for the C++ ctor, (H, I)) for the given format.
 
         ``banks[name]`` is a list of ``num_layers`` ``[num_experts, ...]`` tensors
@@ -430,7 +556,7 @@ class CpuMoeExecutor:
             return ptrs, (H, I)
 
         if fmt == "q4_0":
-            return self._resolve_q4_0_banks(banks)
+            return self._resolve_gguf_banks(banks, ggml_types)
 
         if fmt == "mxfp4_triton":
             return self._resolve_mxfp4_banks(banks)
@@ -464,11 +590,12 @@ class CpuMoeExecutor:
         )
         return ptrs, (H, I)
 
-    def _resolve_q4_0_banks(self, banks: dict) -> tuple[dict, tuple[int, int]]:
-        """Native GGUF Q4_0 schema (gemma4 GGUF): per-32 blocks (fp16 scale + 16 nibble
-        bytes), row-major over K -- the *same* packed banks the GPU offload path streams.
-        gate_up is [S, 2I, H//32*18], down is [S, H, I//32*18]; the C++ W4A16 GEMV reads a
-        row in place (18 bytes / 32 K) and dequantizes weights inside the K-loop."""
+    def _resolve_gguf_banks(
+        self, banks: dict, ggml_types: tuple[int, int]
+    ) -> tuple[dict, tuple[int, int]]:
+        """Validate native GGUF rows using each bank's own GGML type geometry."""
+        from freetoken.models.gguf.dequant import row_bytes
+
         gate_up, down = banks["gate_up"], banks["down"]
         assert gate_up[0].dtype == torch.uint8 and down[0].dtype == torch.uint8, (
             gate_up[0].dtype, down[0].dtype,
@@ -476,9 +603,13 @@ class CpuMoeExecutor:
         I = int(gate_up[0].shape[1] // 2)
         H = int(down[0].shape[1])
         assert gate_up[0].shape[1] == 2 * I
-        assert H % 32 == 0 and I % 32 == 0, (H, I)
-        assert int(gate_up[0].shape[2]) == (H // 32) * 18, (gate_up[0].shape, H)
-        assert int(down[0].shape[2]) == (I // 32) * 18, (down[0].shape, I)
+        gu_type, dn_type = ggml_types
+        assert int(gate_up[0].shape[2]) == row_bytes(H, gu_type), (
+            gate_up[0].shape, H, gu_type
+        )
+        assert int(down[0].shape[2]) == row_bytes(I, dn_type), (
+            down[0].shape, I, dn_type
+        )
         ptrs = dict(
             gate_up_ptr=self._make_table(gate_up).data_ptr(),
             down_ptr=self._make_table(down).data_ptr(),
@@ -576,6 +707,12 @@ class CpuMoeExecutor:
                 io["y"].data_ptr(),
             )
             self._tasks[key] = task
+            if self.host_tier is not None:
+                from freetoken.moe import graph_host
+
+                self._host_callbacks[key] = graph_host.make_host_func(
+                    self._host_admit_callback(layer_id, io)
+                )
             # Allocate this (layer, bs) combo a flag slot and register its task with the
             # coordinator. Combos past the slot capacity keep the host-func path.
             if self._flag_sync and key not in self._flag_slots:
@@ -584,6 +721,28 @@ class CpuMoeExecutor:
                     self._flag_slots[key] = slot
                     self._ext.register_flag_task(slot, task)
         return task
+
+    def _host_admit_callback(self, layer_id: int, io: dict[str, torch.Tensor]):
+        """Return a graph-host callback that remaps raw routes to pooled host slots."""
+        cache_ref = self._cache_ref
+        assert cache_ref is not None
+        host_tier = self.host_tier
+        num_experts = self.num_experts
+
+        def _run() -> None:
+            try:
+                # This callback runs on a driver thread. It may only touch the already
+                # D2H'd pinned ids and the host tier; in particular, do not call CUDA.
+                with torch.inference_mode():
+                    _remap_host_ids(io["ids"], host_tier, layer_id, num_experts)
+            except BaseException as exc:  # never unwind into the GPU driver
+                with torch.inference_mode():
+                    io["ids"].fill_(-1)
+                cache = cache_ref()
+                if cache is not None and getattr(cache, "_admit_error", None) is None:
+                    cache._admit_error = exc
+
+        return _run
 
     def decode(
         self,
@@ -633,16 +792,20 @@ class CpuMoeExecutor:
 
         task = self._task_for(layer_id, bs)
         out = torch.empty_like(hidden_states)
+        stream = torch.cuda.current_stream().cuda_stream
+        if self.host_tier is not None:
+            from freetoken.moe import graph_host
+
+            graph_host.launch_host_func(stream, self._host_callbacks[(layer_id, bs)])
         slot = self._flag_slots.get((layer_id, bs)) if self._flag_sync else None
         if slot is not None:
             # Front-end memops: done[slot]=0 then ready[slot]=1 (the coordinator's
             # doorbell). No kernel launched; no host-func round trip.
             self._cpu_moe.memop_submit(
-                torch.cuda.current_stream().cuda_stream,
+                stream,
                 self._done.data_ptr(), self._ready.data_ptr(), slot,
             )
         else:
-            stream = torch.cuda.current_stream().cuda_stream
             self._ext.submit_with_cuda_stream(stream, task)
         return (bs, task, out, slot)
 

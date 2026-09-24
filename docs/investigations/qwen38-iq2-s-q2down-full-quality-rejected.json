@@ -1,0 +1,105 @@
+{
+  "model": "Qwen3.8-Flash-Next-IQ2_S-Q2_0-00001-of-00006.gguf",
+  "endpoint": "http://127.0.0.1:8199/v1/chat/completions",
+  "started_at": 1789715153.0684948,
+  "cases": [
+    {
+      "id": "arithmetic",
+      "prompt": "Compute exactly 17 * 23. Reply with only the integer, no words or punctuation.",
+      "max_tokens": 64,
+      "temperature": 0,
+      "elapsed_s": 3.019,
+      "response_raw": "{\"id\":\"chatcmpl-14\",\"object\":\"chat.completion\",\"created\":1789715128,\"model\":\"Qwen3.8-Flash-Next-IQ2_S-Q2_0-00001-of-00006.gguf\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":63,\"completion_tokens\":1,\"total_tokens\":64}}",
+      "response": "",
+      "usage": {
+        "prompt_tokens": 63,
+        "completion_tokens": 1,
+        "total_tokens": 64
+      },
+      "error": null,
+      "objective_pass": false
+    },
+    {
+      "id": "syllogism",
+      "prompt": "All glips are flargs. No flargs are blue. Mimi is a glip. Is Mimi blue? Reply with exactly YES or NO and one short reason.",
+      "max_tokens": 128,
+      "temperature": 0,
+      "elapsed_s": 3.199,
+      "response_raw": "{\"id\":\"chatcmpl-15\",\"object\":\"chat.completion\",\"created\":1789715132,\"model\":\"Qwen3.8-Flash-Next-IQ2_S-Q2_0-00001-of-00006.gguf\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"\",\"reasoning_content\":\"0\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":78,\"completion_tokens\":2,\"total_tokens\":80}}",
+      "response": "",
+      "usage": {
+        "prompt_tokens": 78,
+        "completion_tokens": 2,
+        "total_tokens": 80
+      },
+      "error": null,
+      "objective_pass": false
+    },
+    {
+      "id": "format",
+      "prompt": "Return exactly three lines in this format and nothing else:\nNAME: Ada\nLANGUAGE: Python\nCOUNT: 3",
+      "max_tokens": 128,
+      "temperature": 0,
+      "elapsed_s": 2.71,
+      "response_raw": "{\"id\":\"chatcmpl-16\",\"object\":\"chat.completion\",\"created\":1789715135,\"model\":\"Qwen3.8-Flash-Next-IQ2_S-Q2_0-00001-of-00006.gguf\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":66,\"completion_tokens\":1,\"total_tokens\":67}}",
+      "response": "",
+      "usage": {
+        "prompt_tokens": 66,
+        "completion_tokens": 1,
+        "total_tokens": 67
+      },
+      "error": null,
+      "objective_pass": false
+    },
+    {
+      "id": "mutable_default",
+      "prompt": "Debug this Python code: def add_item(x, items=[]): items.append(x); return items. Calls add_item(1) then add_item(2) unexpectedly return [1, 2]. Explain the bug and provide a corrected function that returns independent lists by default.",
+      "max_tokens": 384,
+      "temperature": 0,
+      "elapsed_s": 4.557,
+      "response_raw": "{\"id\":\"chatcmpl-17\",\"object\":\"chat.completion\",\"created\":1789715140,\"model\":\"Qwen3.8-Flash-Next-IQ2_S-Q2_0-00001-of-00006.gguf\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":97,\"completion_tokens\":1,\"total_tokens\":98}}",
+      "response": "",
+      "usage": {
+        "prompt_tokens": 97,
+        "completion_tokens": 1,
+        "total_tokens": 98
+      },
+      "error": null,
+      "objective_pass": false
+    },
+    {
+      "id": "merge_intervals",
+      "prompt": "Implement Python merge_intervals(intervals), merging overlapping or touching inclusive intervals. It must handle unsorted input, empty input, and not mutate the input. Give code plus these expected results: [[1,3],[2,4],[6,8]] -> [[1,4],[6,8]]; [] -> []; [[5,5],[1,2],[2,3]] -> [[1,3],[5,5]].",
+      "max_tokens": 512,
+      "temperature": 0,
+      "elapsed_s": 6.419,
+      "response_raw": "{\"id\":\"chatcmpl-18\",\"object\":\"chat.completion\",\"created\":1789715147,\"model\":\"Qwen3.8-Flash-Next-IQ2_S-Q2_0-00001-of-00006.gguf\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"\",\"reasoning_content\":\"\u6211\u9700\u8981\u5b9e\u73b0\u4e00\u4e2a\u5408\u5e76\u533a\u95f4\u7684\u51fd\u6570\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":128,\"completion_tokens\":8,\"total_tokens\":136}}",
+      "response": "",
+      "usage": {
+        "prompt_tokens": 128,
+        "completion_tokens": 8,
+        "total_tokens": 136
+      },
+      "error": null,
+      "objective_pass": false
+    },
+    {
+      "id": "cache_concurrency",
+      "prompt": "A Python cache uses: if key not in cache: cache[key] = expensive_load(key); return cache[key]. Two threads can call get('a') simultaneously and expensive_load runs twice. Diagnose the race and show a concise thread-safe fix using threading.Lock, while avoiding holding the lock during the expensive load if possible.",
+      "max_tokens": 512,
+      "temperature": 0,
+      "elapsed_s": 4.277,
+      "response_raw": "{\"id\":\"chatcmpl-19\",\"object\":\"chat.completion\",\"created\":1789715152,\"model\":\"Qwen3.8-Flash-Next-IQ2_S-Q2_0-00001-of-00006.gguf\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":106,\"completion_tokens\":1,\"total_tokens\":107}}",
+      "response": "",
+      "usage": {
+        "prompt_tokens": 106,
+        "completion_tokens": 1,
+        "total_tokens": 107
+      },
+      "error": null,
+      "objective_pass": false
+    }
+  ],
+  "objective_pass_count": 0,
+  "case_count": 6
+}

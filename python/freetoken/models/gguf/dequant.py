@@ -45,6 +45,8 @@ GGML_MXFP4 = 39
 GGML_Q4_0_ROCMFP4 = 100
 GGML_Q4_0_ROCMFP4_FAST = 101
 GGML_Q4_0_ROCMI4 = 108
+GGML_Q2_0 = 42
+GGML_Q2_0_SYM = 10042
 
 # (block numel, bytes per block) per ggml type.
 BLOCK_SHAPE: dict[int, tuple[int, int]] = {
@@ -76,6 +78,8 @@ BLOCK_SHAPE: dict[int, tuple[int, int]] = {
     GGML_Q4_0_ROCMFP4: (32, 18),
     GGML_Q4_0_ROCMFP4_FAST: (32, 17),
     GGML_Q4_0_ROCMI4: (32, 17),
+    GGML_Q2_0: (64, 18),
+    GGML_Q2_0_SYM: (64, 18),
 }
 
 GGML_NAME = {
@@ -105,6 +109,8 @@ GGML_NAME = {
     GGML_Q4_0_ROCMFP4: "Q4_0_ROCMFP4",
     GGML_Q4_0_ROCMFP4_FAST: "Q4_0_ROCMFP4_FAST",
     GGML_Q4_0_ROCMI4: "Q4_0_ROCMI4",
+    GGML_Q2_0: "Q2_0",
+    GGML_Q2_0_SYM: "Q2_0_SYM",
 }
 
 
@@ -139,6 +145,26 @@ def dequant_q4_0(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
     hi = (qs >> 4).to(torch.float32)
     q = torch.cat([lo, hi], dim=1)  # [N,32]
     return ((q - 8.0) * d).reshape(-1).to(out_dtype)
+
+
+def dequant_q2_0(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    """Q2_0: fp16 scale plus 64 two-bit codes mapping 0..3 to -1..2."""
+    raw = raw.reshape(-1, 18)
+    d = _f16_scales(raw, 0, 2)
+    qs = raw[:, 2:18]
+    shifts = torch.tensor((0, 2, 4, 6), device=raw.device)
+    q = ((qs.unsqueeze(-1) >> shifts) & 3).reshape(-1, 64).to(torch.float32)
+    return ((q - 1.0) * d).reshape(-1).to(out_dtype)
+
+
+def dequant_q2_0_sym(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    """Q2_0_SYM: fp16 scale plus symmetric two-bit codes {-3, -1, 1, 3}."""
+    raw = raw.reshape(-1, 18)
+    d = _f16_scales(raw, 0, 2)
+    qs = raw[:, 2:18]
+    shifts = torch.tensor((0, 2, 4, 6), device=raw.device)
+    q = ((qs.unsqueeze(-1) >> shifts) & 3).reshape(-1, 64).to(torch.float32)
+    return ((2.0 * q - 3.0) * d).reshape(-1).to(out_dtype)
 
 
 def dequant_q6_k(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
@@ -274,6 +300,8 @@ def dequant_q4_0_rocmi4(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tens
 
 
 _DEQUANT = {
+    GGML_Q2_0: dequant_q2_0,
+    GGML_Q2_0_SYM: dequant_q2_0_sym,
     GGML_Q4_0: dequant_q4_0,
     GGML_Q6_K: dequant_q6_k,
     GGML_MXFP4: dequant_mxfp4,
@@ -304,12 +332,16 @@ __all__ = [
     "GGML_F16",
     "GGML_BF16",
     "GGML_Q4_0",
+    "GGML_Q2_0",
+    "GGML_Q2_0_SYM",
     "GGML_Q8_0",
     "GGML_Q6_K",
     "GGML_NAME",
     "BLOCK_SHAPE",
     "row_bytes",
     "dequant_q4_0",
+    "dequant_q2_0",
+    "dequant_q2_0_sym",
     "dequant_q6_k",
     "dequantize",
 ]

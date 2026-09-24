@@ -1,9 +1,12 @@
 # Handoff: CUDA graph capture for the MoE disk tier
 
-**Status:** the graph-safe expert admission is built, tested and committed, but it is
-opt-in (`FREETOKEN_DISK_TIER_GRAPH=1`) because turning capture on wedges the *prefill*
-path. That hang is the only thing between this and a ~1.5x decode win. Everything below
-was measured on the RX 6800 (gfx1030) box, Qwen3.8-Flash-Next Q4 v3.
+**Status:** graph-safe expert admission is built and committed. A host callback error
+associated with the graph-on request hang was identified: the callback mutated inference
+tensors outside inference mode. It now enters `torch.inference_mode()`. This remains opt-in
+(`FREETOKEN_DISK_TIER_GRAPH=1`). On the controlled RX 6800 workload below, graph-on
+measured 4.92 tok/s against 4.38 tok/s eager (+12.5%); this is a single-prompt workload, not
+a general 1.5x improvement. Hardware measurements below were made on the RX 6800
+(gfx1030) box, Qwen3.8-Flash-Next Q4 v3.
 
 ## Why this work exists
 
@@ -68,15 +71,81 @@ The stream does not advance past the host node until the callback returns, which
 same barrier the old sync provided. Supporting pieces: `moe/graph_host.py` (resolves
 `hipLaunchHostFunc` / `cudaLaunchHostFunc` / `cuLaunchHostFunc`),
 `prepare_graph_admission` called from `graph.py:154` before capture opens, and
-`raise_admission_error` called from `forward_batch` -- a host callback cannot unwind into
-the driver, so failures are parked on the cache and re-raised on the engine thread.
+`raise_admission_error` called by the scheduler after `copy_done.synchronize()` -- a host
+callback cannot unwind into the driver, so failures are parked on the cache and re-raised
+on the engine thread only after replay completion.
 
 Cost: **23.6 us/layer, ~1.1 ms/token** (2.2 ms with a contended GIL), against the ~110
 ms/token of eager launch overhead it is meant to displace.
 
-Covered by `tests/moe/test_graph_admission.py` (4 tests): the node does not fire during
-capture, fires once per replay, zero-miss layers skip the tier, and a failing host
-surfaces on the engine thread rather than hanging the stream or serving stale experts.
+`tests/moe/test_graph_admission.py` covers node timing, replay, zero-miss layers and
+error parking with a stand-in tier. A CPU regression now calls the real callback body
+from a foreign thread with inference tensors and verifies that it writes the mapped slot
+IDs. Callback errors are checked by the scheduler only after the forward's existing
+`copy_done.synchronize()` barrier and before token or cache commits; that check adds no
+GPU synchronization. A separate CPU regression validates this ordering and that an
+error prevents final-batch token output.
+
+## Plateau throughput measurement
+
+Measured 2026-09-14 on `ajkerchum@192.168.1.61`: Radeon RX 6800 (gfx1030, 16 GiB
+VRAM), ROCm 7.1 / PyTorch 2.11.0+rocm7.1, Qwen3.8-Flash-Next-Q4_K-v3.gguf. Both
+services used the same working tree and model, `--moe-backend offload`,
+`--moe-cache-auto --moe-host-cache-size 2048`, `--ple-backend disk`, `--memory-ratio 0.9`,
+`--max-seq-len-override 8192`, and `--max-running-requests 1`. Graph-on used
+`FREETOKEN_DISK_TIER_GRAPH=1 --cuda-graph-max-bs 1`; eager used the variable unset and
+`--cuda-graph-max-bs 0`. `AMD_SERIALIZE_KERNEL`, `FT_GGUF_BACKEND`, and
+`FREETOKEN_ROCM_DECODE_TRACE` were unset in both runs.
+
+The request was the same greedy streamed completion in both modes: prompt
+`The capital of France is a city with museums, historic landmarks, and a river running through it. Explain the main attractions in one sentence.`, `max_tokens=48`,
+`temperature=0`, `ignore_eos=true`, with `stream_options.include_usage=true`. Each mode had
+four warmups and seven measured requests. The first warmup was cold (graph 1.24 tok/s;
+eager 2.51 tok/s); warmups 2-4 stabilized at 4.91-4.93 tok/s graph-on and 4.38-4.40 tok/s
+eager. Throughput follows the decode convention of counting tokens after the first:
+`(completion_tokens - 1) / (last_text_time - first_text_time)`. The SSE reader uses
+`iter_lines(chunk_size=1)` to reduce buffering; prefill is excluded. Every run returned 47
+completion tokens. All 22 output strings were byte-for-byte equal; their SHA-256 was
+`7a7afd5ffd208cb6524d2a0a4a0f505761fa76e3c24dbd72d4501192bec7adea`.
+
+| mode | seven measured samples (tok/s) | median | range |
+|---|---|---:|---:|
+| graph-on | 4.9350, 4.7538, 4.9232, 4.8713, 4.9205, 4.8678, 4.9211 | 4.9205 | 4.7538-4.9350 |
+| eager | 4.3632, 4.4029, 4.3588, 4.3942, 4.3754, 4.4493, 4.3587 | 4.3754 | 4.3587-4.4493 |
+
+That is a 12.5% median increase for graph-on in this A/B (4.92 vs 4.38 tok/s). This
+compares graph admission with eager admission on the same working tree, not against `main`
+or the historical 4.44 tok/s workload. It is a single serial request, one prompt, and one
+token length; it does not establish multi-request behavior or a general speedup. An
+earlier timing draft counted tokens through `[DONE]` and stopped the interval at `[DONE]`;
+those uncorrected proxy artifacts are retained with `proxy-superseded` filenames and are
+not part of this result. The corrected request, per-call timings, text, token counts, and
+hashes are retained in
+[`disk-tier-graph-throughput-graph.json`](disk-tier-graph-throughput-graph.json) and
+[`disk-tier-graph-throughput-eager.json`](disk-tier-graph-throughput-eager.json); the
+SSE timing runner is [`benchmark_disk_tier_graph.py`](benchmark_disk_tier_graph.py).
+
+Reproduce the two service modes from `~/ft-mtp` (model path and options match the run):
+
+```bash
+cd ~/ft-mtp
+nohup env -u FREETOKEN_ROCM_DECODE_TRACE FREETOKEN_DISK_TIER_GRAPH=1 ~/.venvs/ft/bin/python -m freetoken.cli serve --model ~/models/Qwen3.8-Flash-Next-Q4/Qwen3.8-Flash-Next-Q4_K-v3.gguf --host 127.0.0.1 --port 8199 --moe-backend offload --max-running-requests 1 --moe-cache-auto --moe-host-cache-size 2048 --ple-backend disk --memory-ratio 0.9 --max-seq-len-override 8192 --cuda-graph-max-bs 1 >/tmp/disk-tier-graph-throughput.log 2>&1 </dev/null &
+nohup env -u FREETOKEN_DISK_TIER_GRAPH -u FREETOKEN_ROCM_DECODE_TRACE ~/.venvs/ft/bin/python -m freetoken.cli serve --model ~/models/Qwen3.8-Flash-Next-Q4/Qwen3.8-Flash-Next-Q4_K-v3.gguf --host 127.0.0.1 --port 8199 --moe-backend offload --max-running-requests 1 --moe-cache-auto --moe-host-cache-size 2048 --ple-backend disk --memory-ratio 0.9 --max-seq-len-override 8192 --cuda-graph-max-bs 0 >/tmp/disk-tier-eager-throughput.log 2>&1 </dev/null &
+```
+
+Start only one server at a time, redirecting its output to a log, and wait for
+`API server is ready to serve` before sending requests. Run the request loop with the
+service ready on `127.0.0.1:8199`:
+
+```bash
+scp docs/investigations/benchmark_disk_tier_graph.py ajkerchum@192.168.1.61:/tmp/benchmark_disk_tier_graph.py
+source ~/.venvs/ft/bin/activate
+python /tmp/benchmark_disk_tier_graph.py --mode graph --warmups 4 --runs 7 --output /tmp/disk-tier-graph-throughput.json
+python /tmp/benchmark_disk_tier_graph.py --mode eager --warmups 4 --runs 7 --output /tmp/disk-tier-eager-throughput.json
+```
+
+Both services were stopped after their runs, and ports 8199/8200 and their workers were
+confirmed clear.
 
 ### Do not try to do this with a flag handshake
 
@@ -99,41 +168,53 @@ delay. `c5d51ca` hardens `DiskRowTable._probe_wait_sync` against exactly this --
 return only means the driver accepted the call, so the probe now captures a write and
 checks it did not land until replay. ROCm correctly reads `launch-gating` again.
 
-## The blocker
+## Diagnosed callback thread context
 
-With `FREETOKEN_DISK_TIER_GRAPH=1`, capture succeeds ("disk tier: expert admission on
-graph host nodes", graphs captured in ~5 s) and then the **first real request hangs in
-prefill**, GPU pegged at 99%, same stack for 60 s+:
+The first report looked like a prefill hang, but later request-phase instrumentation showed
+the first prefill had completed and the stall was in the first captured decode. A serialized
+run's Python stack stopped at Triton sampling, which identified a wait site rather than the
+kernel or callback responsible. Instrumentation confirmed that this decode took the graph
+path. A temporary `torch.cuda.synchronize()` after replay let the callbacks run and surfaced
+the concrete failure:
 
 ```
-causal_conv1d_varlen (causal_conv1d_triton.py:462)
-_conv_prefill (models/qwen4_exp/gdn.py:101)
-forward_batch (engine/engine.py:1107)
+RuntimeError: Inplace update to inference tensor outside InferenceMode is not allowed
 ```
 
-Two things matter about that line. It is in **prefill, which is never captured**. And it
-is not a kernel -- `causal_conv1d_triton.py:462` is `max_seq_len = int(seq_lens.max().item())`,
-a device->host sync. So the correct reading is *some earlier GPU work never completes*,
-and this sync is merely where the scheduler first waits on it. Do not go looking for a
-bug in the conv kernel.
+The callback runs on a HIP driver thread, outside the engine thread's inference-mode
+context, while its pinned `n`, `src`, and `out` buffers were created in inference mode.
+Writing `out` therefore raised; callback exceptions are parked because they cannot unwind
+through the driver. `_admit_callback` now wraps its tensor reads and output write in
+`torch.inference_mode()`. This fix does not add a replay synchronization.
 
-Isolated cleanly: **the same tree with `--cuda-graph-max-bs 0` generates correct output.**
-So this is capture, not the handshake -- and since the disk tier has always force-disabled
-capture, this configuration has never run before. Treat it as a pre-existing fault the
-blanket disable was masking, not as a regression.
+On the RX 6800 with graph admission enabled, default HIP GGUF backend, and
+`AMD_SERIALIZE_KERNEL` unset, the 5-token prompt `The capital of France is` returned
+` Paris. Paris` (max_tokens=4). A longer greedy comparison used this exact request for both
+graph-on and eager service runs:
 
-Suggested next steps, cheapest first:
+```
+prompt: The capital of France is a city with museums, historic landmarks, and a river running through it. Explain the main attractions in one sentence.
+max_tokens=16, temperature=0, ignore_eos=true
+```
 
-1. `AMD_SERIALIZE_KERNEL=3` to name the kernel that never retires.
-2. Determine whether a host node is still outstanding when prefill stalls. The plausible
-   deadlock is the callback: it runs on a driver thread holding the GIL and calls
-   `host_tier.ensure`, which fans disk reads across a `ThreadPoolExecutor` whose workers
-   need the GIL to run Python. `concurrent.futures` should release the GIL while waiting,
-   but this is unverified and is the first thing to rule out. A quick test: swap the
-   callback body for a no-op that only fills `out` with the identity mapping. If the hang
-   disappears, it is the callback, not capture.
-3. If the hang persists with a no-op callback, capture alone is at fault; bisect by
-   capturing a graph with no host nodes at all on this model.
+Both returned 15 completion tokens and the same text:
+`\n\n<think>\nThe user asks me to explain the main attractions of Paris (`. The graph-on
+request used `FREETOKEN_DISK_TIER_GRAPH=1` and `--cuda-graph-max-bs 1`; the eager control
+used `--cuda-graph-max-bs 0`. This verifies correct output for the tested request, not a
+throughput improvement or the absence of other graph issues.
+
+The focused local CPU suite reports **24 passed, 6 skipped**. On the RX 6800,
+`tests/moe/test_graph_admission.py` plus the new foreign-thread inference-buffer regression
+report **5 passed**. Remote tests and both serving comparisons ran on
+`ajkerchum@192.168.1.61` in `~/ft-mtp`; the final graph and eager service logs are
+`/tmp/disk-tier-graph-correctness16.log` and `/tmp/disk-tier-eager-correctness16.log`, with
+the eager response saved in `/tmp/disk-tier-eager-correctness16.response`. Both test
+services were stopped after collecting results. The warmed throughput comparison is
+recorded above; broader prompts and batch sizes remain untested.
+
+Local CPU verification (CPU-only `.venv`; graph replay tests skip without a GPU):
+`rtk uv run --no-sync python -m pytest tests/scheduler/test_disk_tier_admission_error.py tests/scheduler/test_abort_inflight_prefill.py::test_abort_inflight_final_chunk_marks_then_drains tests/scheduler/test_abort_inflight_prefill.py::test_abort_inflight_intermediate_chunk_marks_then_drains tests/scheduler/test_abort_inflight_prefill.py::test_abort_starved_decode_req_frees_immediately tests/moe/test_host_tier.py tests/moe/test_graph_admission.py tests/models/qwen4_exp/test_ple_disk.py -q`
+reported **24 passed, 6 skipped**.
 
 ## Reproducing
 
@@ -209,14 +290,20 @@ one `test_adjust_config_converts_moe_cache_rate_to_cache_size`). A clean run is
 
   2048 is already optimal on a 30 GB box. This is a config ceiling, not a RAM shortage.
 
-* **More read parallelism.** `host_tier.ensure` already fans misses across
-  `ThreadPoolExecutor(max_workers=8)`; only `read_expert`'s extents are serial within one
-  expert-bank. The device knee is QD8-12 (QD1 1.66-2.41 GB/s, QD8 4.87-6.85 GB/s,
+* **More read parallelism.** `host_tier.ensure` submits one job per missing
+  (expert, bank) pair to `ThreadPoolExecutor(max_workers=8)`; each job reads that bank's
+  extents. The device knee is QD8-12 (QD1 1.66-2.41 GB/s, QD8 4.87-6.85 GB/s,
   QD16+ flat or worse), so 8 workers is at the knee. There is no 3x sitting in the read
   path -- an early claim in this work that there was came from reading `read_expert`
   without its caller.
 
 ## Leftovers
+
+The follow-on Qwen3.8 IQ2 work, including the retained symmetric Q2 down-projection
+format, quality probes, and the current 15.8833 tok/s long-prompt result, is recorded in
+[qwen38-iq2-s-results.md](qwen38-iq2-s-results.md). The retained VM checkpoint is
+`~/models/Qwen3.8-Flash-Next-IQ2_S-Q2SYM/`; it occupies 61.3 GiB and leaves about
+46 GiB free. Do not create another full derivative without removing or moving this one.
 
 * The n-gram PLE table (`per_layer_token_embd`, Q8_0) is 54.40 GB -- 41% of the
   checkpoint -- and must stay on disk; it cannot be pinned on this box. It costs nothing:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field, replace
 from functools import cached_property
 from typing import TYPE_CHECKING, List
@@ -50,6 +51,8 @@ class EngineConfig:
     moe_cache_auto: bool = False
     kv_reserve_tokens: int = 8192  # KV floor for --moe-cache-auto; small by design (MoE-priority)
     moe_cache_policy: str = "lru"
+    moe_cache_frequency_warmup: int = 128
+    moe_cache_frequency_protect_fraction: float = 0.25
     moe_prefill_overlap: bool = True
     # Prefill hit/miss split: serve cache-resident experts D2D during prefill
     # prefetch instead of re-streaming the full layer over PCIe. Needs CUDA >= 12.8
@@ -78,6 +81,10 @@ class EngineConfig:
     # misses so the PCIe fetch and the CPU compute finish together (perfect overlap);
     # falls back to a fixed cap of 1 without a usable `ft bench bw` profile.
     moe_hybrid_max_fetch: int = -1
+    # Hybrid capped-miss selection: recency (default), frequency learned during the
+    # first N calls of each layer, or lowest expert id (routing-blind baseline).
+    moe_hybrid_fetch_policy: str = "recency"
+    moe_hybrid_frequency_warmup: int = 128
     cuda_graph_bs: List[int] | None = None
     cuda_graph_max_bs: int | None = None
     page_size: int = 1
@@ -114,6 +121,22 @@ class EngineConfig:
     speculative_draft_path: str | None = None
 
     def __post_init__(self):
+        if self.moe_cache_policy not in ("lru", "frequency"):
+            raise ValueError("moe_cache_policy must be one of lru, frequency")
+        if self.moe_cache_frequency_warmup < 1:
+            raise ValueError("moe_cache_frequency_warmup must be >= 1")
+        if not math.isfinite(self.moe_cache_frequency_protect_fraction) or not (
+            0 <= self.moe_cache_frequency_protect_fraction < 1
+        ):
+            raise ValueError(
+                "moe_cache_frequency_protect_fraction must be finite and in [0, 1)"
+            )
+        if self.moe_hybrid_fetch_policy not in ("recency", "frequency", "lowest_id"):
+            raise ValueError(
+                "moe_hybrid_fetch_policy must be one of recency, frequency, lowest_id"
+            )
+        if self.moe_hybrid_frequency_warmup < 1:
+            raise ValueError("moe_hybrid_frequency_warmup must be >= 1")
         if self.moe_backend is None:
             return
         if self.moe_strategy != "auto":

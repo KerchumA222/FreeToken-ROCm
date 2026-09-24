@@ -1,0 +1,156 @@
+{
+  "mode": "graph",
+  "recorded_at_utc": "2026-09-17T01:53:55.583592+00:00",
+  "endpoint": "http://127.0.0.1:8199/v1/completions",
+  "request": {
+    "model": "Qwen3.8-Flash-Next-IQ2_S-00001-of-00006.gguf",
+    "prompt": "The capital of France is a city with museums, historic landmarks, and a river running through it. Explain the main attractions in one sentence.",
+    "max_tokens": 48,
+    "temperature": 0,
+    "ignore_eos": true,
+    "stream": true,
+    "stream_options": {
+      "include_usage": true
+    }
+  },
+  "warmup_count": 4,
+  "measured_count": 7,
+  "throughput_method": "(completion_tokens - 1) / (last_text_time - first_text_time); iter_lines(chunk_size=1)",
+  "measured_median_tok_s": 17.664621013409356,
+  "measured_min_tok_s": 17.623436145498005,
+  "measured_max_tok_s": 17.704854959651996,
+  "records": [
+    {
+      "completion_tokens": 47,
+      "decode_seconds_first_text_to_last_text": 5.332709587877616,
+      "decode_tokens_after_first_per_second": 8.626008831339286,
+      "first_text_seconds_from_request": 4.944665336981416,
+      "done_seconds_from_request": 10.278059609001502,
+      "text_sha256": "00657a572dfed7da6be40e137ecf7e6c1c8eedca3cc6ef3acfd41cbbaddbfa20",
+      "text": "\n\n<think>\nThe user asks me to explain the main attractions of Paris (the capital of France) in one sentence. They've already mentioned museums, historic landmarks, and a river (the Seine). I need to craft a single sentence",
+      "finish_reason": "length",
+      "index": 0,
+      "phase": "warmup"
+    },
+    {
+      "completion_tokens": 47,
+      "decode_seconds_first_text_to_last_text": 2.8962417140137404,
+      "decode_tokens_after_first_per_second": 15.882652258416359,
+      "first_text_seconds_from_request": 1.6152175259776413,
+      "done_seconds_from_request": 4.512585471151397,
+      "text_sha256": "00657a572dfed7da6be40e137ecf7e6c1c8eedca3cc6ef3acfd41cbbaddbfa20",
+      "text": "\n\n<think>\nThe user asks me to explain the main attractions of Paris (the capital of France) in one sentence. They've already mentioned museums, historic landmarks, and a river (the Seine). I need to craft a single sentence",
+      "finish_reason": "length",
+      "index": 1,
+      "phase": "warmup"
+    },
+    {
+      "completion_tokens": 47,
+      "decode_seconds_first_text_to_last_text": 2.597295864019543,
+      "decode_tokens_after_first_per_second": 17.710727775468357,
+      "first_text_seconds_from_request": 1.5877756339032203,
+      "done_seconds_from_request": 4.185747416922823,
+      "text_sha256": "00657a572dfed7da6be40e137ecf7e6c1c8eedca3cc6ef3acfd41cbbaddbfa20",
+      "text": "\n\n<think>\nThe user asks me to explain the main attractions of Paris (the capital of France) in one sentence. They've already mentioned museums, historic landmarks, and a river (the Seine). I need to craft a single sentence",
+      "finish_reason": "length",
+      "index": 2,
+      "phase": "warmup"
+    },
+    {
+      "completion_tokens": 47,
+      "decode_seconds_first_text_to_last_text": 2.615762578090653,
+      "decode_tokens_after_first_per_second": 17.585693894885978,
+      "first_text_seconds_from_request": 1.5870135340373963,
+      "done_seconds_from_request": 4.203447923064232,
+      "text_sha256": "00657a572dfed7da6be40e137ecf7e6c1c8eedca3cc6ef3acfd41cbbaddbfa20",
+      "text": "\n\n<think>\nThe user asks me to explain the main attractions of Paris (the capital of France) in one sentence. They've already mentioned museums, historic landmarks, and a river (the Seine). I need to craft a single sentence",
+      "finish_reason": "length",
+      "index": 3,
+      "phase": "warmup"
+    },
+    {
+      "completion_tokens": 47,
+      "decode_seconds_first_text_to_last_text": 2.6077725880313665,
+      "decode_tokens_after_first_per_second": 17.63957494266241,
+      "first_text_seconds_from_request": 1.6067007379606366,
+      "done_seconds_from_request": 4.215134286088869,
+      "text_sha256": "00657a572dfed7da6be40e137ecf7e6c1c8eedca3cc6ef3acfd41cbbaddbfa20",
+      "text": "\n\n<think>\nThe user asks me to explain the main attractions of Paris (the capital of France) in one sentence. They've already mentioned museums, historic landmarks, and a river (the Seine). I need to craft a single sentence",
+      "finish_reason": "length",
+      "index": 4,
+      "phase": "measured"
+    },
+    {
+      "completion_tokens": 47,
+      "decode_seconds_first_text_to_last_text": 2.5981574039906263,
+      "decode_tokens_after_first_per_second": 17.704854959651996,
+      "first_text_seconds_from_request": 1.600863145897165,
+      "done_seconds_from_request": 4.199736353009939,
+      "text_sha256": "00657a572dfed7da6be40e137ecf7e6c1c8eedca3cc6ef3acfd41cbbaddbfa20",
+      "text": "\n\n<think>\nThe user asks me to explain the main attractions of Paris (the capital of France) in one sentence. They've already mentioned museums, historic landmarks, and a river (the Seine). I need to craft a single sentence",
+      "finish_reason": "length",
+      "index": 5,
+      "phase": "measured"
+    },
+    {
+      "completion_tokens": 47,
+      "decode_seconds_first_text_to_last_text": 2.5997784389182925,
+      "decode_tokens_after_first_per_second": 17.693815484960915,
+      "first_text_seconds_from_request": 1.6010249231476337,
+      "done_seconds_from_request": 4.201492255087942,
+      "text_sha256": "00657a572dfed7da6be40e137ecf7e6c1c8eedca3cc6ef3acfd41cbbaddbfa20",
+      "text": "\n\n<think>\nThe user asks me to explain the main attractions of Paris (the capital of France) in one sentence. They've already mentioned museums, historic landmarks, and a river (the Seine). I need to craft a single sentence",
+      "finish_reason": "length",
+      "index": 6,
+      "phase": "measured"
+    },
+    {
+      "completion_tokens": 47,
+      "decode_seconds_first_text_to_last_text": 2.604075115174055,
+      "decode_tokens_after_first_per_second": 17.664621013409356,
+      "first_text_seconds_from_request": 1.6052116909995675,
+      "done_seconds_from_request": 4.21039086417295,
+      "text_sha256": "00657a572dfed7da6be40e137ecf7e6c1c8eedca3cc6ef3acfd41cbbaddbfa20",
+      "text": "\n\n<think>\nThe user asks me to explain the main attractions of Paris (the capital of France) in one sentence. They've already mentioned museums, historic landmarks, and a river (the Seine). I need to craft a single sentence",
+      "finish_reason": "length",
+      "index": 7,
+      "phase": "measured"
+    },
+    {
+      "completion_tokens": 47,
+      "decode_seconds_first_text_to_last_text": 2.6024389010854065,
+      "decode_tokens_after_first_per_second": 17.675727173004773,
+      "first_text_seconds_from_request": 1.5988152839709073,
+      "done_seconds_from_request": 4.201921927044168,
+      "text_sha256": "00657a572dfed7da6be40e137ecf7e6c1c8eedca3cc6ef3acfd41cbbaddbfa20",
+      "text": "\n\n<think>\nThe user asks me to explain the main attractions of Paris (the capital of France) in one sentence. They've already mentioned museums, historic landmarks, and a river (the Seine). I need to craft a single sentence",
+      "finish_reason": "length",
+      "index": 8,
+      "phase": "measured"
+    },
+    {
+      "completion_tokens": 47,
+      "decode_seconds_first_text_to_last_text": 2.6076982989907265,
+      "decode_tokens_after_first_per_second": 17.64007746517443,
+      "first_text_seconds_from_request": 1.5885462029837072,
+      "done_seconds_from_request": 4.196915660984814,
+      "text_sha256": "00657a572dfed7da6be40e137ecf7e6c1c8eedca3cc6ef3acfd41cbbaddbfa20",
+      "text": "\n\n<think>\nThe user asks me to explain the main attractions of Paris (the capital of France) in one sentence. They've already mentioned museums, historic landmarks, and a river (the Seine). I need to craft a single sentence",
+      "finish_reason": "length",
+      "index": 9,
+      "phase": "measured"
+    },
+    {
+      "completion_tokens": 47,
+      "decode_seconds_first_text_to_last_text": 2.610160675831139,
+      "decode_tokens_after_first_per_second": 17.623436145498005,
+      "first_text_seconds_from_request": 1.6094405790790915,
+      "done_seconds_from_request": 4.220676148077473,
+      "text_sha256": "00657a572dfed7da6be40e137ecf7e6c1c8eedca3cc6ef3acfd41cbbaddbfa20",
+      "text": "\n\n<think>\nThe user asks me to explain the main attractions of Paris (the capital of France) in one sentence. They've already mentioned museums, historic landmarks, and a river (the Seine). I need to craft a single sentence",
+      "finish_reason": "length",
+      "index": 10,
+      "phase": "measured"
+    }
+  ]
+}

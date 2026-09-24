@@ -68,6 +68,11 @@ class MmvqGgufMoEKernel(MoEKernel):
 class GgufMoEMethod(MoEMethod):
     candidates = (MmvqGgufMoEKernel,)
 
+    @property
+    def ggml_types(self) -> tuple[int, int]:
+        """Packed GGML type ids in (gate_up, down) bank order."""
+        return _bank_types(self.cfg)
+
     def create_weights(self, layer) -> None:
         from freetoken.models.gguf.dequant import row_bytes
 

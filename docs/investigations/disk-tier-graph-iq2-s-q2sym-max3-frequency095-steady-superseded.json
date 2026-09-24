@@ -1,0 +1,60 @@
+{
+  "mode": "graph",
+  "recorded_at_utc": "2026-09-18T18:00:38.922153+00:00",
+  "endpoint": "http://127.0.0.1:8199/v1/completions",
+  "request": {
+    "model": "Qwen3.8-Flash-Next-IQ2_S-Q2SYM-00001-of-00006.gguf",
+    "prompt": "Write a detailed technical discussion of hash table implementation tradeoffs.",
+    "max_tokens": 512,
+    "temperature": 0,
+    "ignore_eos": true,
+    "stream": true,
+    "stream_options": {
+      "include_usage": true
+    }
+  },
+  "warmup_count": 0,
+  "measured_count": 3,
+  "throughput_method": "(completion_tokens - 1) / (last_text_time - first_text_time); iter_lines(chunk_size=1)",
+  "measured_median_tok_s": 15.541054809613264,
+  "measured_min_tok_s": 15.523196934647029,
+  "measured_max_tok_s": 15.545372434548188,
+  "records": [
+    {
+      "completion_tokens": 511,
+      "decode_seconds_first_text_to_last_text": 32.854057198856026,
+      "decode_tokens_after_first_per_second": 15.523196934647029,
+      "first_text_seconds_from_request": 0.839386495994404,
+      "done_seconds_from_request": 33.69422032381408,
+      "text_sha256": "1b782b358029862bff53283c62d05452839883639d465ad6f452048a5a023ebf",
+      "text": "\n\n1. Start with a brief introduction stating that hash tables are a fundamental data structure.\n\n2. **Part 1**: Explain the tradeoff between **speed and memory**. Discuss the relationship between load factor, memory usage, and lookup speed. Specifically, analyze the scenario where a hash table is sized for a million items but only contains a few thousand, and explain why this configuration is problematic.\n\n3. **Part 2**: Explain the tradeoff between **speed and memory** specifically regarding **collision resolution**. Discuss the choice between allocating more memory to reduce collisions versus using a smaller table.\n\n4. **Part 3**: Explain the tradeoff between **speed and memory** regarding **collision resolution**. Discuss the choice between allocating more memory to reduce collisions versus using a smaller table.\n\n5. **Part 4**: Explain the tradeoff between **speed and memory** regarding **collision resolution**. Discuss the choice between allocating more memory to reduce collisions versus using a smaller table.\n\nEnsure each section is self-contained and includes specific examples or analogies to illustrate the tradeoff.\n\n<think>\n\n</think>\n\nHash tables are a fundamental data structure used to store and retrieve data efficiently. They provide average-case constant time complexity for lookup, insertion, and deletion operations, making them indispensable in modern computing. However, achieving optimal performance requires careful consideration of several tradeoffs, particularly between speed and memory usage.\n\n### Part 1: Speed vs. Memory \u2013 Load Factor and Lookup Speed\n\nThe load factor of a hash table is the ratio of the number of stored elements to the total number of buckets (slots) in the table. A low load factor means many empty buckets, while a high load factor indicates that most buckets are occupied.\n\nWhen a hash table is sized for a million items but only contains a few thousand, the load factor is extremely low (e.g., 0.003). While this configuration ensures fast lookups due to minimal collisions, it is highly inefficient in terms of memory usage. Each bucket occupies memory, even if it remains empty. For example, if each bucket pointer takes 8 bytes, a million-bucket table consumes 8 MB of memory regardless of how many items are stored. This is problematic because:\n\n- **Wasted Memory**: The majority of allocated memory remains unused.\n- **Poor Scalability**: If the dataset grows, the table may need to be resized dynamically, which is expensive.\n- **Inefficient Resource Utilization**: Systems with limited memory (e.g., embedded devices",
+      "finish_reason": "length",
+      "index": 0,
+      "phase": "measured"
+    },
+    {
+      "completion_tokens": 511,
+      "decode_seconds_first_text_to_last_text": 32.80719083105214,
+      "decode_tokens_after_first_per_second": 15.545372434548188,
+      "first_text_seconds_from_request": 0.9518279538024217,
+      "done_seconds_from_request": 33.75970186688937,
+      "text_sha256": "1b782b358029862bff53283c62d05452839883639d465ad6f452048a5a023ebf",
+      "text": "\n\n1. Start with a brief introduction stating that hash tables are a fundamental data structure.\n\n2. **Part 1**: Explain the tradeoff between **speed and memory**. Discuss the relationship between load factor, memory usage, and lookup speed. Specifically, analyze the scenario where a hash table is sized for a million items but only contains a few thousand, and explain why this configuration is problematic.\n\n3. **Part 2**: Explain the tradeoff between **speed and memory** specifically regarding **collision resolution**. Discuss the choice between allocating more memory to reduce collisions versus using a smaller table.\n\n4. **Part 3**: Explain the tradeoff between **speed and memory** regarding **collision resolution**. Discuss the choice between allocating more memory to reduce collisions versus using a smaller table.\n\n5. **Part 4**: Explain the tradeoff between **speed and memory** regarding **collision resolution**. Discuss the choice between allocating more memory to reduce collisions versus using a smaller table.\n\nEnsure each section is self-contained and includes specific examples or analogies to illustrate the tradeoff.\n\n<think>\n\n</think>\n\nHash tables are a fundamental data structure used to store and retrieve data efficiently. They provide average-case constant time complexity for lookup, insertion, and deletion operations, making them indispensable in modern computing. However, achieving optimal performance requires careful consideration of several tradeoffs, particularly between speed and memory usage.\n\n### Part 1: Speed vs. Memory \u2013 Load Factor and Lookup Speed\n\nThe load factor of a hash table is the ratio of the number of stored elements to the total number of buckets (slots) in the table. A low load factor means many empty buckets, while a high load factor indicates that most buckets are occupied.\n\nWhen a hash table is sized for a million items but only contains a few thousand, the load factor is extremely low (e.g., 0.003). While this configuration ensures fast lookups due to minimal collisions, it is highly inefficient in terms of memory usage. Each bucket occupies memory, even if it remains empty. For example, if each bucket pointer takes 8 bytes, a million-bucket table consumes 8 MB of memory regardless of how many items are stored. This is problematic because:\n\n- **Wasted Memory**: The majority of allocated memory remains unused.\n- **Poor Scalability**: If the dataset grows, the table may need to be resized dynamically, which is expensive.\n- **Inefficient Resource Utilization**: Systems with limited memory (e.g., embedded devices",
+      "finish_reason": "length",
+      "index": 1,
+      "phase": "measured"
+    },
+    {
+      "completion_tokens": 511,
+      "decode_seconds_first_text_to_last_text": 32.81630534399301,
+      "decode_tokens_after_first_per_second": 15.541054809613264,
+      "first_text_seconds_from_request": 0.8751032510772347,
+      "done_seconds_from_request": 33.69210987095721,
+      "text_sha256": "64f52d07e565afb0e3b322860022d711f4d43274b0bbfca4eadfaa161751e59b",
+      "text": "\n\n1. Start with a brief introduction stating that hash tables are a fundamental data structure.\n\n2. **Part 1**: Explain the tradeoff between **speed and memory**. Discuss the relationship between load factor, memory usage, and lookup speed. Specifically, analyze the scenario where a hash table is sized for a million items but only contains a few thousand, and explain why this configuration is problematic.\n\n3. **Part 2**: Explain the tradeoff between **speed and memory** specifically regarding **collision resolution**. Discuss the choice between allocating more memory to reduce collisions versus using a smaller table.\n\n4. **Part 3**: Explain the tradeoff between **speed and memory** regarding **collision resolution**. Discuss the choice between allocating more memory to reduce collisions versus using a smaller table.\n\n5. **Part 4**: Explain the tradeoff between **speed and memory** regarding **collision resolution**. Discuss the choice between allocating more memory to reduce collisions versus using a smaller table.\n\nEnsure each section is self-contained and includes specific examples or analogies to illustrate the tradeoff.\n\n<think>\n\n</think>\n\nHash tables are a fundamental data structure used to store and retrieve data efficiently. They provide average-case constant time complexity for lookup, insertion, and deletion operations, making them indispensable in modern computing. However, achieving optimal performance requires careful consideration of several tradeoffs, particularly between speed and memory usage.\n\n### Part 1: Speed vs. Memory \u2013 Load Factor and Lookup Speed\n\nThe load factor of a hash table is the ratio of the number of stored elements to the total number of buckets (slots) in the table. A low load factor means many empty buckets, while a high load factor indicates that most buckets are occupied.\n\nWhen a hash table is sized for a million items but only contains a few thousand, the load factor is extremely low (e.g., 0.003). While this configuration may seem to favor speed by minimizing collisions, it is highly inefficient in terms of memory usage. Each bucket occupies memory, even if it remains empty. Allocating memory for a million buckets when only a few thousand are needed results in significant wasted space. This is problematic because:\n\n- **Memory Overhead**: Each bucket typically stores a pointer or reference, consuming memory even when empty.\n- **Cache Inefficiency**: Modern CPUs rely on cache locality. A sparse table spreads data across memory, reducing cache hit rates and slowing down access times.\n- **Scalability Issues**: If the table grows, the initial",
+      "finish_reason": "length",
+      "index": 2,
+      "phase": "measured"
+    }
+  ]
+}

@@ -557,6 +557,32 @@ torch::Tensor ggml_moe_a8_vec(
   DISPATCH_FLOAT_TYPES(X.scalar_type(), "ggml_moe_vec_a8", [&] {
     quantize_row_q8_1_cuda<scalar_t>((scalar_t*)X.data_ptr(), (void*)quant_X.data_ptr(), col, tokens, stream);
     switch (type) {
+      case 42:
+        moe_vec_q2_0_q8_1_cuda<scalar_t>(
+            (void*)W.data_ptr(),
+            (void*)quant_X.data_ptr(),
+            (scalar_t*)Y.data_ptr(),
+            (int*)topk_ids.data_ptr(),
+            top_k,
+            tokens,
+            col,
+            row,
+            quant_X.stride(0),
+            stream);
+        break;
+      case 10042:
+        moe_vec_q2_0_sym_q8_1_cuda<scalar_t>(
+            (void*)W.data_ptr(),
+            (void*)quant_X.data_ptr(),
+            (scalar_t*)Y.data_ptr(),
+            (int*)topk_ids.data_ptr(),
+            top_k,
+            tokens,
+            col,
+            row,
+            quant_X.stride(0),
+            stream);
+        break;
       case 2:
         moe_vec_q4_0_q8_1_cuda<scalar_t>(
             (void*)W.data_ptr(),
@@ -811,6 +837,9 @@ torch::Tensor ggml_moe_a8_vec(
 
 int64_t ggml_moe_get_block_size(int64_t type) {
   switch (type) {
+    case 42:
+    case 10042:
+      return 1;
     case 2:
       return MOE_X_Q4_0;
     case 3:

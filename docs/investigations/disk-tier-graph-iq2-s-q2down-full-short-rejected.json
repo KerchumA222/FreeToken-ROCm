@@ -1,0 +1,156 @@
+{
+  "mode": "graph",
+  "recorded_at_utc": "2026-09-18T07:02:22.139201+00:00",
+  "endpoint": "http://127.0.0.1:8199/v1/completions",
+  "request": {
+    "model": "Qwen3.8-Flash-Next-IQ2_S-Q2_0-00001-of-00006.gguf",
+    "prompt": "The capital of France is a city with museums, historic landmarks, and a river running through it. Explain the main attractions in one sentence.",
+    "max_tokens": 48,
+    "temperature": 0,
+    "ignore_eos": true,
+    "stream": true,
+    "stream_options": {
+      "include_usage": true
+    }
+  },
+  "warmup_count": 4,
+  "measured_count": 7,
+  "throughput_method": "(completion_tokens - 1) / (last_text_time - first_text_time); iter_lines(chunk_size=1)",
+  "measured_median_tok_s": 18.598218857694686,
+  "measured_min_tok_s": 18.53431580632309,
+  "measured_max_tok_s": 18.622090176271605,
+  "records": [
+    {
+      "completion_tokens": 47,
+      "decode_seconds_first_text_to_last_text": 5.413741964846849,
+      "decode_tokens_after_first_per_second": 8.496895548161078,
+      "first_text_seconds_from_request": 7.251148828072473,
+      "done_seconds_from_request": 12.665575528051704,
+      "text_sha256": "280a420bb0d848a390a1a749e4d35aaf44804b976bd787c048139a91e005f833",
+      "text": "\n\n<think>\n\n</think>\n\nThe capital of France is Paris, a city renowned for its rich cultural heritage featuring iconic landmarks like the Eiffel Tower and Notre-Dame, world-class museums such as the Loure, and the scenic Seine River",
+      "finish_reason": "length",
+      "index": 0,
+      "phase": "warmup"
+    },
+    {
+      "completion_tokens": 47,
+      "decode_seconds_first_text_to_last_text": 2.752889710944146,
+      "decode_tokens_after_first_per_second": 16.709714093204116,
+      "first_text_seconds_from_request": 1.411438390146941,
+      "done_seconds_from_request": 4.165005892980844,
+      "text_sha256": "280a420bb0d848a390a1a749e4d35aaf44804b976bd787c048139a91e005f833",
+      "text": "\n\n<think>\n\n</think>\n\nThe capital of France is Paris, a city renowned for its rich cultural heritage featuring iconic landmarks like the Eiffel Tower and Notre-Dame, world-class museums such as the Loure, and the scenic Seine River",
+      "finish_reason": "length",
+      "index": 1,
+      "phase": "warmup"
+    },
+    {
+      "completion_tokens": 47,
+      "decode_seconds_first_text_to_last_text": 2.4717139729764313,
+      "decode_tokens_after_first_per_second": 18.61056760730568,
+      "first_text_seconds_from_request": 1.3141099631320685,
+      "done_seconds_from_request": 3.7864916890393943,
+      "text_sha256": "280a420bb0d848a390a1a749e4d35aaf44804b976bd787c048139a91e005f833",
+      "text": "\n\n<think>\n\n</think>\n\nThe capital of France is Paris, a city renowned for its rich cultural heritage featuring iconic landmarks like the Eiffel Tower and Notre-Dame, world-class museums such as the Loure, and the scenic Seine River",
+      "finish_reason": "length",
+      "index": 2,
+      "phase": "warmup"
+    },
+    {
+      "completion_tokens": 47,
+      "decode_seconds_first_text_to_last_text": 2.4710796819999814,
+      "decode_tokens_after_first_per_second": 18.615344675073228,
+      "first_text_seconds_from_request": 1.3035357580520213,
+      "done_seconds_from_request": 3.7754011258948594,
+      "text_sha256": "280a420bb0d848a390a1a749e4d35aaf44804b976bd787c048139a91e005f833",
+      "text": "\n\n<think>\n\n</think>\n\nThe capital of France is Paris, a city renowned for its rich cultural heritage featuring iconic landmarks like the Eiffel Tower and Notre-Dame, world-class museums such as the Loure, and the scenic Seine River",
+      "finish_reason": "length",
+      "index": 3,
+      "phase": "warmup"
+    },
+    {
+      "completion_tokens": 47,
+      "decode_seconds_first_text_to_last_text": 2.4738017718773335,
+      "decode_tokens_after_first_per_second": 18.5948609637753,
+      "first_text_seconds_from_request": 1.3185374301392585,
+      "done_seconds_from_request": 3.7930245290044695,
+      "text_sha256": "280a420bb0d848a390a1a749e4d35aaf44804b976bd787c048139a91e005f833",
+      "text": "\n\n<think>\n\n</think>\n\nThe capital of France is Paris, a city renowned for its rich cultural heritage featuring iconic landmarks like the Eiffel Tower and Notre-Dame, world-class museums such as the Loure, and the scenic Seine River",
+      "finish_reason": "length",
+      "index": 4,
+      "phase": "measured"
+    },
+    {
+      "completion_tokens": 47,
+      "decode_seconds_first_text_to_last_text": 2.470649929018691,
+      "decode_tokens_after_first_per_second": 18.61858268940213,
+      "first_text_seconds_from_request": 1.3331634309142828,
+      "done_seconds_from_request": 3.804505209904164,
+      "text_sha256": "280a420bb0d848a390a1a749e4d35aaf44804b976bd787c048139a91e005f833",
+      "text": "\n\n<think>\n\n</think>\n\nThe capital of France is Paris, a city renowned for its rich cultural heritage featuring iconic landmarks like the Eiffel Tower and Notre-Dame, world-class museums such as the Loure, and the scenic Seine River",
+      "finish_reason": "length",
+      "index": 5,
+      "phase": "measured"
+    },
+    {
+      "completion_tokens": 47,
+      "decode_seconds_first_text_to_last_text": 2.470607499126345,
+      "decode_tokens_after_first_per_second": 18.618902442523346,
+      "first_text_seconds_from_request": 1.353476150892675,
+      "done_seconds_from_request": 3.8247761700768024,
+      "text_sha256": "280a420bb0d848a390a1a749e4d35aaf44804b976bd787c048139a91e005f833",
+      "text": "\n\n<think>\n\n</think>\n\nThe capital of France is Paris, a city renowned for its rich cultural heritage featuring iconic landmarks like the Eiffel Tower and Notre-Dame, world-class museums such as the Loure, and the scenic Seine River",
+      "finish_reason": "length",
+      "index": 6,
+      "phase": "measured"
+    },
+    {
+      "completion_tokens": 47,
+      "decode_seconds_first_text_to_last_text": 2.4701845799572766,
+      "decode_tokens_after_first_per_second": 18.622090176271605,
+      "first_text_seconds_from_request": 1.3305051499046385,
+      "done_seconds_from_request": 3.8013721299357712,
+      "text_sha256": "280a420bb0d848a390a1a749e4d35aaf44804b976bd787c048139a91e005f833",
+      "text": "\n\n<think>\n\n</think>\n\nThe capital of France is Paris, a city renowned for its rich cultural heritage featuring iconic landmarks like the Eiffel Tower and Notre-Dame, world-class museums such as the Loure, and the scenic Seine River",
+      "finish_reason": "length",
+      "index": 7,
+      "phase": "measured"
+    },
+    {
+      "completion_tokens": 47,
+      "decode_seconds_first_text_to_last_text": 2.475752712925896,
+      "decode_tokens_after_first_per_second": 18.58020785348802,
+      "first_text_seconds_from_request": 1.3569819829426706,
+      "done_seconds_from_request": 3.8334298219997436,
+      "text_sha256": "280a420bb0d848a390a1a749e4d35aaf44804b976bd787c048139a91e005f833",
+      "text": "\n\n<think>\n\n</think>\n\nThe capital of France is Paris, a city renowned for its rich cultural heritage featuring iconic landmarks like the Eiffel Tower and Notre-Dame, world-class museums such as the Loure, and the scenic Seine River",
+      "finish_reason": "length",
+      "index": 8,
+      "phase": "measured"
+    },
+    {
+      "completion_tokens": 47,
+      "decode_seconds_first_text_to_last_text": 2.4818828210700303,
+      "decode_tokens_after_first_per_second": 18.53431580632309,
+      "first_text_seconds_from_request": 1.320965182967484,
+      "done_seconds_from_request": 3.8040390368551016,
+      "text_sha256": "280a420bb0d848a390a1a749e4d35aaf44804b976bd787c048139a91e005f833",
+      "text": "\n\n<think>\n\n</think>\n\nThe capital of France is Paris, a city renowned for its rich cultural heritage featuring iconic landmarks like the Eiffel Tower and Notre-Dame, world-class museums such as the Loure, and the scenic Seine River",
+      "finish_reason": "length",
+      "index": 9,
+      "phase": "measured"
+    },
+    {
+      "completion_tokens": 47,
+      "decode_seconds_first_text_to_last_text": 2.4733551288954914,
+      "decode_tokens_after_first_per_second": 18.598218857694686,
+      "first_text_seconds_from_request": 1.30658125015907,
+      "done_seconds_from_request": 3.7806312430184335,
+      "text_sha256": "280a420bb0d848a390a1a749e4d35aaf44804b976bd787c048139a91e005f833",
+      "text": "\n\n<think>\n\n</think>\n\nThe capital of France is Paris, a city renowned for its rich cultural heritage featuring iconic landmarks like the Eiffel Tower and Notre-Dame, world-class museums such as the Loure, and the scenic Seine River",
+      "finish_reason": "length",
+      "index": 10,
+      "phase": "measured"
+    }
+  ]
+}

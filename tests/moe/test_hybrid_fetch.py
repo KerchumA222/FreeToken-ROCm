@@ -7,10 +7,12 @@ per-step integer split (GPU kernel vs CPU reference mirror, and the balance rule
 
 import json
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
 
+from freetoken.layers.moe import OffloadMoELayer
 from freetoken.moe.bench_profile import default_profile_path, load_backend_recommendation, load_hybrid_fetch_fraction
 from freetoken.moe.offload_cache import OffloadMoeCache
 
@@ -85,8 +87,131 @@ def test_profile_lookup_prefers_the_gpu_uuid_file(tmp_path, monkeypatch):
     assert load_backend_recommendation("bf16", gpu_name="FAKE GPU", gpu_uuid=uuid) == "offload"
 
 
+def _hybrid_decode_fake_cache(events, host_tier):
+    class Executor:
+        def decode_submit(self, layer_id, hidden_states, topk_weights, topk_ids):
+            events.append("submit")
+            return hidden_states
+
+        def decode_sync(self, pending):
+            events.append("sync")
+            return torch.zeros_like(pending)
+
+    def ensure(layer_id, topk_ids):
+        events.append("ensure")
+
+    def copy_missing():
+        events.append("copy")
+
+    return SimpleNamespace(
+        cpu_executor=Executor(),
+        host_tier=host_tier,
+        collect_stats=False,
+        ensure_experts_hybrid=ensure,
+        copy_missing=copy_missing,
+        bank_views=lambda: (),
+        alphas_for_slots=lambda layer_id: None,
+    )
+
+
+@pytest.mark.parametrize(
+    ("host_tier", "expected"),
+    [
+        (None, ["ensure", "submit", "copy", "gemm", "sync"]),
+        (object(), ["ensure", "copy", "submit", "gemm", "sync"]),
+    ],
+    ids=["resident", "bounded-host"],
+)
+def test_hybrid_decode_orders_bounded_copy_before_cpu_admission(
+    host_tier, expected, monkeypatch
+):
+    monkeypatch.setattr("freetoken.layers.moe._HYBRID_OVERLAP", True)
+    events = []
+    cache = _hybrid_decode_fake_cache(events, host_tier)
+    layer = object.__new__(OffloadMoELayer)
+    layer.layer_id = 0
+    layer._expert_gemm = lambda *args, **kwargs: events.append("gemm") or torch.zeros(
+        (1, 4), dtype=torch.bfloat16
+    )
+    hidden = torch.zeros((1, 4), dtype=torch.bfloat16)
+    weights = torch.ones((1, 2), dtype=torch.float32)
+    ids = torch.tensor([[0, 1]], dtype=torch.int32)
+
+    layer._decode_hybrid(cache, hidden, weights, ids)
+
+    assert events == expected
+
+
+@pytest.mark.parametrize("host_tier", [None, object()], ids=["resident", "bounded-host"])
+def test_ensure_experts_hybrid_admits_only_with_host_tier(monkeypatch, host_tier):
+    events = []
+    cache = OffloadMoeCache.__new__(OffloadMoeCache)
+    cache.collect_decode_freq = False
+    cache.hybrid_max_fetch = 1
+    cache.hybrid_fetch_fraction = 0.0
+    cache.host_tier = host_tier
+    cache._admit_to_host_tier = lambda layer_id: events.append("admit")
+
+    def ensure_kernel(*args):
+        events.append("kernel")
+
+    monkeypatch.setattr("freetoken.moe.offload_kernels.ensure_experts_hybrid", ensure_kernel)
+    cache.ensure_experts_hybrid(0, torch.tensor([2], dtype=torch.int32))
+
+    assert events == (["kernel", "admit"] if host_tier is not None else ["kernel"])
+
+
+def test_hybrid_decode_partitions_multiple_routes_and_merges(monkeypatch):
+    """GPU slots and CPU overflow routes each contribute exactly once."""
+    monkeypatch.setattr("freetoken.layers.moe._HYBRID_OVERLAP", True)
+    seen = {}
+
+    class Executor:
+        def decode_submit(self, layer_id, hidden_states, topk_weights, topk_ids):
+            seen["cpu_ids"] = topk_ids.clone()
+            seen["cpu_weights"] = topk_weights.clone()
+            cpu_weight = topk_weights.masked_select(topk_ids >= 0).sum()
+            return torch.full_like(hidden_states, cpu_weight)
+
+        def decode_sync(self, pending):
+            return pending
+
+    cache = SimpleNamespace(
+        cpu_executor=Executor(),
+        host_tier=None,
+        collect_stats=False,
+        ensure_experts_hybrid=lambda layer_id, ids: ids.copy_(
+            torch.tensor([[2, -1, 5, -1]], dtype=ids.dtype)
+        ),
+        copy_missing=lambda: None,
+        bank_views=lambda: (),
+        alphas_for_slots=lambda layer_id: None,
+    )
+    layer = object.__new__(OffloadMoELayer)
+    layer.layer_id = 0
+
+    def gpu_gemm(cache, hidden_states, weights, slots, **kwargs):
+        seen["gpu_slots"] = slots.clone()
+        seen["gpu_weights"] = weights.clone()
+        return torch.full_like(hidden_states, weights.sum())
+
+    layer._expert_gemm = gpu_gemm
+    hidden = torch.zeros((1, 2), dtype=torch.float32)
+    weights = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
+    ids = torch.tensor([[10, 11, 12, 13]], dtype=torch.int32)
+
+    output = layer._decode_hybrid(cache, hidden, weights, ids)
+
+    assert torch.equal(seen["cpu_ids"], torch.tensor([[-1, 11, -1, 13]], dtype=torch.int32))
+    assert torch.equal(seen["cpu_weights"], weights)
+    assert torch.equal(seen["gpu_slots"], torch.tensor([[2, 0, 5, 0]], dtype=torch.int32))
+    assert torch.equal(seen["gpu_weights"], torch.tensor([[1.0, 0.0, 3.0, 0.0]]))
+    assert torch.equal(output, torch.full_like(hidden, 10.0))
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-def test_hybrid_fraction_gpu_matches_cpu_reference():
+@pytest.mark.parametrize("policy", ["recency", "frequency", "lowest_id"])
+def test_hybrid_fraction_gpu_matches_cpu_reference(policy):
     torch.manual_seed(0)
     num_experts, cache_size, top_k, frac = 32, 40, 8, 0.415
 
@@ -95,6 +220,7 @@ def test_hybrid_fraction_gpu_matches_cpu_reference():
             num_layers=2, num_experts=num_experts, cache_size=cache_size,
             device=torch.device("cuda"), quant_format="bf16", decode_target="hybrid",
             hybrid_max_fetch=num_experts, hybrid_fetch_fraction=frac,
+            hybrid_fetch_policy=policy, hybrid_frequency_warmup=2,
         )
 
     gpu, ref = make(), make()
@@ -112,6 +238,8 @@ def test_hybrid_fraction_gpu_matches_cpu_reference():
         assert torch.equal(g.cpu(), c)
         assert torch.equal(gpu.slot_for_id.cpu(), ref.slot_for_id.cpu())
         assert torch.equal(gpu.id_of_slot.cpu(), ref.id_of_slot.cpu())
+        assert torch.equal(gpu.expert_frequency.cpu(), ref.expert_frequency.cpu())
+        assert torch.equal(gpu.hybrid_call_count.cpu(), ref.hybrid_call_count.cpu())
         assert (g >= 0).sum().item() == len(set(ids.tolist())) - (missing - fetched)
 
 
@@ -126,3 +254,101 @@ def test_hybrid_fixed_cap_unchanged():
     cache.ensure_experts_hybrid(0, ids)
     assert int(cache.num_missing_full.item()) == 8
     assert int(cache.num_indices.item()) == 1
+
+
+def test_hybrid_frequency_learns_per_layer_then_freezes():
+    cache = OffloadMoeCache(
+        num_layers=2,
+        num_experts=8,
+        cache_size=8,
+        device=torch.device("cpu"),
+        quant_format="bf16",
+        decode_target="hybrid",
+        hybrid_max_fetch=1,
+        hybrid_fetch_policy="frequency",
+        hybrid_frequency_warmup=2,
+    )
+
+    # Duplicate routes count as separate occurrences during the warmup.
+    for ids in ([1, 1, 1, 2], [2]):
+        cache.ensure_experts_hybrid(0, torch.tensor(ids, dtype=torch.int32))
+    assert int(cache.hybrid_call_count[0]) == 2
+    assert cache.expert_frequency[0].tolist()[:3] == [0, 3, 2]
+
+    # Make both candidates misses and make expert 2 more recent. Frequency still wins.
+    cache.slot_for_id.fill_(-1)
+    cache.id_of_slot.fill_(-1)
+    cache.usage.zero_()
+    cache.expert_recency[0, 1] = 1
+    cache.expert_recency[0, 2] = 2
+
+    ids = torch.tensor([1, 2], dtype=torch.int32)
+    cache.ensure_experts_hybrid(0, ids)
+    assert int(cache.src_indices[0]) == 1
+    assert int(cache.hybrid_call_count[0]) == 3
+    learned = cache.expert_frequency[0].clone()
+
+    # Once learned, later calls do not change the frequency ranking table.
+    cache.ensure_experts_hybrid(0, torch.tensor([1, 2], dtype=torch.int32))
+    assert torch.equal(cache.expert_frequency[0], learned)
+
+    # The other layer has its own warmup counter and starts learning independently.
+    cache.ensure_experts_hybrid(1, torch.tensor([6, 7], dtype=torch.int32))
+    assert int(cache.hybrid_call_count[1]) == 1
+    assert int(cache.hybrid_call_count[0]) == 4
+
+
+def test_hybrid_fetch_policy_default_is_not_environment_controlled(monkeypatch):
+    monkeypatch.setenv("FREETOKEN_HYBRID_FETCH", "lowest_id")
+    cache = OffloadMoeCache(
+        num_layers=1,
+        num_experts=4,
+        cache_size=4,
+        device=torch.device("cpu"),
+        quant_format="bf16",
+        decode_target="hybrid",
+    )
+    assert cache.hybrid_fetch_policy == "recency"
+
+
+@pytest.mark.parametrize("policy", ["recency", "lowest_id"])
+def test_non_frequency_policies_do_not_update_frequency_warmup_counter(policy):
+    cache = OffloadMoeCache(
+        num_layers=1,
+        num_experts=4,
+        cache_size=4,
+        device=torch.device("cpu"),
+        quant_format="bf16",
+        decode_target="hybrid",
+        hybrid_max_fetch=1,
+        hybrid_fetch_policy=policy,
+    )
+    cache.ensure_experts_hybrid(0, torch.tensor([1, 2], dtype=torch.int32))
+    assert int(cache.hybrid_call_count[0]) == 0
+    assert not torch.any(cache.expert_frequency)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_hybrid_frequency_warmup_uses_recency_on_gpu_and_cpu():
+    kwargs = dict(
+        num_layers=1,
+        num_experts=4,
+        cache_size=4,
+        quant_format="bf16",
+        decode_target="hybrid",
+        hybrid_max_fetch=1,
+        hybrid_fetch_policy="frequency",
+        hybrid_frequency_warmup=2,
+    )
+    gpu = OffloadMoeCache(device=torch.device("cuda"), **kwargs)
+    ref = OffloadMoeCache(device=torch.device("cpu"), **kwargs)
+    for cache in (gpu, ref):
+        cache.hybrid_call_count[0] = 1
+        cache.expert_recency[0, 3] = 5
+
+    g = torch.tensor([1, 3], dtype=torch.int32, device="cuda")
+    c = torch.tensor([1, 3], dtype=torch.int32)
+    gpu.ensure_experts_hybrid(0, g)
+    ref.ensure_experts_hybrid(0, c)
+    assert int(gpu.src_indices[0]) == int(ref.src_indices[0]) == 3
+    assert torch.equal(g.cpu(), c)

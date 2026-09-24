@@ -22,6 +22,32 @@ import numpy as np
 import torch
 
 
+Q2_0_CODEBOOK_KV = "freetoken.q2_0.codebook"
+Q2_0_SYMMETRIC_ODD = "symmetric_odd"
+GGML_Q2_0_SYM = 10042
+
+
+def _gguf_module():
+    """Import gguf-py with the newer Q2_0 tensor type when 0.19 lacks it."""
+    import gguf
+
+    if 42 in gguf.GGML_QUANT_SIZES:
+        return gguf
+    from enum import IntEnum
+    from gguf import gguf_reader, quants
+
+    members = {member.name: int(member) for member in gguf.GGMLQuantizationType}
+    members["Q2_0"] = 42
+    tensor_types = IntEnum("GGMLQuantizationType", members)
+    sizes = dict(gguf.GGML_QUANT_SIZES)
+    sizes[tensor_types.Q2_0] = (64, 18)
+    gguf.GGML_QUANT_SIZES = sizes
+    gguf_reader.GGMLQuantizationType = tensor_types
+    gguf_reader.GGML_QUANT_SIZES = sizes
+    quants.GGML_QUANT_SIZES = sizes
+    return gguf
+
+
 def is_gguf_path(model_path: str) -> bool:
     """A ``.gguf`` file -- single-file, or any shard of a llama.cpp split set."""
     return isinstance(model_path, str) and os.path.isfile(model_path) and model_path.endswith(
@@ -101,7 +127,7 @@ def write_metadata_gguf(source_gguf: str, dest_path: str) -> None:
     Validates by re-parsing: the copy must list zero tensors and expose the identical KV
     key set (the KV *bytes* are copied verbatim, so identical keys imply identical values).
     """
-    import gguf
+    gguf = _gguf_module()
 
     shards = gguf_shard_paths(source_gguf)
     source_gguf = shards[0]  # full KV lives in shard 1 of a split set
@@ -169,7 +195,7 @@ def _field_value(reader, name: str) -> Any:
 
 @functools.cache
 def _reader(model_path: str):
-    import gguf
+    gguf = _gguf_module()
 
     return gguf.GGUFReader(model_path)
 
@@ -197,9 +223,10 @@ def iter_gguf_tensors(model_path: str) -> Iterator[GgufTensor]:
 
 
 def _iter_shard_tensors(model_path: str) -> Iterator[GgufTensor]:
-    import gguf
+    gguf = _gguf_module()
 
     reader = _reader(model_path)
+    q2_codebook = load_gguf_metadata(model_path).get(Q2_0_CODEBOOK_KV)
     for t in reader.tensors:
         ne = [int(s) for s in t.shape]  # ggml order, fastest dim first
         torch_shape = tuple(reversed(ne))
@@ -216,10 +243,13 @@ def _iter_shard_tensors(model_path: str) -> Iterator[GgufTensor]:
         # normalize everything to a flat byte view before shaping into [rows, row_bytes].
         flat = np.ascontiguousarray(t.data).reshape(-1).view(np.uint8)
         raw = flat.reshape(rows, row_bytes)
+        ggml_type = int(t.tensor_type)
+        if ggml_type == 42 and q2_codebook == Q2_0_SYMMETRIC_ODD:
+            ggml_type = GGML_Q2_0_SYM
         yield GgufTensor(
             name=t.name,
             shape=torch_shape,
-            ggml_type=int(t.tensor_type),
+            ggml_type=ggml_type,
             rows=rows,
             row_bytes=row_bytes,
             _raw=raw,
@@ -321,6 +351,8 @@ def gguf_tensor_names(model_path: str) -> set[str]:
 
 
 __all__ = [
+    "Q2_0_CODEBOOK_KV",
+    "Q2_0_SYMMETRIC_ODD",
     "is_gguf_path",
     "gguf_shard_paths",
     "FTW_METADATA_GGUF",

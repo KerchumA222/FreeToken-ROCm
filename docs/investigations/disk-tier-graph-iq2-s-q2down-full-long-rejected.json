@@ -1,0 +1,60 @@
+{
+  "mode": "graph",
+  "recorded_at_utc": "2026-09-18T07:04:46.334651+00:00",
+  "endpoint": "http://127.0.0.1:8199/v1/completions",
+  "request": {
+    "model": "Qwen3.8-Flash-Next-IQ2_S-Q2_0-00001-of-00006.gguf",
+    "prompt": "Write a detailed technical discussion of hash table implementation tradeoffs.",
+    "max_tokens": 512,
+    "temperature": 0,
+    "ignore_eos": true,
+    "stream": true,
+    "stream_options": {
+      "include_usage": true
+    }
+  },
+  "warmup_count": 1,
+  "measured_count": 2,
+  "throughput_method": "(completion_tokens - 1) / (last_text_time - first_text_time); iter_lines(chunk_size=1)",
+  "measured_median_tok_s": 12.190538985499684,
+  "measured_min_tok_s": 12.178943109172765,
+  "measured_max_tok_s": 12.202134861826602,
+  "records": [
+    {
+      "completion_tokens": 511,
+      "decode_seconds_first_text_to_last_text": 42.78377886186354,
+      "decode_tokens_after_first_per_second": 11.920405666985205,
+      "first_text_seconds_from_request": 0.8608400081284344,
+      "done_seconds_from_request": 43.6465681779664,
+      "text_sha256": "adf372eece2ce46433d634e5d8f0f27e750b94b3eca3d19bc30379621ddbd6c3",
+      "text": "\n\n**Background**: The current implementation uses open addressing with quadratic probing.\n\n**Goal**: Explain the tradeoffs of implementing a hash table with **chaining** instead of open addressing, specifically focusing on:\n- **Load factor** implications (load factor < 1 vs > 1)\n- **Memory layout** (pointer-heavy vs contiguous)\n- **Cache locality** (pointer chasing vs sequential access)\n- **Performance** (amplification factor, probe length, cache misses)\n\n**Format**: A structured technical discussion with clear sections for each tradeoff.\n\n**Format**: The output should be present as a structured outline with clear sections for each tradeoff.\n\n**Constraints**: The response must be written in **English only**.\n\n**Restating the goal**: Write a detailed technical discussion of hash table implementation tradeoffs.\n\n**Background**: The current implementation uses open addressing with quadratic probing.\n\n**Goal**: Explain the tradeoff of implementing a hash table with chaining instead of open addressing, specifically focusing on:\n- Load factor implications (load factor < 1 vs > 1)\n- Memory layout (pointer-heavy vs contiguous)\n- Cache locality (pointer chasing vs sequential access)\n- Performance (amplification factor, probe length, cache misses)\n\n**Format**: A structured technical discussion with clear sections for each tradeoff.\n\n**Format**: The output should be present as a structured outline with clear sections for each tradeoff.\n\n**Constraints**: The response must be written in English only.\n\n**Restating the goal**: Write a detailed technical discussion of hash table implementation tradeoffs.\n\n**Background**: The current implementation uses open addressing with quadratic probing.\n\n**Goal**: Explain the tradeoff of implementing a hash table with chaining instead of open addressing, specifically focusing on:\n- Load factor implications (load factor < 1 vs > 1)\n- Memory layout (pointer-heavy vs contiguous)\n- Cache locality (posal vs sequential access)\n- Performance (amplification factor, probe length, cache misses)\n\n**Format**: A structured technical discussion with clear sections for each tradeoff.\n\n**Format**: The output should be present as a structured outline with clear sections for each tradeoff.\n\n**Constraints**: The response must be written in English only.\n\n**Restating the goal**: Write a detailed technical discussion of hash table implementation tradeoffs.\n\n**Background**: The current implementation uses quadratic probing.\n\n**Goal**: Explain the tradeoff of implementing a",
+      "finish_reason": "length",
+      "index": 0,
+      "phase": "warmup"
+    },
+    {
+      "completion_tokens": 511,
+      "decode_seconds_first_text_to_last_text": 41.875554834958166,
+      "decode_tokens_after_first_per_second": 12.178943109172765,
+      "first_text_seconds_from_request": 0.9383176991250366,
+      "done_seconds_from_request": 42.81458975211717,
+      "text_sha256": "adf372eece2ce46433d634e5d8f0f27e750b94b3eca3d19bc30379621ddbd6c3",
+      "text": "\n\n**Background**: The current implementation uses open addressing with quadratic probing.\n\n**Goal**: Explain the tradeoffs of implementing a hash table with **chaining** instead of open addressing, specifically focusing on:\n- **Load factor** implications (load factor < 1 vs > 1)\n- **Memory layout** (pointer-heavy vs contiguous)\n- **Cache locality** (pointer chasing vs sequential access)\n- **Performance** (amplification factor, probe length, cache misses)\n\n**Format**: A structured technical discussion with clear sections for each tradeoff.\n\n**Format**: The output should be present as a structured outline with clear sections for each tradeoff.\n\n**Constraints**: The response must be written in **English only**.\n\n**Restating the goal**: Write a detailed technical discussion of hash table implementation tradeoffs.\n\n**Background**: The current implementation uses open addressing with quadratic probing.\n\n**Goal**: Explain the tradeoff of implementing a hash table with chaining instead of open addressing, specifically focusing on:\n- Load factor implications (load factor < 1 vs > 1)\n- Memory layout (pointer-heavy vs contiguous)\n- Cache locality (pointer chasing vs sequential access)\n- Performance (amplification factor, probe length, cache misses)\n\n**Format**: A structured technical discussion with clear sections for each tradeoff.\n\n**Format**: The output should be present as a structured outline with clear sections for each tradeoff.\n\n**Constraints**: The response must be written in English only.\n\n**Restating the goal**: Write a detailed technical discussion of hash table implementation tradeoffs.\n\n**Background**: The current implementation uses open addressing with quadratic probing.\n\n**Goal**: Explain the tradeoff of implementing a hash table with chaining instead of open addressing, specifically focusing on:\n- Load factor implications (load factor < 1 vs > 1)\n- Memory layout (pointer-heavy vs contiguous)\n- Cache locality (posal vs sequential access)\n- Performance (amplification factor, probe length, cache misses)\n\n**Format**: A structured technical discussion with clear sections for each tradeoff.\n\n**Format**: The output should be present as a structured outline with clear sections for each tradeoff.\n\n**Constraints**: The response must be written in English only.\n\n**Restating the goal**: Write a detailed technical discussion of hash table implementation tradeoffs.\n\n**Background**: The current implementation uses quadratic probing.\n\n**Goal**: Explain the tradeoff of implementing a",
+      "finish_reason": "length",
+      "index": 1,
+      "phase": "measured"
+    },
+    {
+      "completion_tokens": 511,
+      "decode_seconds_first_text_to_last_text": 41.795964868040755,
+      "decode_tokens_after_first_per_second": 12.202134861826602,
+      "first_text_seconds_from_request": 0.9057568579446524,
+      "done_seconds_from_request": 42.70246615400538,
+      "text_sha256": "adf372eece2ce46433d634e5d8f0f27e750b94b3eca3d19bc30379621ddbd6c3",
+      "text": "\n\n**Background**: The current implementation uses open addressing with quadratic probing.\n\n**Goal**: Explain the tradeoffs of implementing a hash table with **chaining** instead of open addressing, specifically focusing on:\n- **Load factor** implications (load factor < 1 vs > 1)\n- **Memory layout** (pointer-heavy vs contiguous)\n- **Cache locality** (pointer chasing vs sequential access)\n- **Performance** (amplification factor, probe length, cache misses)\n\n**Format**: A structured technical discussion with clear sections for each tradeoff.\n\n**Format**: The output should be present as a structured outline with clear sections for each tradeoff.\n\n**Constraints**: The response must be written in **English only**.\n\n**Restating the goal**: Write a detailed technical discussion of hash table implementation tradeoffs.\n\n**Background**: The current implementation uses open addressing with quadratic probing.\n\n**Goal**: Explain the tradeoff of implementing a hash table with chaining instead of open addressing, specifically focusing on:\n- Load factor implications (load factor < 1 vs > 1)\n- Memory layout (pointer-heavy vs contiguous)\n- Cache locality (pointer chasing vs sequential access)\n- Performance (amplification factor, probe length, cache misses)\n\n**Format**: A structured technical discussion with clear sections for each tradeoff.\n\n**Format**: The output should be present as a structured outline with clear sections for each tradeoff.\n\n**Constraints**: The response must be written in English only.\n\n**Restating the goal**: Write a detailed technical discussion of hash table implementation tradeoffs.\n\n**Background**: The current implementation uses open addressing with quadratic probing.\n\n**Goal**: Explain the tradeoff of implementing a hash table with chaining instead of open addressing, specifically focusing on:\n- Load factor implications (load factor < 1 vs > 1)\n- Memory layout (pointer-heavy vs contiguous)\n- Cache locality (posal vs sequential access)\n- Performance (amplification factor, probe length, cache misses)\n\n**Format**: A structured technical discussion with clear sections for each tradeoff.\n\n**Format**: The output should be present as a structured outline with clear sections for each tradeoff.\n\n**Constraints**: The response must be written in English only.\n\n**Restating the goal**: Write a detailed technical discussion of hash table implementation tradeoffs.\n\n**Background**: The current implementation uses quadratic probing.\n\n**Goal**: Explain the tradeoff of implementing a",
+      "finish_reason": "length",
+      "index": 2,
+      "phase": "measured"
+    }
+  ]
+}

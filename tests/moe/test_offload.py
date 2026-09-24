@@ -240,6 +240,51 @@ def test_offload_moe_cache_marlin_rejects_slot_count_beyond_kernel_limit():
         )
 
 
+def test_frequency_cache_protects_fraction_and_reserves_dynamic_slots(monkeypatch):
+    from freetoken.moe.offload_cache import OffloadMoeCache
+    from freetoken.moe.offload_kernels import _rank_frequency_reference
+
+    cache = OffloadMoeCache(
+        num_layers=4,
+        num_experts=8,
+        cache_size=40,
+        device=torch.device("cpu"),
+        cache_policy="frequency",
+        frequency_warmup=3,
+        frequency_protect_fraction=0.5,
+    )
+    # floor(40 * .5 / 4) = 5; 20 unprotected slots remain for an eight-expert query.
+    assert cache.frequency_protect_count == 5
+    assert cache.frequency_counts.shape == (4, 8)
+    assert cache.frequency_calls.shape == (4,)
+    assert cache.frequency_protected.shape == (4, 8)
+    assert _rank_frequency_reference([3, 7, 7, 1, 0], 3) == [1, 2, 0]
+
+    cache.frequency_counts[0].fill_(9)
+    cache.frequency_protected[0].fill_(1)
+    cache.frequency_calls.fill_(3)
+    monkeypatch.setattr("freetoken.moe.offload_kernels.reset_cache", lambda _cache: None)
+    cache.reset()
+    assert not torch.any(cache.frequency_counts)
+    assert not torch.any(cache.frequency_calls)
+    assert not torch.any(cache.frequency_protected)
+
+
+def test_lru_cache_keeps_frequency_policy_state_inert():
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    cache = OffloadMoeCache(
+        num_layers=2,
+        num_experts=8,
+        cache_size=16,
+        device=torch.device("cpu"),
+        cache_policy="lru",
+    )
+    assert cache.frequency_protect_count == 0
+    assert not torch.any(cache.frequency_counts)
+    assert not torch.any(cache.frequency_protected)
+
+
 def test_prefill_overlap_prefetch_invalidates_borrowed_unified_cache_slots():
     from freetoken.moe.offload_cache import OffloadMoeCache
 

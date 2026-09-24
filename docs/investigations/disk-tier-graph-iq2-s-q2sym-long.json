@@ -1,0 +1,60 @@
+{
+  "mode": "graph",
+  "recorded_at_utc": "2026-09-18T18:28:26.656723+00:00",
+  "endpoint": "http://127.0.0.1:8199/v1/completions",
+  "request": {
+    "model": "Qwen3.8-Flash-Next-IQ2_S-Q2SYM-00001-of-00006.gguf",
+    "prompt": "Write a detailed technical discussion of hash table implementation tradeoffs.",
+    "max_tokens": 512,
+    "temperature": 0,
+    "ignore_eos": true,
+    "stream": true,
+    "stream_options": {
+      "include_usage": true
+    }
+  },
+  "warmup_count": 1,
+  "measured_count": 2,
+  "throughput_method": "(completion_tokens - 1) / (last_text_time - first_text_time); iter_lines(chunk_size=1)",
+  "measured_median_tok_s": 14.104539724549705,
+  "measured_min_tok_s": 14.088055078640997,
+  "measured_max_tok_s": 14.121024370458413,
+  "records": [
+    {
+      "completion_tokens": 511,
+      "decode_seconds_first_text_to_last_text": 37.07657678006217,
+      "decode_tokens_after_first_per_second": 13.755315196041808,
+      "first_text_seconds_from_request": 0.8484538430348039,
+      "done_seconds_from_request": 37.92573551600799,
+      "text_sha256": "8410c7c4b1a9cadde0ccf6546343f2a460cfba2750bd1b2d3e9675bce141e79b",
+      "text": "\n\n<think>\nThe user wants a detailed technical discussion of hash table implementation tradeoffs. This is a broad topic that covers many aspects of hash table design. Let me think about what to cover:\n\n1. Hash function selection - what makes a good hash function, types of hash functions\n2. Collision resolution strategies - open addressing vs chaining vs cuckoo hashing\n3. Load factor and resizing strategies\n4. Memory layout considerations\n5. Performance tradeoffs (time vs space)\n6. Concurrency considerations\n7. Specific implementations (Java HashMap, Python dict, etc.)\n8. Load factor thresholds\n9. Probe sequences\n10. Tombstones and deletion strategies\n\nLet me write a comprehensive, well-structured technical discussion that covers the major tradeoffs. I'll aim for depth and precision, covering multiple dimensions of tradeoffs rather than just listing facts. The user asked for \"detailed\" so I should go deep into each topic.\n\nLet me structure this as a flowing technical essay with clear sections, covering the major tradeoffs systematically. I'll aim for a thorough treatment that demonstrates real understanding of the engineering decisions involved.\n</think>\n\n# Hash Table Implementation Tradeoffs: A Technical Discussion\n\n## 1. The Fundamental Design Space\n\nA hash table is a data structure that maps keys to values using a hash function to compute an index into an array of buckets. The design space is deceptively large: every implementation decision cascades into performance, memory, correctness, and scalability consequences. What follows is a survey of the major tradeoffs engineers face when selecting and tuning a hash table for production use.\n\n---\n\n## 2. Collision Resolution Strategy\n\nThis is the single most consequential design decision, and it determines nearly everything else.\n\n### Open Addressing (Linear Probing, Quadratic Probing, Double Hashing)\n\nIn open addressing, every key is stored directly in the array. When a collision occurs, the probe sequence determines the next slot to check.\n\n- **Linear probing** (`h(k) + i`): Cache-friendly because consecutive probes access adjacent memory, which is likely already in the CPU cache line (typically 64 bytes on x86). This is the reason Java's HashMap and many high-performance implementations favor it. The cost is **primary clustering**: a long run of occupied slots inflates probe lengths for all keys hashing into that region, not just the keys that originally collided.\n\n- **Quadratic probing** (`h(k) + i\u00b2`): Red",
+      "finish_reason": "length",
+      "index": 0,
+      "phase": "warmup"
+    },
+    {
+      "completion_tokens": 511,
+      "decode_seconds_first_text_to_last_text": 36.11636001896113,
+      "decode_tokens_after_first_per_second": 14.121024370458413,
+      "first_text_seconds_from_request": 0.987442976096645,
+      "done_seconds_from_request": 37.10449553397484,
+      "text_sha256": "8410c7c4b1a9cadde0ccf6546343f2a460cfba2750bd1b2d3e9675bce141e79b",
+      "text": "\n\n<think>\nThe user wants a detailed technical discussion of hash table implementation tradeoffs. This is a broad topic that covers many aspects of hash table design. Let me think about what to cover:\n\n1. Hash function selection - what makes a good hash function, types of hash functions\n2. Collision resolution strategies - open addressing vs chaining vs cuckoo hashing\n3. Load factor and resizing strategies\n4. Memory layout considerations\n5. Performance tradeoffs (time vs space)\n6. Concurrency considerations\n7. Specific implementations (Java HashMap, Python dict, etc.)\n8. Load factor thresholds\n9. Probe sequences\n10. Tombstones and deletion strategies\n\nLet me write a comprehensive, well-structured technical discussion that covers the major tradeoffs. I'll aim for depth and precision, covering multiple dimensions of tradeoffs rather than just listing facts. The user asked for \"detailed\" so I should go deep into each topic.\n\nLet me structure this as a flowing technical essay with clear sections, covering the major tradeoffs systematically. I'll aim for a thorough treatment that demonstrates real understanding of the engineering decisions involved.\n</think>\n\n# Hash Table Implementation Tradeoffs: A Technical Discussion\n\n## 1. The Fundamental Design Space\n\nA hash table is a data structure that maps keys to values using a hash function to compute an index into an array of buckets. The design space is deceptively large: every implementation decision cascades into performance, memory, correctness, and scalability consequences. What follows is a survey of the major tradeoffs engineers face when selecting and tuning a hash table for production use.\n\n---\n\n## 2. Collision Resolution Strategy\n\nThis is the single most consequential design decision, and it determines nearly everything else.\n\n### Open Addressing (Linear Probing, Quadratic Probing, Double Hashing)\n\nIn open addressing, every key is stored directly in the array. When a collision occurs, the probe sequence determines the next slot to check.\n\n- **Linear probing** (`h(k) + i`): Cache-friendly because consecutive probes access adjacent memory, which is likely already in the CPU cache line (typically 64 bytes on x86). This is the reason Java's HashMap and many high-performance implementations favor it. The cost is **primary clustering**: a long run of occupied slots inflates probe lengths for all keys hashing into that region, not just the keys that originally collided.\n\n- **Quadratic probing** (`h(k) + i\u00b2`): Red",
+      "finish_reason": "length",
+      "index": 1,
+      "phase": "measured"
+    },
+    {
+      "completion_tokens": 511,
+      "decode_seconds_first_text_to_last_text": 36.20088061504066,
+      "decode_tokens_after_first_per_second": 14.088055078640997,
+      "first_text_seconds_from_request": 0.9720199590083212,
+      "done_seconds_from_request": 37.17358040995896,
+      "text_sha256": "8410c7c4b1a9cadde0ccf6546343f2a460cfba2750bd1b2d3e9675bce141e79b",
+      "text": "\n\n<think>\nThe user wants a detailed technical discussion of hash table implementation tradeoffs. This is a broad topic that covers many aspects of hash table design. Let me think about what to cover:\n\n1. Hash function selection - what makes a good hash function, types of hash functions\n2. Collision resolution strategies - open addressing vs chaining vs cuckoo hashing\n3. Load factor and resizing strategies\n4. Memory layout considerations\n5. Performance tradeoffs (time vs space)\n6. Concurrency considerations\n7. Specific implementations (Java HashMap, Python dict, etc.)\n8. Load factor thresholds\n9. Probe sequences\n10. Tombstones and deletion strategies\n\nLet me write a comprehensive, well-structured technical discussion that covers the major tradeoffs. I'll aim for depth and precision, covering multiple dimensions of tradeoffs rather than just listing facts. The user asked for \"detailed\" so I should go deep into each topic.\n\nLet me structure this as a flowing technical essay with clear sections, covering the major tradeoffs systematically. I'll aim for a thorough treatment that demonstrates real understanding of the engineering decisions involved.\n</think>\n\n# Hash Table Implementation Tradeoffs: A Technical Discussion\n\n## 1. The Fundamental Design Space\n\nA hash table is a data structure that maps keys to values using a hash function to compute an index into an array of buckets. The design space is deceptively large: every implementation decision cascades into performance, memory, correctness, and scalability consequences. What follows is a survey of the major tradeoffs engineers face when selecting and tuning a hash table for production use.\n\n---\n\n## 2. Collision Resolution Strategy\n\nThis is the single most consequential design decision, and it determines nearly everything else.\n\n### Open Addressing (Linear Probing, Quadratic Probing, Double Hashing)\n\nIn open addressing, every key is stored directly in the array. When a collision occurs, the probe sequence determines the next slot to check.\n\n- **Linear probing** (`h(k) + i`): Cache-friendly because consecutive probes access adjacent memory, which is likely already in the CPU cache line (typically 64 bytes on x86). This is the reason Java's HashMap and many high-performance implementations favor it. The cost is **primary clustering**: a long run of occupied slots inflates probe lengths for all keys hashing into that region, not just the keys that originally collided.\n\n- **Quadratic probing** (`h(k) + i\u00b2`): Red",
+      "finish_reason": "length",
+      "index": 2,
+      "phase": "measured"
+    }
+  ]
+}

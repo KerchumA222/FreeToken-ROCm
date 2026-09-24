@@ -146,14 +146,34 @@ class OffloadMoeCache:
     # pcie_bw / cpu_bw ratio so the PCIe fetch and the CPU overflow GEMV take equal
     # time (perfect overlap): fetched : cpu = pcie : cpu - pcie.
     hybrid_fetch_fraction: float = 0.0
+    # hybrid only: policy for choosing which capped misses cross PCIe. Frequency learns
+    # per-layer routed occurrences during the first ``hybrid_frequency_warmup`` calls,
+    # then freezes that primary ranking; recency remains the secondary key.
+    hybrid_fetch_policy: str = "recency"
+    hybrid_frequency_warmup: int = 128
+    # Global GPU slot policy: frequency learns one routed histogram per layer, then
+    # keeps a small per-layer top-frequency set out of the shared LRU victim pool.
+    frequency_warmup: int = 128
+    frequency_protect_fraction: float = 0.25
     # bank layout from the expert kernel (a BankSpec per role); when given it replaces the _BANK_SCHEMAS lookup and the slot cap comes from max_slots
     layout: dict | None = None
     max_slots: int | None = None
 
     def __post_init__(self) -> None:
-        policy_ids = {"lru": 0}
-        assert self.cache_policy in policy_ids
+        policy_ids = {"lru": 0, "frequency": 1}
+        if self.cache_policy not in policy_ids:
+            raise ValueError(f"unknown cache policy {self.cache_policy!r}")
+        if self.frequency_warmup < 1:
+            raise ValueError("frequency_warmup must be >= 1")
+        if not math.isfinite(self.frequency_protect_fraction) or not (
+            0 <= self.frequency_protect_fraction < 1
+        ):
+            raise ValueError("frequency_protect_fraction must be finite and in [0, 1)")
         assert self.decode_target in ("gpu", "cpu", "hybrid"), self.decode_target
+        assert self.hybrid_fetch_policy in ("recency", "frequency", "lowest_id"), (
+            self.hybrid_fetch_policy
+        )
+        assert self.hybrid_frequency_warmup >= 1, self.hybrid_frequency_warmup
         if self.layout is None:
             assert self.quant_format in _BANK_SCHEMAS, f"unknown quant_format {self.quant_format!r}"
         # Attached by the engine for decode_target == "cpu" (CpuMoeExecutor); None
@@ -178,6 +198,18 @@ class OffloadMoeCache:
             "(raise moe_cache_size or disable moe_prefill_overlap)"
         )
         self.cache_policy_id = policy_ids[self.cache_policy]
+        # Keep enough unprotected slots for the largest possible one-layer query. The
+        # router can touch every expert in a prefill or large batch, so num_experts is
+        # the only safe bound available before a graph's concrete query shape exists.
+        available = max(0, self.cache_size - self.num_experts)
+        requested = math.floor(
+            self.cache_size * self.frequency_protect_fraction / self.num_layers
+        )
+        self.frequency_protect_count = (
+            min(requested, available // self.num_layers)
+            if self.cache_policy == "frequency"
+            else 0
+        )
         self.slot_for_id = torch.full(
             (self.num_layers, self.num_experts),
             -1,
@@ -210,6 +242,25 @@ class OffloadMoeCache:
         # fetch (most-recently active first) and bumps it for every active expert.
         self.expert_recency = torch.full(
             (self.num_layers, self.num_experts), -1, dtype=torch.int64, device=self.device
+        )
+        # Frequency mode is entirely device-side so it remains safe under CUDA graph
+        # replay. Counts stop changing after each layer reaches its warmup call count.
+        self.expert_frequency = torch.zeros(
+            (self.num_layers, self.num_experts), dtype=torch.int64, device=self.device
+        )
+        self.hybrid_call_count = torch.zeros(
+            (self.num_layers,), dtype=torch.int64, device=self.device
+        )
+        # Global frequency state is separate from the hybrid capped-fetch histogram and
+        # call counter. Allocate it before graph capture, even when policy is LRU.
+        self.frequency_counts = torch.zeros(
+            (self.num_layers, self.num_experts), dtype=torch.int64, device=self.device
+        )
+        self.frequency_calls = torch.zeros(
+            (self.num_layers,), dtype=torch.int64, device=self.device
+        )
+        self.frequency_protected = torch.zeros(
+            (self.num_layers, self.num_experts), dtype=torch.int32, device=self.device
         )
         # Host source banks (one [num_experts, ...] tensor per layer, so layers can
         # carry independent host attributes -- see layer_residency) and their GPU
@@ -656,6 +707,15 @@ class OffloadMoeCache:
         self.banks = []
         self.bank_caches = {}
         self.cache_size = cache_size
+        available = max(0, cache_size - self.num_experts)
+        requested = math.floor(
+            cache_size * self.frequency_protect_fraction / self.num_layers
+        )
+        self.frequency_protect_count = (
+            min(requested, available // self.num_layers)
+            if self.cache_policy == "frequency"
+            else 0
+        )
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
             torch.cuda.empty_cache()
@@ -679,6 +739,11 @@ class OffloadMoeCache:
         self.num_indices.zero_()
         self.num_missing_full.zero_()
         self.expert_recency.fill_(-1)
+        self.expert_frequency.zero_()
+        self.hybrid_call_count.zero_()
+        self.frequency_counts.zero_()
+        self.frequency_calls.zero_()
+        self.frequency_protected.zero_()
         self.stat_missing.zero_()
         self.stat_active.zero_()
         self.stat_calls.zero_()
@@ -1118,10 +1183,9 @@ class OffloadMoeCache:
         """Make this step's GPU misses resident in the host pool and rewrite
         ``src_indices`` from expert rows to the host slots holding them.
 
-        This reads device state back, so the decode step cannot be CUDA-graph
-        captured while a disk tier is attached -- the engine turns capture off. The
-        graph-safe version of this is the flag handshake the CPU MoE executor already
-        uses; that is a later change, not a different design.
+        Eager execution reads the miss list back to the host. During graph capture,
+        admission instead records a host-function node that performs the host-tier
+        lookup on each replay.
         """
         if torch.cuda.is_current_stream_capturing():
             self._admit_capture(layer_id)
@@ -1184,10 +1248,13 @@ class OffloadMoeCache:
     def _admit_callback(self, layer_id: int, bufs: dict):
         def _run() -> None:
             try:
-                n = int(bufs["n"][0])
-                if n > 0:
-                    slots = self.host_tier.ensure(layer_id, bufs["src"][:n].tolist())
-                    bufs["out"][:n] = torch.as_tensor(slots, dtype=torch.int32)
+                # The callback runs on a driver thread, outside the engine's
+                # inference-mode context. Its pinned buffers were created there.
+                with torch.inference_mode():
+                    n = int(bufs["n"][0])
+                    if n > 0:
+                        slots = self.host_tier.ensure(layer_id, bufs["src"][:n].tolist())
+                        bufs["out"][:n] = torch.as_tensor(slots, dtype=torch.int32)
             except BaseException as exc:  # never unwind into the driver
                 if self._admit_error is None:
                     self._admit_error = exc
@@ -1254,6 +1321,8 @@ class OffloadMoeCache:
         ensure_experts_hybrid(
             self, layer_id, expert_ids, self.hybrid_max_fetch, self.hybrid_fetch_fraction
         )
+        if self.host_tier is not None:
+            self._admit_to_host_tier(layer_id)
 
     def materialize_layer(self, layer_id: int) -> None:
         from freetoken.moe.offload_kernels import materialize_layer
@@ -1266,9 +1335,12 @@ class OffloadMoeCache:
         from freetoken.moe.offload_kernels import reset_cache
 
         reset_cache(self)
-        # Per-expert recency is not cache_size-shaped, so reset_cache leaves it alone; wipe
-        # it here so a new sequence starts with cold hybrid fetch priorities.
         self.expert_recency.fill_(-1)
+        self.expert_frequency.zero_()
+        self.hybrid_call_count.zero_()
+        self.frequency_counts.zero_()
+        self.frequency_calls.zero_()
+        self.frequency_protected.zero_()
 
     def reset_stats(self) -> None:
         self.prefill_hit_rows = 0
@@ -1420,6 +1492,12 @@ class OffloadMoeCache:
             "fetched_per_layer": (fetched / calls) if calls else 0.0,
             "cpu_per_layer": ((missing - fetched) / calls) if calls else 0.0,
             "fetch_rate": (fetched / missing) if missing else 0.0,
+            "hybrid_fetch_policy": self.hybrid_fetch_policy,
+            "hybrid_frequency_warmup": self.hybrid_frequency_warmup,
+            "cache_policy": self.cache_policy,
+            "frequency_warmup": self.frequency_warmup,
+            "frequency_protect_fraction": self.frequency_protect_fraction,
+            "frequency_protect_count": self.frequency_protect_count,
             # prefill hit-D2D split: expert rows served from the cache (D2D) vs all
             # rows prefetched into the double buffer since the last reset.
             "prefill_hit_rows": self.prefill_hit_rows,

@@ -15,6 +15,13 @@
 // QR = QK / number of values before dequantization
 // QI = number of 32 bit integers before dequantization
 
+#define QK2_0 64
+#define QI2_0 (QK2_0 / 32)
+typedef struct {
+  half d;
+  uint8_t qs[QK2_0 / 4];
+} block_q2_0;
+
 #define QK4_0 32
 #define QR4_0 2
 #define QI4_0 (QK4_0 / (4 * QR4_0))

@@ -105,6 +105,7 @@ class GraphRunner:
         vocab_size: int,
         dummy_req: Req,
         moe_offload_cache: OffloadMoeCache | None = None,
+        capture_hidden: bool = False,
     ) -> None:
         cuda_graph_bs = _determine_cuda_graph_bs(
             cuda_graph_bs=cuda_graph_bs,
@@ -116,6 +117,7 @@ class GraphRunner:
         self.graph_bs_list = sorted(cuda_graph_bs)
         self.dummy_req = dummy_req
         self.moe_offload_cache = moe_offload_cache
+        self.capture_hidden = capture_hidden
         self.stream = stream
         self.device = device
         self._capture_graphs(max_seq_len, vocab_size, model)
@@ -132,6 +134,7 @@ class GraphRunner:
         # graphs-disabled early return so that config gets the phase too.
         emit_progress("Capturing CUDA graphs / warming up", 0, 0)
         self.graph_map: Dict[int, torch.cuda.CUDAGraph] = {}
+        self.hidden_map: Dict[int, torch.Tensor] = {}
         if self.max_graph_bs == 0:
             return logger.info_rank0("CUDA graph is disabled.")
 
@@ -168,6 +171,7 @@ class GraphRunner:
             pbar.refresh()
             graph = torch.cuda.CUDAGraph()
             batch = Batch(reqs=[self.dummy_req] * bs, phase="decode")
+            batch.capture_hidden = self.capture_hidden
             batch.padded_reqs = batch.reqs
             self.attn_backend.prepare_for_capture(batch)
             self.buffer.set_batch(batch)
@@ -188,6 +192,9 @@ class GraphRunner:
             if pool is None:
                 pool = graph.pool()  # reuse cuda graph handle to reduce memory
             self.graph_map[bs] = graph
+            if self.capture_hidden:
+                assert batch.hidden_states is not None
+                self.hidden_map[bs] = batch.hidden_states
 
         self._reset_moe_offload_cache()
         free_memory = get_free_memory(self.device)
@@ -202,6 +209,8 @@ class GraphRunner:
         g = self.graph_map[batch.padded_size]
         self.attn_backend.prepare_for_replay(batch)
         g.replay()
+        if self.capture_hidden:
+            batch.hidden_states = self.hidden_map[batch.padded_size][: batch.size]
         return self.buffer.logits[: batch.size]
 
     def pad_batch(self, batch: Batch) -> None:
@@ -220,5 +229,6 @@ class GraphRunner:
         # free-before-alloc cannot reclaim this GPU memory. empty_cache() is left to the
         # caller / next capture (GraphRunner._capture_graphs already runs it).
         self.graph_map = {}
+        self.hidden_map = {}
         self.buffer = None
         gc.collect()

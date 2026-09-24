@@ -42,6 +42,42 @@ static __device__ __forceinline__ int get_int_from_uint8_aligned(const uint8_t* 
 // VDR = vec dot ratio, how many contiguous integers each thread processes when the vec dot kernel is called
 // MMVQ = mul_mat_vec_q, MMQ = mul_mat_q
 
+#define VDR_Q2_0_Q8_1_MMVQ 1
+
+static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
+    const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1, const int& iqs) {
+  const block_q2_0* bq2 = (const block_q2_0*)vbq;
+  const uint8_t* qs = bq2->qs + iqs * 8;
+  const block_q8_1* q8 = bq8_1 + iqs;
+  int sumi = 0;
+#pragma unroll
+  for (int j = 0; j < 8; ++j) {
+    const uint32_t q = qs[j];
+    const int codes = (q & 3) | (((q >> 2) & 3) << 8) |
+                      (((q >> 4) & 3) << 16) | (((q >> 6) & 3) << 24);
+    sumi = __dp4a(codes, get_int_from_int8_aligned(q8->qs, j), sumi);
+  }
+  const float2 ds = __half22float2(q8->ds);
+  return __half2float(bq2->d) * (ds.x * sumi - ds.y);
+}
+
+static __device__ __forceinline__ float vec_dot_q2_0_sym_q8_1(
+    const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1, const int& iqs) {
+  const block_q2_0* bq2 = (const block_q2_0*)vbq;
+  const uint8_t* qs = bq2->qs + iqs * 8;
+  const block_q8_1* q8 = bq8_1 + iqs;
+  int sumi = 0;
+#pragma unroll
+  for (int j = 0; j < 8; ++j) {
+    const uint32_t q = qs[j];
+    const int codes = (q & 3) | (((q >> 2) & 3) << 8) |
+                      (((q >> 4) & 3) << 16) | (((q >> 6) & 3) << 24);
+    sumi = __dp4a(codes, get_int_from_int8_aligned(q8->qs, j), sumi);
+  }
+  const float2 ds = __half22float2(q8->ds);
+  return __half2float(bq2->d) * (2.0f * ds.x * sumi - 3.0f * ds.y);
+}
+
 #define VDR_Q4_0_Q8_1_MMVQ 2
 #define VDR_Q4_0_Q8_1_MMQ 4
 

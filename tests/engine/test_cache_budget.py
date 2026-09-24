@@ -374,6 +374,53 @@ def _offload_engine_config(**overrides):
     return config
 
 
+def test_hybrid_frequency_config_validates_policy_and_warmup():
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+
+    base = dict(
+        model_path="/tmp/freetoken-test-model",
+        tp_info=DistributedInfo(rank=0, size=1),
+        dtype=torch.bfloat16,
+    )
+    config = EngineConfig(
+        **base, moe_hybrid_fetch_policy="frequency", moe_hybrid_frequency_warmup=17
+    )
+    assert config.moe_hybrid_fetch_policy == "frequency"
+    assert config.moe_hybrid_frequency_warmup == 17
+    with pytest.raises(ValueError, match="moe_hybrid_fetch_policy"):
+        EngineConfig(**base, moe_hybrid_fetch_policy="bogus")
+    with pytest.raises(ValueError, match="moe_hybrid_frequency_warmup"):
+        EngineConfig(**base, moe_hybrid_frequency_warmup=0)
+
+
+def test_global_frequency_cache_config_validates_policy_warmup_and_fraction():
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+
+    base = dict(
+        model_path="/tmp/freetoken-test-model",
+        tp_info=DistributedInfo(rank=0, size=1),
+        dtype=torch.bfloat16,
+    )
+    config = EngineConfig(
+        **base,
+        moe_cache_policy="frequency",
+        moe_cache_frequency_warmup=17,
+        moe_cache_frequency_protect_fraction=0.4,
+    )
+    assert config.moe_cache_policy == "frequency"
+    assert config.moe_cache_frequency_warmup == 17
+    assert config.moe_cache_frequency_protect_fraction == pytest.approx(0.4)
+    with pytest.raises(ValueError, match="moe_cache_policy"):
+        EngineConfig(**base, moe_cache_policy="bogus")
+    with pytest.raises(ValueError, match="moe_cache_frequency_warmup"):
+        EngineConfig(**base, moe_cache_frequency_warmup=0)
+    for fraction in (-0.1, 1.0, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="moe_cache_frequency_protect_fraction"):
+            EngineConfig(**base, moe_cache_frequency_protect_fraction=fraction)
+
+
 def test_guard_passes_when_size_covers_one_expert_per_layer():
     from freetoken.engine.engine import _require_offload_cache_size
 

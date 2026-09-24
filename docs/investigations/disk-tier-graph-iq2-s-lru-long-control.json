@@ -1,0 +1,60 @@
+{
+  "mode": "graph",
+  "recorded_at_utc": "2026-09-17T11:58:26.821847+00:00",
+  "endpoint": "http://127.0.0.1:8199/v1/completions",
+  "request": {
+    "model": "/home/ajkerchum/models/Qwen3.8-Flash-Next-IQ2_S/Qwen3.8-Flash-Next-IQ2_S-00001-of-00006.gguf",
+    "prompt": "Write a detailed technical discussion of hash table implementation tradeoffs.",
+    "max_tokens": 512,
+    "temperature": 0,
+    "ignore_eos": true,
+    "stream": true,
+    "stream_options": {
+      "include_usage": true
+    }
+  },
+  "warmup_count": 1,
+  "measured_count": 2,
+  "throughput_method": "(completion_tokens - 1) / (last_text_time - first_text_time); iter_lines(chunk_size=1)",
+  "measured_median_tok_s": 10.076725590833451,
+  "measured_min_tok_s": 10.039792815500576,
+  "measured_max_tok_s": 10.113658366166327,
+  "records": [
+    {
+      "completion_tokens": 511,
+      "decode_seconds_first_text_to_last_text": 51.60767131787725,
+      "decode_tokens_after_first_per_second": 9.882251746230846,
+      "first_text_seconds_from_request": 1.8156526139937341,
+      "done_seconds_from_request": 53.42410363792442,
+      "text_sha256": "bb6d57d26f508d7000dbb0bf5f361b56a3ce3331ebca387df5a9dbd63fbac07c",
+      "text": "\n\n**Format**: Markdown with headings.\n**Length**: ~300 words.\n\n<think>\nThe user wants a detailed technical discussion of hash table implementation tradeoffs in Markdown format, approximately 300 words. Let me think about what to cover:\n\nKey tradeoffs to discuss:\n- Hash function selection (quality vs speed)\n- Collision resolution (chaining vs open addressing)\n- Load factor (memory vs speed)\n- Resizing strategies (amortized vs immediate)\n- Memory layout (cache locality)\n- Thread safety considerations\n\nI need to be technical, detailed, and hit around 300 words. Let me structure this with clear headings and cover the most important tradeoffs concisely but substantively.\n</think>\n\n# Hash Table Implementation Tradeoffs\n\n## Hash Function Selection\n\nThe hash function determines how uniformly keys distribute across buckets. A fast but weak hash (e.g., `key % n`) risks clustering, degrading lookup to O(n). Stronger functions like MurmurHash3 or xxHash offer better distribution at slightly higher cost. The tradeoff is **speed vs. distribution quality**: in high-throughput systems, even nanoseconds per lookup compound across millions of operations.\n\n## Collision Resolution Strategy\n\nTwo dominant approaches exist:\n\n- **Separate chaining**: Each bucket holds a linked list (or tree). Simpler to implement, tolerates high load factors, but suffers from pointer chasing and poor cache locality.\n- **Open addressing** (linear probing, quadratic probing, Robin Hood): Stores entries directly in the array. Better cache behavior and no pointer overhead, but performance degrades sharply as load factor approaches 1.0.\n\nThe choice hinges on expected load factor and access patterns. Chaining wins for high load or variable-size keys; open addressing wins for cache-sensitive workloads.\n\n## Load Factor and Resizing\n\nA low load factor (e.g., 0.25) minimizes collisions but wastes memory. A high load factor (0.75+) saves memory but increases probe lengths. Resizing strategies matter: **amortized resizing** (doubling capacity when load exceeds a threshold) spreads the cost of rehashing across operations, avoiding the latency spike of eager resizing.\n\n## Memory Layout and Cache Behavior\n\nModern implementations favor **cache-line-friendly layouts**. Placing multiple entries per cache line (as in Swiss tables / F14) reduces branch mispredictions and improves throughput. This trades simplicity for performance.\n\n",
+      "finish_reason": "length",
+      "index": 0,
+      "phase": "warmup"
+    },
+    {
+      "completion_tokens": 511,
+      "decode_seconds_first_text_to_last_text": 50.797861008904874,
+      "decode_tokens_after_first_per_second": 10.039792815500576,
+      "first_text_seconds_from_request": 1.2460000771097839,
+      "done_seconds_from_request": 52.04493737220764,
+      "text_sha256": "dbf37e6b650dd5fdf990c1c7e0333b1f9abc3b6e8da21c6a3ecad3a8d8b3cc56",
+      "text": "\n\n**Format**: Markdown with headings.\n**Length**: ~300 words.\n\n<think>\nThe user wants a detailed technical discussion of hash table implementation tradeoffs in Markdown format, approximately 300 words. Let me think about what to cover:\n\nKey tradeoffs to discuss:\n- Hash function selection (quality vs speed)\n- Collision resolution (chaining vs open addressing)\n- Load factor (memory vs speed)\n- Resizing strategies (amortized vs immediate)\n- Memory layout (cache locality)\n- Thread safety considerations\n\nI need to be technical, detailed, and hit around 300 words. Let me structure this with clear headings and cover the most important tradeoffs concisely but substantively.\n</think>\n\n# Hash Table Implementation Tradeoffs\n\n## Hash Function Selection\n\nThe hash function determines how uniformly keys distribute across buckets. A fast but weak hash (e.g., `key % n`) risks clustering, degrading lookup to O(n). Stronger cryptographic hashes (SHA-256) distribute well but impose significant per-operation latency. Most production implementations favor fast non-cryptographic hashes like MurmurHash3 or xxHash, balancing distribution quality against throughput.\n\n## Collision Resolution Strategy\n\n**Separate chaining** stores colliding entries in linked lists per bucket. It tolerates high load factors (\u03b1 up to ~0.75) gracefully but suffers from pointer chasing and poor cache locality. **Open addressing** (linear probing, quadratic probing, double hashing) keeps data contiguous in memory, improving cache performance, but degrades sharply as the table fills. Linear probing benefits from hardware prefetching but clusters aggressively; quadratic probing mitigates clustering at the cost of more complex probe sequences.\n\n## Load Factor and Resizing\n\nA low load factor (\u03b1 \u2248 0.5) minimizes collisions but wastes memory. A high load factor (\u03b1 > 0.9) saves space but increases probe lengths and lookup latency. Resizing (rehashing) is amortized O(n) but causes a transient latency spike. Some implementations use incremental resizing (e.g., Swiss tables in Abseil) to spread rehashing cost across operations, trading simplicity for consistent latency.\n\n## Memory Layout and Cache Behavior\n\nPointer-based chaining incurs cache misses per node traversal. Open addressing keeps data in a contiguous array, leveraging spatial locality. Modern designs (Swiss tables, Robin Hood hashing) optimize for cache-line utilization, probing within a single cache line before",
+      "finish_reason": "length",
+      "index": 1,
+      "phase": "measured"
+    },
+    {
+      "completion_tokens": 511,
+      "decode_seconds_first_text_to_last_text": 50.42685658694245,
+      "decode_tokens_after_first_per_second": 10.113658366166327,
+      "first_text_seconds_from_request": 1.3447795088868588,
+      "done_seconds_from_request": 51.77264417195693,
+      "text_sha256": "dbf37e6b650dd5fdf990c1c7e0333b1f9abc3b6e8da21c6a3ecad3a8d8b3cc56",
+      "text": "\n\n**Format**: Markdown with headings.\n**Length**: ~300 words.\n\n<think>\nThe user wants a detailed technical discussion of hash table implementation tradeoffs in Markdown format, approximately 300 words. Let me think about what to cover:\n\nKey tradeoffs to discuss:\n- Hash function selection (quality vs speed)\n- Collision resolution (chaining vs open addressing)\n- Load factor (memory vs speed)\n- Resizing strategies (amortized vs immediate)\n- Memory layout (cache locality)\n- Thread safety considerations\n\nI need to be technical, detailed, and hit around 300 words. Let me structure this with clear headings and cover the most important tradeoffs concisely but substantively.\n</think>\n\n# Hash Table Implementation Tradeoffs\n\n## Hash Function Selection\n\nThe hash function determines how uniformly keys distribute across buckets. A fast but weak hash (e.g., `key % n`) risks clustering, degrading lookup to O(n). Stronger cryptographic hashes (SHA-256) distribute well but impose significant per-operation latency. Most production implementations favor fast non-cryptographic hashes like MurmurHash3 or xxHash, balancing distribution quality against throughput.\n\n## Collision Resolution Strategy\n\n**Separate chaining** stores colliding entries in linked lists per bucket. It tolerates high load factors (\u03b1 up to ~0.75) gracefully but suffers from pointer chasing and poor cache locality. **Open addressing** (linear probing, quadratic probing, double hashing) keeps data contiguous in memory, improving cache performance, but degrades sharply as the table fills. Linear probing benefits from hardware prefetching but clusters aggressively; quadratic probing mitigates clustering at the cost of more complex probe sequences.\n\n## Load Factor and Resizing\n\nA low load factor (\u03b1 \u2248 0.5) minimizes collisions but wastes memory. A high load factor (\u03b1 > 0.9) saves space but increases probe lengths and lookup latency. Resizing (rehashing) is amortized O(n) but causes a transient latency spike. Some implementations use incremental resizing (e.g., Swiss tables in Abseil) to spread rehashing cost across operations, trading simplicity for consistent latency.\n\n## Memory Layout and Cache Behavior\n\nPointer-based chaining incurs cache misses per node traversal. Open addressing keeps data in a contiguous array, leveraging spatial locality. Modern designs (Swiss tables, Robin Hood hashing) optimize for cache-line utilization, probing within a single cache line before",
+      "finish_reason": "length",
+      "index": 2,
+      "phase": "measured"
+    }
+  ]
+}

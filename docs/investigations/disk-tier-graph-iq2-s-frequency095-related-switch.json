@@ -1,0 +1,48 @@
+{
+  "mode": "graph",
+  "recorded_at_utc": "2026-09-17T16:22:15.097029+00:00",
+  "endpoint": "http://127.0.0.1:8199/v1/completions",
+  "request": {
+    "model": "/home/ajkerchum/models/Qwen3.8-Flash-Next-IQ2_S/Qwen3.8-Flash-Next-IQ2_S-00001-of-00006.gguf",
+    "prompt": "Write a detailed technical discussion of B-tree implementation tradeoffs for a database storage engine.",
+    "max_tokens": 512,
+    "temperature": 0,
+    "ignore_eos": true,
+    "stream": true,
+    "stream_options": {
+      "include_usage": true
+    }
+  },
+  "warmup_count": 0,
+  "measured_count": 2,
+  "throughput_method": "(completion_tokens - 1) / (last_text_time - first_text_time); iter_lines(chunk_size=1)",
+  "measured_median_tok_s": 10.410676499246371,
+  "measured_min_tok_s": 10.39857300564101,
+  "measured_max_tok_s": 10.422779992851734,
+  "records": [
+    {
+      "completion_tokens": 511,
+      "decode_seconds_first_text_to_last_text": 48.931283242069185,
+      "decode_tokens_after_first_per_second": 10.422779992851734,
+      "first_text_seconds_from_request": 1.5209303579758853,
+      "done_seconds_from_request": 50.453009746037424,
+      "text_sha256": "2d12822af469aa2eb23d0cd889c14bd0339a0ddbc71f6a8c3101ad27293f1aa1",
+      "text": "\n\n<think>\n\n</think>\n\nDesigning a storage engine for a database is fundamentally an exercise in optimizing for specific workloads under constrained resources. The B-tree (and its variants like B+Tree) is the dominant data structure for on-disk indexing because it balances the cost of disk I/O with memory usage. However, the \"textbook\" B-tree is rarely implemented exactly as described in introductory algorithms courses.\n\nBelow is a detailed technical discussion of the critical tradeoffs involved in implementing a B-tree for a high-performance database storage engine.\n\n### 1. Node Size and Fanout: The Disk Block Tradeoff\n\nThe most critical parameter in a B-tree implementation is the **node size** (often aligned with the underlying storage block size, e.g., 4KB, 8KB, or 16KB).\n\n*   **The Tradeoff:**\n    *   **Large Nodes:** Increase the fanout (number of children per node), reducing the height of the tree. Fewer nodes mean fewer disk seeks for deep queries. However, large nodes require more memory to buffer and more time to parse during a scan.\n    *   **Small Nodes:** Reduce memory footprint per node but increase tree height, leading to more disk seeks for deep queries.\n\n*   **Technical Implication:**\n    *   **Disk Seek Latency:** Modern SSDs have lower seek latency than HDDs, but still non-negligible. A deeper tree (small nodes) results in more sequential reads. For HDDs, sequential reads are fast, so larger nodes are generally better. For SSDs, the penalty for depth is lower, but the penalty for large nodes (memory pressure) remains.\n    *   **Cache Locality:** Larger nodes improve cache locality for range scans because more relevant keys are loaded into memory at once. However, if the working set is small, large nodes may waste memory on irrelevant keys.\n\n*   **Optimal Strategy:**\n    *   Align node size with the **logical block size** of the storage device.\n    *   For SSDs, nodes can be smaller than for HDDs because random access is faster, but memory pressure is more critical due to higher concurrency.\n    *   **Example:** A 16KB node size is common for SSDs, while 8KB or 4KB might be used for HDDs to balance memory usage with seek reduction.\n\n### 2. Key Compression and Prefix Compression\n\nStoring keys in their raw",
+      "finish_reason": "length",
+      "index": 0,
+      "phase": "measured"
+    },
+    {
+      "completion_tokens": 511,
+      "decode_seconds_first_text_to_last_text": 49.045191077981144,
+      "decode_tokens_after_first_per_second": 10.39857300564101,
+      "first_text_seconds_from_request": 1.584788752021268,
+      "done_seconds_from_request": 50.63075617910363,
+      "text_sha256": "2d12822af469aa2eb23d0cd889c14bd0339a0ddbc71f6a8c3101ad27293f1aa1",
+      "text": "\n\n<think>\n\n</think>\n\nDesigning a storage engine for a database is fundamentally an exercise in optimizing for specific workloads under constrained resources. The B-tree (and its variants like B+Tree) is the dominant data structure for on-disk indexing because it balances the cost of disk I/O with memory usage. However, the \"textbook\" B-tree is rarely implemented exactly as described in introductory algorithms courses.\n\nBelow is a detailed technical discussion of the critical tradeoffs involved in implementing a B-tree for a high-performance database storage engine.\n\n### 1. Node Size and Fanout: The Disk Block Tradeoff\n\nThe most critical parameter in a B-tree implementation is the **node size** (often aligned with the underlying storage block size, e.g., 4KB, 8KB, or 16KB).\n\n*   **The Tradeoff:**\n    *   **Large Nodes:** Increase the fanout (number of children per node), reducing the height of the tree. Fewer nodes mean fewer disk seeks for deep queries. However, large nodes require more memory to buffer and more time to parse during a scan.\n    *   **Small Nodes:** Reduce memory footprint per node but increase tree height, leading to more disk seeks for deep queries.\n\n*   **Technical Implication:**\n    *   **Disk Seek Latency:** Modern SSDs have lower seek latency than HDDs, but still non-negligible. A deeper tree (small nodes) results in more sequential reads. For HDDs, sequential reads are fast, so larger nodes are generally better. For SSDs, the penalty for depth is lower, but the penalty for large nodes (memory pressure) remains.\n    *   **Cache Locality:** Larger nodes improve cache locality for range scans because more relevant keys are loaded into memory at once. However, if the working set is small, large nodes may waste memory on irrelevant keys.\n\n*   **Optimal Strategy:**\n    *   Align node size with the **logical block size** of the storage device.\n    *   For SSDs, nodes can be smaller than for HDDs because random access is faster, but memory pressure is more critical due to higher concurrency.\n    *   **Example:** A 16KB node size is common for SSDs, while 8KB or 4KB might be used for HDDs to balance memory usage with seek reduction.\n\n### 2. Key Compression and Prefix Compression\n\nStoring keys in their raw",
+      "finish_reason": "length",
+      "index": 1,
+      "phase": "measured"
+    }
+  ]
+}

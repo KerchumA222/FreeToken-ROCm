@@ -1,19 +1,19 @@
 from __future__ import annotations
 
-import os
-
 import torch
 import triton
 import triton.language as tl
 from flashlib.kernels.slot_cache import lru_ensure
 
-# Hybrid backend: which of a step's missing experts to fetch (when capped below the miss
-# count). "recency" (default) fetches the experts most-recently active before this step
-# (LRU on the expert -> prioritizes recurring misses, lowering the steady miss rate);
-# "lowest_id" fetches the smallest expert ids (the original, routing-blind heuristic).
-_HYBRID_FETCH_BY_RECENCY = (
-    os.getenv("FREETOKEN_HYBRID_FETCH", "recency").strip().lower() != "lowest_id"
-)
+_HYBRID_FETCH_POLICY_IDS = {"recency": 0, "frequency": 1, "lowest_id": 2}
+_FREQUENCY_USAGE_SENTINEL = 1 << 62
+
+
+def _rank_frequency_reference(counts, protect_count: int) -> list[int]:
+    """CPU mirror used by tests and trace tooling (frequency desc, id asc)."""
+    return sorted(range(len(counts)), key=lambda expert: (-int(counts[expert]), expert))[
+        :protect_count
+    ]
 
 
 def ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
@@ -25,6 +25,10 @@ def ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
     tensor. ``out_indices`` aliases the input, preserving the in-place rewrite every
     downstream GEMM depends on.
     """
+    if cache.cache_policy == "frequency":
+        _observe_frequency(cache, layer_id, expert_ids)
+        _rank_frequency(cache, layer_id)
+
     lru_ensure(
         expert_ids,
         cache.slot_for_id.view(-1),
@@ -37,6 +41,49 @@ def ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
         cache.num_indices,
         stats=cache.lru_stats[layer_id] if cache.collect_stats else None,
         id_base=layer_id * cache.num_experts,
+        strategy="seq" if cache.cache_policy == "frequency" else None,
+    )
+    if cache.cache_policy == "frequency":
+        _mark_frequency_protected(cache, layer_id)
+
+
+def _observe_frequency(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
+    """Count raw routed ids during the fixed, graph-safe warmup window."""
+    _frequency_observe_kernel[(1,)](
+        expert_ids,
+        cache.frequency_counts,
+        cache.frequency_calls,
+        layer_id,
+        expert_ids.numel(),
+        int(cache.frequency_warmup),
+        cache.num_experts,
+        BLOCK=triton.next_power_of_2(cache.num_experts),
+    )
+
+
+def _rank_frequency(cache, layer_id: int) -> None:
+    """On the exact warmup call, materialize a deterministic top-P mask on device."""
+    _frequency_rank_kernel[(1,)](
+        cache.frequency_counts,
+        cache.frequency_calls,
+        cache.frequency_protected,
+        layer_id,
+        int(cache.frequency_warmup),
+        int(cache.frequency_protect_count),
+        cache.num_experts,
+        BLOCK=triton.next_power_of_2(cache.num_experts),
+    )
+
+
+def _mark_frequency_protected(cache, layer_id: int) -> None:
+    _frequency_mark_kernel[(1,)](
+        cache.slot_for_id,
+        cache.usage,
+        cache.frequency_protected,
+        layer_id,
+        cache.num_experts,
+        _FREQUENCY_USAGE_SENTINEL,
+        BLOCK=triton.next_power_of_2(cache.num_experts),
     )
 
 
@@ -55,9 +102,17 @@ def ensure_experts_hybrid(
     pre-cap miss count (stats)."""
     # Q16 fixed point so the GPU kernel and the CPU reference cap identically (no float).
     frac_q16 = min(1 << 16, max(0, round(fetch_fraction * (1 << 16))))
+    policy = cache.hybrid_fetch_policy
+    if policy not in _HYBRID_FETCH_POLICY_IDS:
+        raise ValueError(f"unknown hybrid fetch policy {policy!r}")
+    policy_id = _HYBRID_FETCH_POLICY_IDS[policy]
     if not expert_ids.is_cuda:
-        return _ensure_experts_hybrid_cpu(cache, layer_id, expert_ids, max_fetch, frac_q16)
-    _ensure_experts_hybrid_gpu(cache, layer_id, expert_ids, max_fetch, frac_q16)
+        return _ensure_experts_hybrid_cpu(
+            cache, layer_id, expert_ids, max_fetch, frac_q16, policy
+        )
+    _ensure_experts_hybrid_gpu(
+        cache, layer_id, expert_ids, max_fetch, frac_q16, policy_id
+    )
 
 
 def prefill_hit_compact(cache, layer_id: int, buffer_id: int) -> None:
@@ -95,7 +150,7 @@ def reset_cache(cache) -> None:
 
 
 def _ensure_experts_hybrid_gpu(
-    cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, frac_q16: int
+    cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, frac_q16: int, policy_id: int
 ) -> None:
     block_e = triton.next_power_of_2(cache.num_experts)
     block_c = triton.next_power_of_2(cache.cache_size)
@@ -112,35 +167,44 @@ def _ensure_experts_hybrid_gpu(
         cache.num_indices,
         cache.num_missing_full,
         cache.expert_recency,
+        cache.expert_frequency,
+        cache.hybrid_call_count,
         layer_id,
         expert_ids.numel(),
         int(max_fetch),
         int(frac_q16),
+        int(cache.hybrid_frequency_warmup),
         cache.num_experts,
         cache.cache_size,
         BLOCK_E=block_e,
         BLOCK_C=block_c,
-        BY_RECENCY=_HYBRID_FETCH_BY_RECENCY,
+        FETCH_POLICY=policy_id,
         num_warps=num_warps,
     )
 
 
 def _ensure_experts_hybrid_cpu(
-    cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, frac_q16: int
+    cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, frac_q16: int, policy: str
 ) -> None:
     """CPU reference mirror of the hybrid kernel (eviction/fetch decisions bit-identical to
     the GPU path; see tests/test_offload_lru_kernels.py). Fetches at most ``max_fetch`` (or
     the bandwidth-matched ``~frac_q16/2^16 * misses`` when ``frac_q16`` > 0) of the missing
-    experts; overflow misses are rewritten to -1. With ``BY_RECENCY`` the fetch set is the
-    most-recently-active misses (ties -> lower id); else the lowest ids."""
+    experts; overflow misses are rewritten to -1. Frequency uses frozen occurrence counts
+    after warmup, then recency and lower id as tie-breakers."""
+    raw_experts = expert_ids.view(-1).tolist()
     seen = []
-    for expert in expert_ids.view(-1).tolist():
+    for expert in raw_experts:
         if expert not in seen:
             seen.append(expert)
 
     cache.active_mask.zero_()
     step = int(cache.step.item()) + 1
     cache.step.fill_(step)
+    if policy == "frequency":
+        layer_calls = int(cache.hybrid_call_count[layer_id].item()) + 1
+        cache.hybrid_call_count[layer_id] = layer_calls
+    else:
+        layer_calls = 0
     for expert in seen:
         cache.active_mask[expert] = 1
 
@@ -150,7 +214,11 @@ def _ensure_experts_hybrid_cpu(
             cache.usage[slot] = step
 
     missing = [e for e in seen if int(cache.slot_for_id[layer_id, e].item()) == -1]
-    if _HYBRID_FETCH_BY_RECENCY:
+    if policy == "frequency" and layer_calls > cache.hybrid_frequency_warmup:
+        freq = cache.expert_frequency[layer_id].tolist()
+        rec = cache.expert_recency[layer_id].tolist()
+        missing.sort(key=lambda e: (-freq[e], -rec[e], e))
+    elif policy in ("recency", "frequency"):
         rec = cache.expert_recency[layer_id].tolist()
         missing.sort(key=lambda e: (-rec[e], e))
     else:
@@ -178,7 +246,10 @@ def _ensure_experts_hybrid_cpu(
         cache.evict_slots[idx] = victim
         cache.src_indices[idx] = expert  # layer-local row
 
-    if _HYBRID_FETCH_BY_RECENCY:
+    if policy == "frequency" and layer_calls <= cache.hybrid_frequency_warmup:
+        for expert in raw_experts:
+            cache.expert_frequency[layer_id, expert] += 1
+    if policy in ("recency", "frequency"):
         for expert in seen:
             cache.expert_recency[layer_id, expert] = step
 
@@ -287,7 +358,81 @@ def _materialize_layer_kernel(
 
 
 
-@triton.jit(do_not_specialize=["layer_id", "num_active", "max_fetch", "fetch_frac_q16"])
+@triton.jit
+def _frequency_observe_kernel(
+    expert_ids_ptr,
+    frequency_counts_ptr,
+    frequency_calls_ptr,
+    layer_id,
+    num_active,
+    warmup,
+    num_experts,
+    BLOCK: tl.constexpr,
+):
+    """Accumulate raw routing ids for one layer, stopping at ``warmup`` calls."""
+    call = tl.load(frequency_calls_ptr + layer_id)
+    if call < warmup:
+        base = layer_id * num_experts
+        for i in tl.range(num_active):
+            expert = tl.load(expert_ids_ptr + i)
+            tl.atomic_add(frequency_counts_ptr + base + expert, 1)
+        tl.store(frequency_calls_ptr + layer_id, call + 1)
+    elif call == warmup:
+        # warmup+1 is a frozen sentinel; it keeps the exact-warmup rank gate one-shot.
+        tl.store(frequency_calls_ptr + layer_id, warmup + 1)
+
+
+@triton.jit
+def _frequency_rank_kernel(
+    frequency_counts_ptr,
+    frequency_calls_ptr,
+    frequency_protected_ptr,
+    layer_id,
+    warmup,
+    protect_count,
+    num_experts,
+    BLOCK: tl.constexpr,
+):
+    """Select top frequency experts once; lower ids win equal-frequency ties."""
+    if tl.load(frequency_calls_ptr + layer_id) == warmup:
+        off = tl.arange(0, BLOCK)
+        valid = off < num_experts
+        base = layer_id * num_experts
+        selected = tl.load(
+            frequency_counts_ptr + base + off, mask=valid, other=0
+        ).to(tl.int64)
+        score = selected * (num_experts + 1) + (num_experts - 1 - off)
+        tl.store(frequency_protected_ptr + base + off, 0, mask=valid)
+        for _ in tl.range(protect_count):
+            expert = tl.argmax(tl.where(valid, score, -9223372036854775807), axis=0)
+            tl.store(frequency_protected_ptr + base + expert, 1)
+            score = tl.where(off == expert, -9223372036854775807, score)
+
+
+@triton.jit
+def _frequency_mark_kernel(
+    slot_for_id_ptr,
+    usage_ptr,
+    frequency_protected_ptr,
+    layer_id,
+    num_experts,
+    usage_sentinel,
+    BLOCK: tl.constexpr,
+):
+    """Make resident protected experts unavailable to the LRU victim scan."""
+    off = tl.arange(0, BLOCK)
+    valid = off < num_experts
+    base = layer_id * num_experts
+    slot = tl.load(slot_for_id_ptr + base + off, mask=valid, other=-1)
+    protected = tl.load(frequency_protected_ptr + base + off, mask=valid, other=0)
+    tl.store(usage_ptr + slot, usage_sentinel, mask=valid & (slot >= 0) & (protected != 0))
+
+
+@triton.jit(
+    do_not_specialize=[
+        "layer_id", "num_active", "max_fetch", "fetch_frac_q16", "frequency_warmup"
+    ]
+)
 def _ensure_experts_hybrid_kernel(
     expert_ids_ptr,
     slot_for_id_ptr,
@@ -300,15 +445,18 @@ def _ensure_experts_hybrid_kernel(
     num_indices_ptr,
     num_missing_full_ptr,
     expert_recency_ptr,
+    expert_frequency_ptr,
+    hybrid_call_count_ptr,
     layer_id,
     num_active,
     max_fetch,
     fetch_frac_q16,
+    frequency_warmup,
     num_experts: tl.constexpr,
     cache_size: tl.constexpr,
     BLOCK_E: tl.constexpr,
     BLOCK_C: tl.constexpr,
-    BY_RECENCY: tl.constexpr,
+    FETCH_POLICY: tl.constexpr,
 ):
     """Capped-fetch timestamp-LRU (hybrid backend).
 
@@ -321,14 +469,19 @@ def _ensure_experts_hybrid_kernel(
     = the capped fetch count (copy_missing), ``num_missing_full`` = the pre-cap miss count
     (stats).
 
-    Which misses to fetch is the cap policy. ``BY_RECENCY`` (default) fetches the experts
-    most-recently active before this step (LRU on the expert, via ``expert_recency``),
-    breaking ties toward the lower expert id -- this prioritizes *recurring* misses for
-    caching, lowering the steady miss rate. Otherwise the lowest expert ids are fetched
-    (``missing_rank``), the original routing-blind heuristic."""
+    Which misses to fetch is the cap policy. Frequency learns routed occurrences for the
+    first ``frequency_warmup`` calls of each layer, then ranks frequency first, recency
+    second, and lower id last. Recency and lowest_id are the fixed alternatives.
+    The frequency score uses the global ``step + 1`` as its recency span, so it remains
+    lexicographic when layers have different call counts."""
     step = tl.load(step_ptr) + 1
     tl.store(step_ptr, step)
     base = layer_id * num_experts
+    if FETCH_POLICY == 1:
+        layer_calls = tl.load(hybrid_call_count_ptr + layer_id) + 1
+        tl.store(hybrid_call_count_ptr + layer_id, layer_calls)
+    else:
+        layer_calls = 0
 
     # ---- Phase 1: active + missing over experts ----
     off_e = tl.arange(0, BLOCK_E)
@@ -361,11 +514,29 @@ def _ensure_experts_hybrid_kernel(
     # Fetch-selection priority: encode (recency desc, id asc) into one strictly-ordered
     # score so argmax has no ties (rec deltas are multiples of num_experts; the id term
     # spans only [0, num_experts), so it can only break exact-recency ties).
-    if BY_RECENCY:
+    if FETCH_POLICY == 0:
         rec = tl.load(expert_recency_ptr + base + off_e, mask=e_mask, other=-1).to(tl.int64)
         score = tl.where(
             is_missing, rec * num_experts + (num_experts - 1 - off_e), -1152921504606846976
         ).to(tl.int64)
+    elif FETCH_POLICY == 1:
+        rec = tl.load(expert_recency_ptr + base + off_e, mask=e_mask, other=-1).to(tl.int64)
+        if layer_calls <= frequency_warmup:
+            # Frequency mode deliberately behaves like recency until its per-layer
+            # observation window is complete.
+            score = tl.where(
+                is_missing, rec * num_experts + (num_experts - 1 - off_e),
+                -1152921504606846976
+            ).to(tl.int64)
+        else:
+            freq = tl.load(expert_frequency_ptr + base + off_e, mask=e_mask, other=0).to(tl.int64)
+            # Frequency is primary; global step + 1 spans every possible recency value.
+            score = tl.where(
+                is_missing,
+                (freq * (step + 1) + (rec + 1)) * num_experts
+                + (num_experts - 1 - off_e),
+                -1152921504606846976,
+            ).to(tl.int64)
     else:
         missing_rank = tl.cumsum(is_missing.to(tl.int32)) - 1
 
@@ -385,7 +556,7 @@ def _ensure_experts_hybrid_kernel(
             old_id = tl.sum(tl.where(off_c == victim, oid, 0))
             if old_id >= 0:
                 tl.store(slot_for_id_ptr + old_id, -1)
-            if BY_RECENCY:
+            if FETCH_POLICY != 2:
                 e = tl.argmax(score, axis=0).to(tl.int32)
                 score = tl.where(off_e == e, -1152921504606846976, score)
             else:
@@ -397,6 +568,14 @@ def _ensure_experts_hybrid_kernel(
             tl.store(src_indices_ptr + i, e)  # layer-local row
             u = tl.where(off_c == victim, 9223372036854775807, u)
 
+    # Frequency is learned from routed occurrences, including duplicate routes in a batch.
+    # Do this before the in-place rewrite below changes expert_ids into slot ids.
+    if FETCH_POLICY == 1:
+        if layer_calls <= frequency_warmup:
+            for i in tl.range(num_active):
+                e = tl.load(expert_ids_ptr + i)
+                tl.atomic_add(expert_frequency_ptr + base + e, 1)
+
     # ---- Phase 3: rewrite expert_ids -> slot id (hit/fetched) or -1 (overflow -> CPU) ----
     for i in tl.range(num_active):
         e = tl.load(expert_ids_ptr + i)
@@ -405,7 +584,7 @@ def _ensure_experts_hybrid_kernel(
 
     # Bump every active expert's recency to this step (LRU on the expert): an overflow miss
     # computed on the CPU now ranks high if it recurs, so it gets fetched next time.
-    if BY_RECENCY:
+    if FETCH_POLICY != 2:
         step_vec = tl.zeros((BLOCK_E,), dtype=tl.int64) + step
         tl.store(expert_recency_ptr + base + off_e, step_vec, mask=is_active & e_mask)
 

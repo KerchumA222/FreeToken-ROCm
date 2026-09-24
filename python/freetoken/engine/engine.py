@@ -454,6 +454,7 @@ class Engine:
             vocab_size=config.model_config.vocab_size,
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
+            capture_hidden=self.mtp_head is not None,
         )
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
@@ -631,11 +632,15 @@ class Engine:
             cache_size=config.moe_cache_size,
             device=self.device,
             cache_policy=config.moe_cache_policy,
+            frequency_warmup=config.moe_cache_frequency_warmup,
+            frequency_protect_fraction=config.moe_cache_frequency_protect_fraction,
             prefill_overlap=config.moe_prefill_overlap,
             prefill_hit_d2d=False,   # the split reads the complete bank; not available here
             quant_format="q4_0",
             decode_target=decode_target,
             hybrid_max_fetch=config.moe_hybrid_max_fetch,
+            hybrid_fetch_policy=config.moe_hybrid_fetch_policy,
+            hybrid_frequency_warmup=config.moe_hybrid_frequency_warmup,
         )
         # before set_bank_sources, as on the resident path: the residency validation
         # and the copy plan's skip of non-pinned layers key on the CPU-layer set
@@ -778,11 +783,15 @@ class Engine:
             cache_size=config.moe_cache_size,
             device=self.device,
             cache_policy=config.moe_cache_policy,
+            frequency_warmup=config.moe_cache_frequency_warmup,
+            frequency_protect_fraction=config.moe_cache_frequency_protect_fraction,
             prefill_overlap=config.moe_prefill_overlap,
             prefill_hit_d2d=config.moe_prefill_hit_d2d,
             quant_format=banks.quant_format,
             decode_target=decode_target,
             hybrid_max_fetch=config.moe_hybrid_max_fetch,
+            hybrid_fetch_policy=config.moe_hybrid_fetch_policy,
+            hybrid_frequency_warmup=config.moe_hybrid_frequency_warmup,
             layout=layout,
             max_slots=max_slots,
         )
@@ -799,6 +808,11 @@ class Engine:
         disk-backed paths: both end up as the same cache object on the same layers."""
         if decode_target == "hybrid":
             self._resolve_hybrid_fetch(config, cache)
+            logger.info_rank0(
+                "hybrid miss selection: "
+                f"policy={cache.hybrid_fetch_policy} "
+                f"frequency_warmup={cache.hybrid_frequency_warmup} calls/layer"
+            )
         # Must be set before CUDA graph capture so the (device-side) accumulation ops are
         # captured and re-run on every decode replay.
         cache.collect_stats = config.moe_collect_stats
@@ -878,6 +892,7 @@ class Engine:
             swiglu_limit=sample.limit,
             # FIXME: the None branch serves GGUF q4_0 banks, which have no quant method yet; drop it once GGUF joins the quant path
             fmt=sample.quant_method.cpu_format if sample.quant_method is not None else None,
+            ggml_types=getattr(sample.quant_method, "ggml_types", None),
         )
         cache.set_cpu_executor(executor)
         self.cpu_moe_executor = executor
@@ -1089,6 +1104,7 @@ class Engine:
             vocab_size=config.model_config.vocab_size,
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
+            capture_hidden=self.mtp_head is not None,
         )
 
     def _draft_tokens(self, batch: Batch, next_tokens: torch.Tensor) -> torch.Tensor:
@@ -1135,10 +1151,6 @@ class Engine:
             next_tokens_gpu = self.sampler.sample(logits[:rows], args).to(torch.int32)
             if self.mtp_head is not None and batch.capture_hidden:
                 draft_tokens_gpu = self._draft_tokens(batch, next_tokens_gpu)
-        if self.moe_offload_cache is not None and self.moe_offload_cache.host_tier is not None:
-            # A host node cannot unwind into the driver, so a failed fetch is parked
-            # on the cache and surfaces here instead of as silently stale experts.
-            self.moe_offload_cache.raise_admission_error()
         if self.cpu_moe_executor is not None:
             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
             # -> stale expert outputs) as a loud error instead of silent corruption.
@@ -1487,9 +1499,14 @@ _DENSE_MOE_SETTINGS = {
     "moe_cache_size": 0,
     "moe_cache_rate": None,
     "moe_cache_auto": False,
+    "moe_cache_policy": "lru",
+    "moe_cache_frequency_warmup": 128,
+    "moe_cache_frequency_protect_fraction": 0.25,
     "moe_cpu_layers": None,
     "moe_cpu_threads": 0,
     "moe_hybrid_max_fetch": -1,
+    "moe_hybrid_fetch_policy": "recency",
+    "moe_hybrid_frequency_warmup": 128,
     "moe_prefill_overlap": True,
     "moe_prefill_hit_d2d": False,
     "expert_load": "auto",

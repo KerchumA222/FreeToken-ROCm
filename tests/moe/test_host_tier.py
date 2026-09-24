@@ -6,11 +6,15 @@ it took to get there.
 """
 from __future__ import annotations
 
+import threading
+
 import numpy as np
 import pytest
+import torch
 
 from freetoken.moe.disk_store import GgufExpertStore
 from freetoken.moe.host_tier import MISS, HostExpertCache
+from freetoken.moe.offload_cache import OffloadMoeCache
 from tests.moe.conftest import E, L, Q4_0
 
 
@@ -233,3 +237,128 @@ def test_residency_split_does_not_disturb_recency(store):
         c.ensure(0, [2])          # evicts the oldest, which is still expert 0
         hit_e, _hit_s, miss = c.residency_split(0, E, [0, 1, 2])
         assert 0 in miss and sorted(hit_e) == [1, 2]
+
+
+def test_graph_admission_callback_writes_inference_buffers_from_foreign_thread():
+    cache = type("Harness", (), {})()
+
+    class Tier:
+        def ensure(self, _layer, experts):
+            return [expert + 1000 for expert in experts]
+
+    cache.host_tier = Tier()
+    cache._admit_error = None
+    with torch.inference_mode():
+        bufs = {
+            "n": torch.tensor([2], dtype=torch.int64),
+            "src": torch.tensor([4, 9], dtype=torch.int32),
+            "out": torch.zeros(2, dtype=torch.int32),
+        }
+    callback = OffloadMoeCache._admit_callback(cache, 3, bufs)
+    worker = threading.Thread(target=callback)
+    worker.start()
+    worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert cache._admit_error is None
+    assert bufs["out"].tolist() == [1004, 1009]
+
+
+def _cpu_host_callback(cache, layer_id, ids):
+    import weakref
+
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    executor = CpuMoeExecutor.__new__(CpuMoeExecutor)
+    executor._cache_ref = weakref.ref(cache)
+    executor.host_tier = cache.host_tier
+    executor.num_experts = cache.num_experts
+    return executor._host_admit_callback(layer_id, {"ids": ids})
+
+
+def test_cpu_host_admission_deduplicates_routes_and_preserves_negative_ids():
+    cache = type("Harness", (), {"num_experts": 8, "_admit_error": None})()
+
+    class Tier:
+        capacity = 3
+
+        def __init__(self):
+            self.calls = []
+
+        def ensure(self, layer_id, experts):
+            self.calls.append((layer_id, list(experts)))
+            return [20 + expert for expert in experts]
+
+    cache.host_tier = Tier()
+    ids = torch.tensor([3, 3, -1, 1, -1], dtype=torch.int32)
+    _cpu_host_callback(cache, 2, ids)()
+
+    assert cache.host_tier.calls == [(2, [3, 1])]
+    assert ids.tolist() == [23, 23, -1, 21, -1]
+
+
+def test_cpu_host_admission_rejects_out_of_range_raw_id():
+    cache = type("Harness", (), {"num_experts": 8, "_admit_error": None})()
+
+    class Tier:
+        capacity = 3
+
+        def ensure(self, _layer_id, _experts):
+            raise AssertionError("invalid routes must fail before host admission")
+
+    cache.host_tier = Tier()
+    ids = torch.tensor([8, -1], dtype=torch.int32)
+    _cpu_host_callback(cache, 0, ids)()
+
+    assert ids.tolist() == [-1, -1]
+    assert isinstance(cache._admit_error, ValueError)
+
+
+def test_cpu_host_admission_remaps_same_raw_id_independently_per_layer():
+    cache = type("Harness", (), {"num_experts": 8, "_admit_error": None})()
+
+    class Tier:
+        capacity = 4
+
+        def ensure(self, layer_id, experts):
+            return [1000 * layer_id + 500 + expert for expert in experts]
+
+    cache.host_tier = Tier()
+    ids0 = torch.tensor([2], dtype=torch.int32)
+    ids1 = torch.tensor([2], dtype=torch.int32)
+    _cpu_host_callback(cache, 0, ids0)()
+    _cpu_host_callback(cache, 1, ids1)()
+
+    assert ids0.tolist() == [502]
+    assert ids1.tolist() == [1502]
+
+
+def test_cpu_host_admission_parks_first_error_and_poison_ids():
+    cache = type("Harness", (), {"num_experts": 8, "_admit_error": None})()
+
+    class Tier:
+        capacity = 2
+
+        def ensure(self, _layer_id, _experts):
+            assert torch.is_inference_mode_enabled()
+            raise OSError("disk read failed")
+
+    cache.host_tier = Tier()
+    ids = torch.tensor([4, -1], dtype=torch.int32)
+    _cpu_host_callback(cache, 0, ids)()
+    first = cache._admit_error
+    _cpu_host_callback(cache, 0, torch.tensor([1], dtype=torch.int32))()
+
+    assert ids.tolist() == [-1, -1]
+    assert isinstance(first, OSError)
+    assert cache._admit_error is first
+
+
+def test_cpu_native_row_bound_uses_host_capacity_but_keeps_logical_experts():
+    from freetoken.moe.cpu_executor import _native_num_experts
+
+    cache = type("Harness", (), {"num_experts": 128})()
+    cache.host_tier = type("Tier", (), {"capacity": 7})()
+
+    assert cache.num_experts == 128
+    assert _native_num_experts(cache) == 7

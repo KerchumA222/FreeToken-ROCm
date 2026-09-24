@@ -1,0 +1,133 @@
+{
+  "independent": {
+    "0": [
+      {
+        "n": 47,
+        "first": 1269968.449414885,
+        "last": 1269977.677845312,
+        "rate": 4.98459628245038,
+        "hash": "7a7afd5ffd208cb6524d2a0a4a0f505761fa76e3c24dbd72d4501192bec7adea",
+        "text": "\n\n<think>\nThe user asks me to explain the main attractions of Paris (the capital of France) in one sentence. They've already described it as having museums, historic landmarks, and a river running through it. I need to craft"
+      },
+      {
+        "n": 47,
+        "first": 1269981.132239263,
+        "last": 1269990.331970524,
+        "rate": 5.00014605806877,
+        "hash": "7a7afd5ffd208cb6524d2a0a4a0f505761fa76e3c24dbd72d4501192bec7adea",
+        "text": "\n\n<think>\nThe user asks me to explain the main attractions of Paris (the capital of France) in one sentence. They've already described it as having museums, historic landmarks, and a river running through it. I need to craft"
+      },
+      {
+        "n": 47,
+        "first": 1269993.882986427,
+        "last": 1270003.115235511,
+        "rate": 4.9825345462218396,
+        "hash": "7a7afd5ffd208cb6524d2a0a4a0f505761fa76e3c24dbd72d4501192bec7adea",
+        "text": "\n\n<think>\nThe user asks me to explain the main attractions of Paris (the capital of France) in one sentence. They've already described it as having museums, historic landmarks, and a river running through it. I need to craft"
+      }
+    ],
+    "1": [
+      {
+        "n": 47,
+        "first": 1270006.35285744,
+        "last": 1270014.666701375,
+        "rate": 5.532940040669206,
+        "hash": "83c125deae3aee9736fba3181579c7ad5403a6b54c73631761be93e264d95077",
+        "text": "\n\n<think>\nThe user asks me to explain a simple way to improve tomato soup flavor in one sentence, noting that good tomato soup balances sweetness and acidity. Let me think of a concise, practical tip.\n\nOptions:\n- Add"
+      },
+      {
+        "n": 47,
+        "first": 1270017.79324971,
+        "last": 1270026.154026358,
+        "rate": 5.501881217149166,
+        "hash": "83c125deae3aee9736fba3181579c7ad5403a6b54c73631761be93e264d95077",
+        "text": "\n\n<think>\nThe user asks me to explain a simple way to improve tomato soup flavor in one sentence, noting that good tomato soup balances sweetness and acidity. Let me think of a concise, practical tip.\n\nOptions:\n- Add"
+      },
+      {
+        "n": 47,
+        "first": 1270029.300022147,
+        "last": 1270037.73511128,
+        "rate": 5.453410067579407,
+        "hash": "83c125deae3aee9736fba3181579c7ad5403a6b54c73631761be93e264d95077",
+        "text": "\n\n<think>\nThe user asks me to explain a simple way to improve tomato soup flavor in one sentence, noting that good tomato soup balances sweetness and acidity. Let me think of a concise, practical tip.\n\nOptions:\n- Add"
+      }
+    ]
+  },
+  "concurrent_pairs": [
+    {
+      "aggregate_tps": 6.537106016502917,
+      "per_request_tps": [
+        3.268863107305785,
+        3.2686572189654473
+      ],
+      "hashes": [
+        "7a7afd5ffd208cb6524d2a0a4a0f505761fa76e3c24dbd72d4501192bec7adea",
+        "83c125deae3aee9736fba3181579c7ad5403a6b54c73631761be93e264d95077"
+      ],
+      "counts": [
+        47,
+        47
+      ]
+    },
+    {
+      "aggregate_tps": 6.4916418999736605,
+      "per_request_tps": [
+        3.246061420561806,
+        3.245918665358096
+      ],
+      "hashes": [
+        "7a7afd5ffd208cb6524d2a0a4a0f505761fa76e3c24dbd72d4501192bec7adea",
+        "83c125deae3aee9736fba3181579c7ad5403a6b54c73631761be93e264d95077"
+      ],
+      "counts": [
+        47,
+        47
+      ]
+    },
+    {
+      "aggregate_tps": 6.46155026911203,
+      "per_request_tps": [
+        3.2308516208161833,
+        3.23086318365412
+      ],
+      "hashes": [
+        "7a7afd5ffd208cb6524d2a0a4a0f505761fa76e3c24dbd72d4501192bec7adea",
+        "83c125deae3aee9736fba3181579c7ad5403a6b54c73631761be93e264d95077"
+      ],
+      "counts": [
+        47,
+        47
+      ]
+    },
+    {
+      "aggregate_tps": 6.495959584832813,
+      "per_request_tps": [
+        3.2479797924164067,
+        3.2483655443733133
+      ],
+      "hashes": [
+        "7a7afd5ffd208cb6524d2a0a4a0f505761fa76e3c24dbd72d4501192bec7adea",
+        "83c125deae3aee9736fba3181579c7ad5403a6b54c73631761be93e264d95077"
+      ],
+      "counts": [
+        47,
+        47
+      ]
+    },
+    {
+      "aggregate_tps": 6.3311436723234955,
+      "per_request_tps": [
+        3.165680796141692,
+        3.165752173058941
+      ],
+      "hashes": [
+        "7a7afd5ffd208cb6524d2a0a4a0f505761fa76e3c24dbd72d4501192bec7adea",
+        "83c125deae3aee9736fba3181579c7ad5403a6b54c73631761be93e264d95077"
+      ],
+      "counts": [
+        47,
+        47
+      ]
+    }
+  ]
+}
