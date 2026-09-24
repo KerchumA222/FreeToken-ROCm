@@ -106,15 +106,15 @@ class GraphRunner:
         dummy_req: Req,
         moe_offload_cache: OffloadMoeCache | None = None,
         capture_hidden: bool = False,
-        verify_rows: int = 0,
+        verify_rows: tuple[int, ...] = (),
         verify_tail=None,
     ) -> None:
         # ``verify_tail(batch, logits) -> (next_tokens, draft_tokens)``: the greedy sample and
         # the draft head, captured into the verify graph after the target forward.
         self.verify_tail = verify_tail
-        # Rows per request of a speculative verify forward (1 + draft depth) to capture
-        # graphs for; 0 captures decode graphs only.
-        self.verify_rows = verify_rows
+        # Rows per request of the speculative verify forwards (1 + drafts) to capture
+        # graphs for; empty captures decode graphs only.
+        self.verify_rows = tuple(verify_rows)
         cuda_graph_bs = _determine_cuda_graph_bs(
             cuda_graph_bs=cuda_graph_bs,
             cuda_graph_max_bs=cuda_graph_max_bs,
@@ -153,7 +153,7 @@ class GraphRunner:
         # are sized for the larger of the two.
         attn_bs = list(self.graph_bs_list)
         if self.verify_rows:
-            attn_bs.append(self.max_graph_bs * self.verify_rows)
+            attn_bs.append(self.max_graph_bs * max(self.verify_rows))
         self.attn_backend.init_capture_graph(max_seq_len=max_seq_len, bs_list=attn_bs)
 
         torch.cuda.synchronize(self.device)
@@ -223,62 +223,66 @@ class GraphRunner:
         logger.info_rank0(f"Free GPU memory after capturing CUDA graphs: {mem_GB(free_memory)}")
 
     def _capture_verify_graphs(self, vocab_size: int, model: BaseLLMModel, pool) -> None:
-        """Graphs for the speculative verify forward: ``bs`` requests of ``verify_rows``
-        rows each. The verify is decode-shaped throughout -- attention runs each row as a
-        decode query, the GDN layers run the recurrent decode kernel over each request's
-        rows, the MoE takes its decode path -- so it captures like a decode step. Eager, it
-        spends most of its wall time launching kernels."""
+        """Graphs for the speculative verify forward: ``bs`` requests of ``R`` rows each,
+        for every ``R`` in ``verify_rows``. The verify is decode-shaped throughout --
+        attention runs each row as a decode query, the GDN layers run the recurrent decode
+        kernel over each request's rows, the MoE takes its decode path -- so it captures
+        like a decode step. Eager, it spends most of its wall time launching kernels."""
         from freetoken.attention.linear import FLAMetadata
 
-        R = self.verify_rows
-        rows_max = self.max_graph_bs * R
-        self.vbuffer = GraphCaptureBuffer.init(rows_max, vocab_size, self.device)
-        self.v_cu_seqlens = torch.arange(
-            0, (self.max_graph_bs + 1) * R, R, dtype=torch.int32, device=self.device)
+        rows_max = self.max_graph_bs * max(self.verify_rows)
+        vb = self.vbuffer = GraphCaptureBuffer.init(rows_max, vocab_size, self.device)
+        self.v_page_row = torch.zeros(self.max_graph_bs, dtype=torch.int64, device=self.device)
+        self.v_cu_seqlens = {
+            R: torch.arange(0, (self.max_graph_bs + 1) * R, R, dtype=torch.int32, device=self.device)
+            for R in self.verify_rows
+        }
         self.v_logits_indices = torch.arange(rows_max, device=self.device)
         dummy_slot = (self.dummy_req.linear_slot_idx
                       if self.dummy_req.linear_slot_idx is not None
                       else self.dummy_req.table_idx)
-        for bs in sorted(self.graph_bs_list, reverse=True):
-            rows = bs * R
-            graph = torch.cuda.CUDAGraph()
-            batch = Batch(reqs=[self.dummy_req] * bs, phase="prefill")
-            batch.is_spec_verify = True
-            batch.spec_uniform_rows = R
-            batch.capture_hidden = self.capture_hidden
-            batch.padded_reqs = batch.reqs
-            batch.logits_indices = self.v_logits_indices[:rows]
-            self.attn_backend.prepare_for_capture_rows(batch, rows)
-            vb = self.vbuffer
-            batch.input_ids = vb.input_ids[:rows]
-            batch.out_loc = vb.out_loc[:rows]
-            batch.positions = vb.positions[:rows]
-            vb.table_idx[:bs].fill_(dummy_slot)
-            batch.fla_metadata = FLAMetadata(
-                cu_seqlens=self.v_cu_seqlens[: bs + 1], cache_indices=vb.table_idx[:bs])
-            with get_global_ctx().forward_batch(batch):
-                vb.logits[:rows] = model.forward()
-                if self.verify_tail is not None:
-                    self.verify_tail(batch, vb.logits[:rows])
-                batch.hidden_states = None
-                with torch.cuda.graph(graph, pool=pool, stream=self.stream):
+        for R in self.verify_rows:
+            for bs in sorted(self.graph_bs_list, reverse=True):
+                rows = bs * R
+                graph = torch.cuda.CUDAGraph()
+                batch = Batch(reqs=[self.dummy_req] * bs, phase="prefill")
+                batch.is_spec_verify = True
+                batch.spec_uniform_rows = R
+                batch.capture_hidden = self.capture_hidden
+                batch.padded_reqs = batch.reqs
+                batch.logits_indices = self.v_logits_indices[:rows]
+                self.attn_backend.prepare_for_capture_rows(batch, rows)
+                batch.input_ids = vb.input_ids[:rows]
+                batch.out_loc = vb.out_loc[:rows]
+                batch.positions = vb.positions[:rows]
+                vb.table_idx[:bs].fill_(dummy_slot)
+                self.v_page_row[:bs].fill_(self.dummy_req.table_idx)
+                batch.spec_page_row = self.v_page_row[:bs]
+                batch.fla_metadata = FLAMetadata(
+                    cu_seqlens=self.v_cu_seqlens[R][: bs + 1], cache_indices=vb.table_idx[:bs])
+                with get_global_ctx().forward_batch(batch):
                     vb.logits[:rows] = model.forward()
                     if self.verify_tail is not None:
-                        nt, dt = self.verify_tail(batch, vb.logits[:rows])
-                        self.verify_tail_out[bs] = (nt, dt)
-                self._reset_moe_offload_cache()
-            self.verify_graph_map[bs] = graph
-            if self.capture_hidden:
-                assert batch.hidden_states is not None
-                self.verify_hidden_map[bs] = batch.hidden_states
-        logger.info_rank0(f"Captured speculative verify graphs ({R} rows/request): "
+                        self.verify_tail(batch, vb.logits[:rows])
+                    batch.hidden_states = None
+                    with torch.cuda.graph(graph, pool=pool, stream=self.stream):
+                        vb.logits[:rows] = model.forward()
+                        if self.verify_tail is not None:
+                            nt, dt = self.verify_tail(batch, vb.logits[:rows])
+                            self.verify_tail_out[(bs, R)] = (nt, dt)
+                    self._reset_moe_offload_cache()
+                self.verify_graph_map[(bs, R)] = graph
+                if self.capture_hidden:
+                    assert batch.hidden_states is not None
+                    self.verify_hidden_map[(bs, R)] = batch.hidden_states
+        logger.info_rank0(f"Captured speculative verify graphs (bs, rows/request): "
                           f"{sorted(self.verify_graph_map)}")
 
     def _is_verify_graph(self, batch: Batch) -> bool:
         return (
             batch.is_spec_verify
-            and getattr(batch, "spec_uniform_rows", 0) == self.verify_rows
-            and batch.size in getattr(self, "verify_graph_map", {})
+            and (batch.size, getattr(batch, "spec_uniform_rows", 0)) in getattr(
+                self, "verify_graph_map", {})
             and getattr(getattr(batch, "attn_metadata", None), "rows_as_decode", False)
         )
 
@@ -288,17 +292,20 @@ class GraphRunner:
         return batch.is_decode and batch.size <= self.max_graph_bs
 
     def _replay_verify(self, batch: Batch) -> torch.Tensor:
-        bs, rows = batch.size, batch.size * self.verify_rows
+        R = batch.spec_uniform_rows
+        bs, rows = batch.size, batch.size * R
         vb = self.vbuffer
         vb.input_ids[:rows] = batch.input_ids
         vb.out_loc[:rows] = batch.out_loc
         vb.positions[:rows] = batch.positions
         vb.table_idx[:bs] = batch.fla_metadata.cache_indices
+        if getattr(batch, "spec_page_row", None) is not None:
+            self.v_page_row[:bs] = batch.spec_page_row
         self.attn_backend.prepare_for_replay_rows(batch, rows)
-        self.verify_graph_map[bs].replay()
+        self.verify_graph_map[(bs, R)].replay()
         if self.capture_hidden:
-            batch.hidden_states = self.verify_hidden_map[bs][:rows]
-        tail = self.verify_tail_out.get(bs)
+            batch.hidden_states = self.verify_hidden_map[(bs, R)][:rows]
+        tail = self.verify_tail_out.get((bs, R))
         if tail is not None:
             batch.graph_next_tokens, batch.graph_draft_tokens = tail
         return vb.logits[:rows]

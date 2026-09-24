@@ -72,7 +72,10 @@ class Req:
     # The token the draft head proposed for this request's next position, carried from the
     # forward that produced it to the batch that will verify it. None when speculation is
     # off, or for the first step after a prefill that has not drafted yet.
-    pending_draft: int | None = None
+    pending_draft: list[int] | None = None
+    # KV slots allocated past the staged drafts for the draft head's autoregressive steps
+    # (drafts - 1 of them); scratch, rolled back with the rejected drafts.
+    spec_scratch: int = 0
     # Spare LinearStatePool slot holding this request's GDN state as it was before the
     # verify forward. Recurrent state cannot be rewound token by token, so speculation
     # snapshots it and restores on a rejection.

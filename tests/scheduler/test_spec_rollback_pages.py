@@ -77,3 +77,32 @@ def test_full_accept_keeps_every_page(page_size):
         req.accept(1, torch.tensor(9))
         cm.rollback_speculative(req, staged)
         _expect_owned(cm, req, page_size)
+
+
+@pytest.mark.parametrize("page_size", [1, 2])
+@pytest.mark.parametrize("accepted", [0, 1, 2])
+def test_draft_head_scratch_slots_are_returned(page_size, accepted):
+    """k drafts allocate k - 1 scratch slots past the staged rows for the head's chain;
+    whatever acceptance commits, the rollback returns them with the rejected drafts."""
+    cm, req = _setup(page_size)
+    for _ in range(4):
+        req.reserve_drafts(2)
+        req.write_draft(0, torch.tensor(7))
+        req.write_draft(1, torch.tensor(8))
+        req.spec_scratch = 1
+        cm.allocate_paged([req])
+        staged = req.device_len + req.spec_scratch
+        req.spec_scratch = 0
+        req.accept(accepted, torch.tensor(9))
+        cm.rollback_speculative(req, staged)
+        _expect_owned(cm, req, page_size)
+
+
+def test_scratch_slots_of_a_dropped_request_are_freed():
+    cm, req = _setup(1)
+    req.reserve_drafts(2)
+    req.spec_scratch = 1
+    cm.allocate_paged([req])
+    before = len(cm.free_slots)
+    cm.free_spec_scratch(req)
+    assert len(cm.free_slots) == before + 1 and req.spec_scratch == 0

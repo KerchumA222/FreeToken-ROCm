@@ -265,7 +265,7 @@ class CacheManager:
         allocation_info: List[Tuple[int, int, int]] = []
         for req in reqs:
             first_page = div_ceil(req.cached_len, self.page_size)
-            last_page = div_ceil(req.device_len, self.page_size)
+            last_page = div_ceil(req.device_len + req.spec_scratch, self.page_size)
             if last_page > first_page:
                 needed_pages += last_page - first_page
                 allocation_info.append((req.table_idx, first_page, last_page))
@@ -650,8 +650,18 @@ class CacheManager:
         last = div_ceil(staged_device_len, self.page_size)
         if last <= first:
             return
-        rows = self.page_table[req.table_idx, first * self.page_size : last * self.page_size]
-        self._free(rows[:: self.page_size].contiguous())
+        # _free takes token slots and keeps every page_size-th itself.
+        self._free(self.page_table[req.table_idx, first * self.page_size : last * self.page_size])
+
+    def free_spec_scratch(self, req: Req) -> None:
+        """Free the draft head's scratch slots past ``device_len`` (a request dropped while
+        its verify was in flight never reaches the rollback that normally frees them)."""
+        if req.spec_scratch:
+            first = div_ceil(req.device_len, self.page_size)
+            last = div_ceil(req.device_len + req.spec_scratch, self.page_size)
+            if last > first:
+                self._free(self.page_table[req.table_idx, first * self.page_size : last * self.page_size])
+            req.spec_scratch = 0
 
     def _free(self, indices: torch.Tensor) -> None:
         if len(indices) > 0:

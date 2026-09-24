@@ -387,7 +387,7 @@ class Scheduler(SchedulerIOMixin):
                     if draft_tokens_cpu is not None and batch.draft_last_rows:
                         last = batch.draft_last_rows[i]
                         if last < draft_tokens_cpu.numel():
-                            req.pending_draft = int(draft_tokens_cpu[last])
+                            req.pending_draft = [int(draft_tokens_cpu[last])]
                 for next_token in emitted:
                     if self._commit_token(batch, req, next_token, reply, new_finished_reqs):
                         break
@@ -612,6 +612,7 @@ class Scheduler(SchedulerIOMixin):
         # slots to two later requests. table_idx == -1 marks an already-freed request.
         if req.table_idx == -1:
             return
+        self.cache_manager.free_spec_scratch(req)
         if req.spec_state_slot is not None:
             # The speculative rollback snapshot; freed with the rest so the slot does not
             # leak out of the linear-state pool when a request ends mid-speculation.
@@ -902,15 +903,20 @@ class Scheduler(SchedulerIOMixin):
             self.token_pool[req.table_idx, req.cached_len + 1] = correction
             req.spec_rejects += 1
             return []
-        staged_device_len = req.device_len
+        staged_device_len = req.device_len + req.spec_scratch
+        req.spec_scratch = 0
         req.accept(accepted, torch.tensor(correction, dtype=req.input_ids.dtype))
         self.cache_manager.rollback_speculative(req, staged_device_len)
         # The forward reads its ids from the GPU pool; accept() only wrote the host buffer.
         self.token_pool[req.table_idx, req.cached_len] = correction
         if draft_tokens_cpu is not None:
-            # The head's prediction at the row we committed at is the token two past it,
-            # which is exactly the next round's draft.
-            req.pending_draft = int(draft_tokens_cpu[off + accepted])
+            if draft_tokens_cpu.dim() == 2:
+                # [requests, drafts]: the head's chain from the row acceptance stopped at.
+                req.pending_draft = [int(t) for t in draft_tokens_cpu[row]]
+            else:
+                # The head's prediction at the row we committed at is the token two past
+                # it, which is exactly the next round's draft.
+                req.pending_draft = [int(draft_tokens_cpu[off + accepted])]
         req.spec_rejects = 0
         self._spec_accepted += accepted
         if self._spec_rounds % 256 == 0:
@@ -953,15 +959,23 @@ class Scheduler(SchedulerIOMixin):
                 # Restaged by a rejection: the draft is already in place and in the pool.
                 staged += 1
             elif (
-                draft is not None
+                draft
                 and req.sampling_params.is_greedy
                 and req.spec_capacity >= 1
                 and req.spec_rejects < _SPEC_MAX_REJECTS
             ):
-                req.reserve_drafts(1)
-                req.write_draft(0, torch.tensor(draft, dtype=self.token_pool.dtype))
+                # k drafts also need k - 1 scratch slots for the head's chain; near the end
+                # of the output budget fall back to the one the head is surest of.
+                if req.spec_capacity < 2 * len(draft) - 1:
+                    draft = draft[:1]
+                k = len(draft)
+                req.reserve_drafts(k)
+                for j, d in enumerate(draft):
+                    req.write_draft(j, torch.tensor(d, dtype=self.token_pool.dtype))
+                req.spec_scratch = k - 1 if pool is not None and pool.has_spec else 0
                 # The forward reads its ids from the GPU pool, not from the host buffer.
-                self.token_pool[req.table_idx, req.device_len - 1] = draft
+                self.token_pool[req.table_idx, req.device_len - k : req.device_len] = torch.tensor(
+                    draft, dtype=self.token_pool.dtype)
                 staged += 1
             else:
                 req.spec_rejects = 0
@@ -970,19 +984,29 @@ class Scheduler(SchedulerIOMixin):
                 # No spare slot for the rollback snapshot: run this request unspeculated
                 # rather than risk state we cannot restore.
                 req.drop_drafts()
+                req.spec_scratch = 0
                 staged -= 1
         if staged == len(batch.reqs) and staged:
             batch.phase = "prefill"
             batch.is_spec_verify = True
             ks = {req.spec_draft_len for req in batch.reqs}
-            if pool is not None and pool.has_spec and len(ks) == 1:
-                # Every request verifies the same number of rows: the GDN layers can run
-                # them through the decode kernels and record per-row state for rollback.
-                batch.spec_uniform_rows = 1 + ks.pop()
+            if pool is not None and pool.has_spec:
+                if len(ks) == 1:
+                    # Every request verifies the same number of rows: the GDN layers run
+                    # them through the decode kernels and record per-row state for rollback.
+                    batch.spec_uniform_rows = 1 + ks.pop()
+                else:
+                    # No per-row rollback without uniform rows, and no snapshot was taken.
+                    batch.phase = "decode"
+                    batch.is_spec_verify = False
+                    for req in batch.reqs:
+                        req.drop_drafts()
+                        req.spec_scratch = 0
         elif staged:
             # Mixed batch: un-stage rather than run some requests unverified.
             for req in batch.reqs:
                 req.drop_drafts()
+                req.spec_scratch = 0
 
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
         self.engine.graph_runner.pad_batch(batch)
@@ -1043,6 +1067,10 @@ class Scheduler(SchedulerIOMixin):
             # them. The default prefill gather keeps only each request's last row.
             rows = sum(r.extend_len for r in batch.padded_reqs)
             batch.logits_indices = torch.arange(rows, device=self.device)
+            # Page-table row per request, for the draft head's chained steps (engine).
+            batch.spec_page_row = torch.tensor(
+                [r.table_idx for r in batch.reqs], dtype=torch.int64, pin_memory=True
+            ).to(self.device, non_blocking=True)
         self.engine.attn_backend.prepare_metadata(batch)
         return ForwardInput(
             batch=batch,

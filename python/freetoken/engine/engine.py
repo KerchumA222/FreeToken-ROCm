@@ -354,6 +354,8 @@ class Engine:
         )
         if self.mtp_head is not None:
             finalize_quant(self.mtp_head)
+        # Drafts per speculative round (--speculative-draft-tokens).
+        self.spec_k = int(config.speculative_draft_tokens) if self.mtp_head is not None else 0
         post_weights_free = self._sync_get_memory()[0]
         logger.info_rank0(f"Host memory after loading weights:  {host_mem_summary()}")
         self._weights_bytes = self._baseline_free - post_weights_free
@@ -403,8 +405,8 @@ class Engine:
             )
             self.ctx.linear_state_pool = self.linear_state_pool
             if self.mtp_head is not None:
-                # MTP drafts one token per round; the verify rolls back to at most row 0.
-                self.linear_state_pool.alloc_spec(config.max_running_req, 1)
+                # A verify of k drafts rolls back to at most row k - 1.
+                self.linear_state_pool.alloc_spec(config.max_running_req, max(1, self.spec_k))
         else:
             self.linear_state_pool = None
 
@@ -1116,16 +1118,17 @@ class Engine:
             verify_tail=self._verify_tail if self._verify_graph_rows() else None,
         )
 
-    def _verify_graph_rows(self) -> int:
-        """Rows per request of the speculative verify graphs (1 + the one MTP draft), or 0
-        when there is nothing to capture. Only the per-step GDN rollback path is
+    def _verify_graph_rows(self) -> tuple[int, ...]:
+        """Rows per request of the speculative verify graphs, or () when there is nothing
+        to capture: 2 for the round after a plain step (which drafts once), and 1 + k once
+        the head's chain supplies k drafts. Only the per-step GDN rollback path is
         decode-shaped enough to capture; see ``LinearStatePool.alloc_spec``."""
         pool = self.linear_state_pool
         if self.mtp_head is None or pool is None or not pool.has_spec:
-            return 0
+            return ()
         if os.environ.get("FT_VERIFY_GRAPH", "1") == "0":
-            return 0
-        return 2
+            return ()
+        return tuple(sorted({2, 1 + self.spec_k}))
 
     def _verify_tail(self, batch: Batch, logits: torch.Tensor):
         """Greedy sample + draft head for a verify batch, captured into its graph.
@@ -1133,6 +1136,62 @@ class Engine:
         what the sampler would return."""
         next_tokens = torch.argmax(logits, dim=-1).to(torch.int32)
         return next_tokens, self._draft_tokens(batch, next_tokens)
+
+    def _draft_chain(self, batch, out, tokens, ids, rows, forward_rows) -> torch.Tensor:
+        """The next round's drafts for a uniform verify batch, as ``[bs, drafts]``.
+
+        Only the row acceptance stops at yields a draft; which row that is is decided on
+        the device (the leading run of drafts the target's own draws agree with), so the
+        whole chain can live in the verify graph. Further drafts step the head
+        autoregressively on its own output, one row at a time."""
+        bs, k = out.shape[0] // rows, rows - 1
+        match = (tokens.view(bs, rows)[:, :k] == ids.view(bs, rows)[:, 1:]).int()
+        accepted = match.cumprod(dim=1).sum(dim=1).long()
+        h = out.index_select(0, torch.arange(bs, device=out.device) * rows + accepted)
+        draft = forward_rows(h).argmax(dim=-1)
+        drafts = [draft]
+        chain = self.spec_k - 1 if bs == 1 and getattr(batch, "spec_page_row", None) is not None else 0
+        if chain > 0:
+            # Position of the accepted row; the head's step j queries position base + j.
+            base = batch.positions.view(bs, rows)[:, 0].long() + accepted
+            for j in range(1, chain + 1):
+                h = self._head_step(batch, h, draft, base + j)
+                draft = forward_rows(h).argmax(dim=-1)
+                drafts.append(draft)
+        return torch.stack(drafts, dim=1).to(torch.int32)
+
+    def _head_step(self, batch: Batch, hidden: torch.Tensor, token: torch.Tensor,
+                   q_pos: torch.Tensor) -> torch.Tensor:
+        """One autoregressive draft-head row at sequence position ``q_pos`` (one request).
+
+        The head is a decoder block, so the step needs its own attention metadata, rope
+        position and KV slot; all three are built on the device from ``q_pos`` so the step
+        captures into the verify graph. The KV slot is scratch the scheduler allocated past
+        the staged rows (``Req.spec_scratch``) and rolls back with them."""
+        from freetoken.attention.triton import TritonMetadata
+
+        page_row = self.ctx.page_table.index_select(0, batch.spec_page_row).view(-1)
+        pos32 = q_pos.to(torch.int32)
+        meta = TritonMetadata(
+            cu_seqlens_q_gpu=torch.arange(2, dtype=torch.int32, device=q_pos.device),
+            indptr=torch.cat([pos32.new_zeros(1), pos32 + 1]),
+            indices=page_row,
+            q_to_req=pos32.new_zeros(1),
+            q_positions=pos32,
+            is_decode=False,
+            prefix_lens=pos32,
+            max_q_len=1,
+            rows_as_decode=True,
+        )
+        saved = batch.attn_metadata, batch.positions, batch.out_loc
+        batch.attn_metadata = meta
+        batch.positions = pos32.to(saved[1].dtype)
+        batch.out_loc = page_row.index_select(0, q_pos).to(saved[2].dtype)
+        try:
+            embed = self.model.model.embed_tokens.forward(token.to(torch.int64))
+            return self.mtp_head.forward(hidden, embed)
+        finally:
+            batch.attn_metadata, batch.positions, batch.out_loc = saved
 
     def _draft_tokens(self, batch: Batch, next_tokens: torch.Tensor) -> torch.Tensor:
         """Run the draft head over every row this forward produced.
@@ -1166,16 +1225,8 @@ class Engine:
             forward_rows = getattr(self.model.lm_head, "forward_rows", None)
             if getattr(self.model.lm_head, "tp_size", 1) != 1:
                 forward_rows = None
-            if rows == 2 and forward_rows is not None:
-                # Only the row acceptance stops at yields the next draft, and a GEMV over a
-                # large vocabulary costs per row on GPUs without a native dp4a. At depth 1
-                # that row is 1 when the target's draw at row 0 matches the staged draft.
-                bs = out.shape[0] // rows
-                accepted = (tokens.view(bs, rows)[:, 0] == ids.view(bs, rows)[:, 1]).long()
-                sel = torch.arange(bs, device=out.device) * rows + accepted
-                draft = forward_rows(out.index_select(0, sel)).argmax(dim=-1).to(torch.int32)
-                # Per-row layout for the scheduler, which reads the row it commits at.
-                return draft.repeat_interleave(rows)
+            if rows >= 2 and forward_rows is not None:
+                return self._draft_chain(batch, out, tokens, ids, rows, forward_rows)
             return self.model.lm_head.forward(out).argmax(dim=-1).to(torch.int32)
         last_rows: list[int] = []
         offset = 0
