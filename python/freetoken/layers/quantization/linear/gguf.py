@@ -41,15 +41,45 @@ class MmvqGgufLinearKernel(LinearKernel):
 
     name = "mmvq"
 
+    def finalize(self, layer: Any) -> None:
+        """Merge runs of adjacent packed slots that share a ggml type into one matrix.
+
+        Each slot is otherwise its own GEMV that re-quantizes the same activation, and
+        the small slots (a GDN in_proj's 32-row beta/alpha) run far below bandwidth.
+        Rows of one type concatenate cleanly; the slot tensors become views into the
+        merged buffer, so the weights are not held twice."""
+        runs: list[tuple[list[str], int]] = []
+        for n, t in zip(layer.gguf_slots, layer.gguf_types):
+            if runs and _is_packed(t) and runs[-1][1] == t:
+                runs[-1][0].append(n)
+            else:
+                runs.append(([n], t))
+        merged = []
+        for names, t in runs:
+            if len(names) == 1:
+                merged.append((names[0], t))
+                continue
+            parts = [getattr(layer, n) for n in names]
+            buf = torch.cat(parts, dim=0)
+            off = 0
+            for n, p in zip(names, parts):
+                setattr(layer, n, buf[off : off + p.shape[0]])
+                off += p.shape[0]
+            attr = f"_gguf_run_{len(merged)}"
+            setattr(layer, attr, buf)
+            merged.append((attr, t))
+        layer._gguf_runs = tuple(merged)
+
     def apply(self, layer: Any, x: torch.Tensor) -> torch.Tensor:
         from freetoken.layers.gguf import fused_mul_mat_gguf
 
         # A fused module may mix packed and dense slots; the dense ones are tiny
         # (0.69% of the bytes in Qwen4-Exp) but must still be multiplied as dense.
+        runs = getattr(layer, "_gguf_runs", None) or tuple(zip(layer.gguf_slots, layer.gguf_types))
         outs = [
             fused_mul_mat_gguf(x, getattr(layer, n), t) if _is_packed(t)
             else torch.nn.functional.linear(x, getattr(layer, n))
-            for n, t in zip(layer.gguf_slots, layer.gguf_types)
+            for n, t in runs
         ]
         out = outs[0] if len(outs) == 1 else torch.cat(outs, dim=-1)
         bias = getattr(layer, "bias", None)
