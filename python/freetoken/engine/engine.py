@@ -530,6 +530,7 @@ class Engine:
             capture_hidden=self.mtp_head is not None,
             verify_rows=self._verify_graph_rows(),
             verify_tail=self._verify_tail if self._verify_graph_rows() else None,
+            verify_chains=tuple(range(self.spec_k)) if self._verify_graph_rows() else (0,),
         )
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
@@ -1186,6 +1187,7 @@ class Engine:
             capture_hidden=self.mtp_head is not None,
             verify_rows=self._verify_graph_rows(),
             verify_tail=self._verify_tail if self._verify_graph_rows() else None,
+            verify_chains=tuple(range(self.spec_k)) if self._verify_graph_rows() else (0,),
         )
 
     def _verify_graph_rows(self) -> tuple[int, ...]:
@@ -1201,7 +1203,8 @@ class Engine:
         # Capturing a verify needs the backend to run its rows as decode queries.
         if not hasattr(getattr(self, "attn_backend", None), "prepare_for_capture_rows"):
             return ()
-        return tuple(sorted({2, 1 + self.spec_k}))
+        # Every depth up to spec_k: the scheduler's depth selector may verify any of them.
+        return tuple(range(2, 2 + self.spec_k))
 
     def _verify_tail(self, batch: Batch, logits: torch.Tensor):
         """Greedy sample + draft head for a verify batch, captured into its graph.
@@ -1238,7 +1241,11 @@ class Engine:
         h = out.index_select(0, pick)
         draft = forward_rows(h).argmax(dim=-1)
         drafts = [draft]
-        chain = self.spec_k - 1 if bs == 1 and getattr(batch, "spec_page_row", None) is not None else 0
+        # The scheduler sizes the chain for the next round's depth (Batch.spec_chain).
+        chain = getattr(batch, "spec_chain", None)
+        chain = self.spec_k - 1 if chain is None else min(chain, self.spec_k - 1)
+        if bs != 1 or getattr(batch, "spec_page_row", None) is None:
+            chain = 0
         if not hasattr(getattr(self, "attn_backend", None), "chain_step_metadata"):
             chain = 0
         if chain > 0:

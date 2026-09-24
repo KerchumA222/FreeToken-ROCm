@@ -108,6 +108,7 @@ class HostExpertCache:
         self.num_experts = int(num_experts)
         self.capacity = int(capacity)
         self.stats = HostTierStats()
+        self.read_seconds_total = 0.0  # never reset; the scheduler times rounds by it
 
         self.banks: dict[str, torch.Tensor] = {}
         for name in store.banks:
@@ -218,7 +219,9 @@ class HostExpertCache:
         else:
             for job in jobs:
                 fill(job)
-        self.stats.read_seconds += time.perf_counter() - t0
+        dt = time.perf_counter() - t0
+        self.stats.read_seconds += dt
+        self.read_seconds_total += dt
 
         for pos, e, slot in claims:
             fid = self._fid(layer, e)

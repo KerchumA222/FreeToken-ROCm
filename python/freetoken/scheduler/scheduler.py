@@ -142,6 +142,10 @@ class Scheduler(SchedulerIOMixin):
         # length per round (1 + accepted/rounds tokens per forward).
         self._spec_accepted = 0
         self._spec_rounds = 0
+        # Adaptive draft depth (speculative/depth.py), built on first use; wall clock and
+        # disk-read clock at the previous commit, to time each verify round.
+        self._depth_sel = None
+        self._step_clock: tuple[float, float] | None = None
         # Floor the prefill chunk by the cache manager's cap (DSV4: ~half the window pool) so a
         # sliding-window cache chunks long prompts and frees out-of-window pages between chunks
         # instead of OOMing _alloc_window on a prompt longer than the window pool.
@@ -349,6 +353,7 @@ class Scheduler(SchedulerIOMixin):
             moe_offload_cache.raise_admission_error()
         reply: List[DetokenizeMsg] = []
         new_finished_reqs: Set[Req] = set()
+        spec_accepted: List[int] = []
         with self.cache_manager.lazy_free_region():
             for i, req in enumerate(batch.reqs):
                 if isinstance(req, ChunkedReq):
@@ -380,6 +385,7 @@ class Scheduler(SchedulerIOMixin):
                     emitted = self._commit_verified(
                         batch, req, i, row_offsets[i], next_tokens_cpu, draft_tokens_cpu
                     )
+                    spec_accepted.append(max(0, len(emitted) - 1))
                 else:
                     tok = next_tokens_cpu[i]
                     req.append_host(tok.unsqueeze(0))
@@ -395,6 +401,8 @@ class Scheduler(SchedulerIOMixin):
                         break
 
         self.finished_reqs = new_finished_reqs
+        if getattr(engine, "mtp_head", None) is not None:
+            self._time_round(batch, spec_accepted)
         # Stamp each reply with the post-batch KV page occupancy so the frontend (shell
         # status bar) can show live KV usage without a separate query.
         used, total = self._kv_usage_pages()
@@ -933,6 +941,38 @@ class Scheduler(SchedulerIOMixin):
             )
         return drafts[:accepted] + [correction]
 
+    def _depth_selector(self):
+        """The draft-depth selector, or None when the head drafts one token.
+        FT_SPEC_ADAPT=0 keeps the configured depth (still measured and logged)."""
+        if self._depth_sel is None:
+            max_k = int(getattr(getattr(self, "engine", None), "spec_k", 1) or 1)
+            if max_k <= 1:
+                return None
+            from freetoken.speculative.depth import DepthSelector
+
+            adapt = _os.environ.get("FT_SPEC_ADAPT", "1") != "0"
+            # FT_SPEC_DEPTH=<k>: verify at k always (the chain still drafts spec_k).
+            forced = int(_os.environ.get("FT_SPEC_DEPTH", "0") or 0) or None
+            self._depth_sel = DepthSelector(max_k, adapt=adapt, fixed_k=forced)
+        return self._depth_sel
+
+    def _time_round(self, batch, accepted: List[int]) -> None:
+        """Credit this forward's wall time (since the previous commit; speculation runs
+        without overlap, so that is one round) to its draft depth."""
+        cache = getattr(getattr(self, "engine", None), "moe_offload_cache", None)
+        tier = getattr(cache, "host_tier", None)
+        now = (time.perf_counter(), getattr(tier, "read_seconds_total", 0.0))
+        prev, self._step_clock = self._step_clock, now
+        rows = getattr(batch, "spec_uniform_rows", 0)
+        if prev is None or not batch.is_spec_verify or not rows or not accepted:
+            return
+        sel = self._depth_selector()
+        if sel is None:
+            return
+        sel.record(rows - 1, accepted, now[0] - prev[0], now[1] - prev[1])
+        if self._spec_rounds % 64 == 0:
+            logger.info_rank0(sel.summary())
+
     def _record_verify_budget(self, extra: int, dead: bool, accepted: int) -> None:
         """Histogram of draft-only expert misses per verify round, with how often each
         bucket's draft was accepted -- the data for choosing FT_VERIFY_BUDGET."""
@@ -967,6 +1007,12 @@ class Scheduler(SchedulerIOMixin):
             return
         pool = self.engine.linear_state_pool
         staged = 0
+        # This round verifies the drafts in hand; the selector picks the NEXT round's depth,
+        # which is how many drafts this round's head chain produces (chain = depth - 1
+        # extra head steps, each a scratch KV slot past the staged rows).
+        sel = self._depth_selector()
+        spec_k = int(getattr(self.engine, "spec_k", 1) or 1)
+        chain = (sel.choose() if sel is not None else spec_k) - 1
         for req in batch.reqs:
             draft = req.pending_draft
             req.pending_draft = None
@@ -988,13 +1034,16 @@ class Scheduler(SchedulerIOMixin):
             ):
                 # k drafts also need k - 1 scratch slots for the head's chain; near the end
                 # of the output budget fall back to the one the head is surest of.
-                if req.spec_capacity < 2 * len(draft) - 1:
+                capacity = req.spec_capacity
+                scratch = max(chain, len(draft) - 1)
+                if capacity < len(draft) + scratch:
                     draft = draft[:1]
                 k = len(draft)
                 req.reserve_drafts(k)
                 for j, d in enumerate(draft):
                     req.write_draft(j, torch.tensor(d, dtype=self.token_pool.dtype))
-                req.spec_scratch = k - 1 if pool is not None and pool.has_spec else 0
+                req.spec_scratch = (min(scratch, max(0, capacity - k))
+                                    if pool is not None and pool.has_spec else 0)
                 # The forward reads its ids from the GPU pool, not from the host buffer.
                 self.token_pool[req.table_idx, req.device_len - k : req.device_len] = torch.tensor(
                     draft, dtype=self.token_pool.dtype)
@@ -1011,6 +1060,7 @@ class Scheduler(SchedulerIOMixin):
         if staged == len(batch.reqs) and staged:
             batch.phase = "prefill"
             batch.is_spec_verify = True
+            batch.spec_chain = chain
             ks = {req.spec_draft_len for req in batch.reqs}
             if pool is not None and pool.has_spec:
                 if len(ks) == 1:

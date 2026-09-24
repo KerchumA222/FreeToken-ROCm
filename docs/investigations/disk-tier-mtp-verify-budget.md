@@ -99,3 +99,48 @@ each step, but the MTP layer is QSA. Now the head's `forward_chain` returns the 
 wide pre-mixer output for the next step, and each backend builds that step's metadata
 (`chain_step_metadata`). The drift at depth 2 against plain decode matches depth 1: median
 0.125, p99 1.78.
+
+## Why deeper drafts lose on the long run, and an adaptive depth
+
+The scheduler times every verify round per depth (`FT_SPEC_ADAPT=0` logs without adapting;
+`FT_SPEC_DEPTH=<k>` forces one). Fixed depths, moving averages at the end of each run:
+
+| | tokens / round | ms / round | disk ms | tok/s |
+|---|---:|---:|---:|---:|
+| short, depth 2 | 2.52 | 81 | 0 | 31 |
+| short, depth 3 | 2.84 | 95 | 0 | 30 |
+| long, depth 2 | 1.71 | 101 | 13 | 17 |
+| long, depth 3 | 2.14 | 142 | 35 | 15 |
+
+- **Acceptance drops on long prose.** At depth 2 the long run accepts 0.7 drafts a round
+  against 1.5 on the short run. The short benchmark repeats one prompt.
+- **Each extra verify row costs ~15-25 ms of disk reads on the long run**, and nothing on
+  the short run, whose experts stay cached.
+- **Each chained head step costs ~3.5 ms.** Measured by forcing depth 1 under
+  `--speculative-draft-tokens 3` (22.9 tok/s) and `2` (24.1), against a true depth-1 run
+  (25.4).
+
+`speculative/depth.py` picks the depth per round:
+
+- Tokens for depth `d` are estimated from every round at depth `k >= d`, as
+  `min(accepted, d) + 1`, because shallower drafts are prefixes of the same chain.
+- Seconds are measured per depth, skipping the first 6 rounds after a switch, which pay
+  cold reads.
+- A probe every 128 rounds keeps the stalest depth current.
+- The verify graphs are captured per (rows, chain length), 9 for depth 3, so a
+  shallower round does not run the full chain.
+
+| `--speculative-draft-tokens 3` | fixed depth 1 | fixed depth 2 | fixed depth 3 | adaptive |
+|---|---:|---:|---:|---:|
+| Flash-Next short | 25.4 | 28.0 | 29.1 | 28.0 |
+| Flash-Next long | 17.8-19.0 | 16.9-19.5 | 16.2-17.7 | 17.7 |
+| Qwen3.6-35B-A3B in VRAM | -- | 90.8 | 90.8 | 89.7 |
+
+The long runs are noisy (5 runs; each depth spans 1-3 tok/s across sessions). Adaptive sits
+within a few percent of the best fixed depth on every workload, and avoids the worst one:
+depth 3 on the long run, or depth 1 on the short run. It is on by default when
+`--speculative-draft-tokens` is above 1.
+
+Adaptive loses its few percent to probes, and to settling that is still too short on the
+disk tier. A depth-3 probe on the short run measured 192 ms with 74 ms of disk, against a
+steady state of 95 ms with 0 ms.

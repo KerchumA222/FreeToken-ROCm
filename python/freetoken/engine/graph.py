@@ -108,6 +108,7 @@ class GraphRunner:
         capture_hidden: bool = False,
         verify_rows: tuple[int, ...] = (),
         verify_tail=None,
+        verify_chains: tuple[int, ...] = (0,),
     ) -> None:
         # ``verify_tail(batch, logits) -> (next_tokens, draft_tokens)``: the greedy sample and
         # the draft head, captured into the verify graph after the target forward.
@@ -115,6 +116,8 @@ class GraphRunner:
         # Rows per request of the speculative verify forwards (1 + drafts) to capture
         # graphs for; empty captures decode graphs only.
         self.verify_rows = tuple(verify_rows)
+        # Chained draft-head steps the verify tail runs (Batch.spec_chain); one graph each.
+        self.verify_chains = tuple(verify_chains) or (0,)
         cuda_graph_bs = _determine_cuda_graph_bs(
             cuda_graph_bs=cuda_graph_bs,
             cuda_graph_max_bs=cuda_graph_max_bs,
@@ -241,13 +244,15 @@ class GraphRunner:
         dummy_slot = (self.dummy_req.linear_slot_idx
                       if self.dummy_req.linear_slot_idx is not None
                       else self.dummy_req.table_idx)
-        for R in self.verify_rows:
+        shapes = [(R, C) for R in self.verify_rows for C in self.verify_chains]
+        for R, C in shapes:
             for bs in sorted(self.graph_bs_list, reverse=True):
                 rows = bs * R
                 graph = torch.cuda.CUDAGraph()
                 batch = Batch(reqs=[self.dummy_req] * bs, phase="prefill")
                 batch.is_spec_verify = True
                 batch.spec_uniform_rows = R
+                batch.spec_chain = C
                 batch.capture_hidden = self.capture_hidden
                 batch.padded_reqs = batch.reqs
                 batch.logits_indices = self.v_logits_indices[:rows]
@@ -269,22 +274,26 @@ class GraphRunner:
                         vb.logits[:rows] = model.forward()
                         if self.verify_tail is not None:
                             nt, dt = self.verify_tail(batch, vb.logits[:rows])
-                            self.verify_tail_out[(bs, R)] = (nt, dt)
+                            self.verify_tail_out[(bs, R, C)] = (nt, dt)
                     self._reset_moe_offload_cache()
-                self.verify_graph_map[(bs, R)] = graph
+                self.verify_graph_map[(bs, R, C)] = graph
                 if self.capture_hidden:
                     assert batch.hidden_states is not None
-                    self.verify_hidden_map[(bs, R)] = batch.hidden_states
-        logger.info_rank0(f"Captured speculative verify graphs (bs, rows/request): "
+                    self.verify_hidden_map[(bs, R, C)] = batch.hidden_states
+        logger.info_rank0(f"Captured speculative verify graphs (bs, rows/request, chain): "
                           f"{sorted(self.verify_graph_map)}")
 
     def _is_verify_graph(self, batch: Batch) -> bool:
         return (
             batch.is_spec_verify
-            and (batch.size, getattr(batch, "spec_uniform_rows", 0)) in getattr(
-                self, "verify_graph_map", {})
+            and self._verify_key(batch) in getattr(self, "verify_graph_map", {})
             and getattr(getattr(batch, "attn_metadata", None), "rows_as_decode", False)
         )
+
+    @staticmethod
+    def _verify_key(batch: Batch) -> tuple[int, int, int]:
+        return (batch.size, getattr(batch, "spec_uniform_rows", 0),
+                getattr(batch, "spec_chain", None) or 0)
 
     def can_use_cuda_graph(self, batch: Batch) -> bool:
         if batch.is_spec_verify:
@@ -292,6 +301,7 @@ class GraphRunner:
         return batch.is_decode and batch.size <= self.max_graph_bs
 
     def _replay_verify(self, batch: Batch) -> torch.Tensor:
+        key = self._verify_key(batch)
         R = batch.spec_uniform_rows
         bs, rows = batch.size, batch.size * R
         vb = self.vbuffer
@@ -302,10 +312,10 @@ class GraphRunner:
         if getattr(batch, "spec_page_row", None) is not None:
             self.v_page_row[:bs] = batch.spec_page_row
         self.attn_backend.prepare_for_replay_rows(batch, rows)
-        self.verify_graph_map[(bs, R)].replay()
+        self.verify_graph_map[key].replay()
         if self.capture_hidden:
-            batch.hidden_states = self.verify_hidden_map[(bs, R)][:rows]
-        tail = self.verify_tail_out.get((bs, R))
+            batch.hidden_states = self.verify_hidden_map[key][:rows]
+        tail = self.verify_tail_out.get(key)
         if tail is not None:
             batch.graph_next_tokens, batch.graph_draft_tokens = tail
         return vb.logits[:rows]
