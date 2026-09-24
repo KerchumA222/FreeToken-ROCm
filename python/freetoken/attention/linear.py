@@ -79,7 +79,8 @@ def build_fla_metadata(batch: "Batch", device: torch.device) -> FLAMetadata:
     fresh_host = torch.tensor(fresh, dtype=torch.int64, **pin) if fresh else None
 
     # A verify batch extends by a handful of rows and never crosses a snapshot boundary.
-    track = (_build_track_metadata(reqs, cu_host, device, pin) if not batch.is_spec_verify
+    track = (_build_track_metadata(reqs, cu_host, device, pin)
+             if not getattr(batch, "is_spec_verify", False)
              else dict(track_dst=None, track_h_row=None, track_conv_src=None,
                        track_boundary_row=None))
 
