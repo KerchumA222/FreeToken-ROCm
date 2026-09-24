@@ -143,9 +143,11 @@ class MoELayer(BaseOP):
 
 
 # FT_VERIFY_BUDGET=<n>: draft-only expert misses a speculative verify may fetch before its
-# draft is abandoned (see OffloadMoeCache.apply_verify_budget). Unset: count only.
+# draft is abandoned (see OffloadMoeCache.apply_verify_budget). Unset: count only, and only
+# with FT_TIER_STATS -- the per-layer counting costs ~8% of an in-VRAM MTP round.
 _VERIFY_BUDGET = (int(os.environ["FT_VERIFY_BUDGET"])
                   if os.environ.get("FT_VERIFY_BUDGET", "") != "" else None)
+_VERIFY_COUNT = _VERIFY_BUDGET is not None or os.environ.get("FT_TIER_STATS", "0") not in ("", "0")
 
 
 def _active_batch():
@@ -308,7 +310,7 @@ class OffloadMoELayer(MoELayer):
             return self._decode_routed_traced(cache, hidden_states, topk_weights, topk_ids)
         batch = _active_batch()
         rows = getattr(batch, "spec_uniform_rows", 0)
-        if rows and batch.is_spec_verify and self.layer_id < cache.num_layers - _draft_layers(cache):
+        if _VERIFY_COUNT and rows and batch.is_spec_verify and self.layer_id < cache.num_layers - _draft_layers(cache):
             cache.apply_verify_budget(self.layer_id, topk_ids, rows, self.layer_id == 0,
                                       _VERIFY_BUDGET)
         cache.ensure_experts(self.layer_id, topk_ids)

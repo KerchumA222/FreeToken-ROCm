@@ -1,10 +1,10 @@
 # MTP on the disk tier: per-row rollback and a verify expert budget (Qwen3.8-Flash-Next)
 
-**Status:** per-row rollback and QSA verify graphs are on. MTP depth 1 runs +25% over
-plain decode. The verify budget (`FT_VERIFY_BUDGET`, off by default) loses at every budget
+**Status:** per-row rollback and QSA verify graphs are on. MTP runs +30-48% over plain
+decode on the short prompt and +35% on the long one (depth 1). The verify budget (`FT_VERIFY_BUDGET`, off by default) loses at every budget
 tried. Measured 2026-09-24 on
 the RX 6800, `Qwen3.8-Flash-Next-IQ2_S-Q2SYM`, with the same disk-tier service as
-[disk-tier-expert-prefetch.md](disk-tier-expert-prefetch.md), MTP depth 1, symmetric
+[disk-tier-expert-prefetch.md](disk-tier-expert-prefetch.md), symmetric
 Q2_0 sidecar `mtp-Qwen3.8-Flash-Next-IQ2XSQ2SYM.gguf`.
 
 ## Per-row rollback for PLE slot states
@@ -71,20 +71,31 @@ restaged onto static buffers per replay. Two PLE pieces had to become capture-sa
 - the disk PLE backend stages a verify graph's tokens into the graph's pinned buffer,
   ordered after the previous graph like decode.
 
-| MTP depth 1 | short tok/s | long tok/s |
-|---|---:|---:|
-| plain decode | 19.6 | 14.1 |
-| eager verify | 18.20 | 14.48 |
-| **graph verify** | **24.51** | **17.35** |
+| | short tok/s | long tok/s | accepted / round |
+|---|---:|---:|---:|
+| plain decode | 19.6 | 14.1 | -- |
+| depth 1, eager verify | 18.20 | 14.48 | 0.77 |
+| **depth 1, graph verify** | **25.57** | **19.04** | 0.77 |
+| depth 2, graph verify | 27.96 | 16.90 | 1.20 |
+| depth 3, graph verify | 29.06 | 17.71 | 1.43 |
 
-Acceptance is unchanged (0.768 a round). The divergence harness gives the same drift
+The graph rows were measured without `FT_TIER_STATS`. The verify-miss counting it enables
+costs ~4-9% a round, so it now runs only with `FT_TIER_STATS` or `FT_VERIFY_BUDGET`. The long
+prompt is 3 runs and noisy (depth 2: 16.8-18.4). Depth 1 wins there because each extra
+verify row adds its own non-resident experts to every stalled layer. On the short prompt
+more depth keeps paying.
+
+Acceptance at depth 1 is unchanged by capture. The divergence harness gives the same drift
 against plain decode as eager verify, so capture changes nothing numerically. That drift
 (median 0.125, p99 1.93, max 3.3) comes from QSA's extend path selecting blocks slightly
 differently from its decode path. It predates this work: `FT_SPEC_ROLLBACK=snapshot`
 shows the same drift.
 
-## Next
+## Depth > 1 on Flash-Next
 
-Depth 2 does not start on this model yet: the draft chain feeds the head its own narrow
-`[T, hidden]` output, where the head wants the wide `[T, hc*hidden]` residual. The chain
-also builds Triton metadata for each step, and the MTP layer here is QSA.
+The draft chain used to feed the head its own narrow `[T, hidden]` output, where the
+Flash-Next head takes the wide `[T, hc*hidden]` residual. It also built Triton metadata for
+each step, but the MTP layer is QSA. Now the head's `forward_chain` returns the block's
+wide pre-mixer output for the next step, and each backend builds that step's metadata
+(`chain_step_metadata`). The drift at depth 2 against plain decode matches depth 1: median
+0.125, p99 1.78.

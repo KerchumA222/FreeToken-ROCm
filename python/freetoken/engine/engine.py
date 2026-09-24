@@ -1210,7 +1210,17 @@ class Engine:
         next_tokens = torch.argmax(logits, dim=-1).to(torch.int32)
         return next_tokens, self._draft_tokens(batch, next_tokens)
 
-    def _draft_chain(self, batch, out, tokens, ids, rows, forward_rows) -> torch.Tensor:
+    def _head_chain(self, hidden: torch.Tensor, embed: torch.Tensor):
+        """The draft head as ``(lm_head input, hidden for its next chained step)``. They
+        are the same tensor unless the head's input is wider than its output (the
+        hyper-connection heads take the wide residual and mix it down for the lm_head)."""
+        forward_chain = getattr(self.mtp_head, "forward_chain", None)
+        if forward_chain is not None:
+            return forward_chain(hidden, embed)
+        out = self.mtp_head.forward(hidden, embed)
+        return out, out
+
+    def _draft_chain(self, batch, out, stream, tokens, ids, rows, forward_rows) -> torch.Tensor:
         """The next round's drafts for a uniform verify batch, as ``[bs, drafts]``.
 
         Only the row acceptance stops at yields a draft; which row that is is decided on
@@ -1224,49 +1234,42 @@ class Engine:
         if dead is not None and dead.numel() == bs:
             # An abandoned draft computed garbage past its pending row: nothing accepted.
             accepted = torch.where(dead, torch.zeros_like(accepted), accepted)
-        h = out.index_select(0, torch.arange(bs, device=out.device) * rows + accepted)
+        pick = torch.arange(bs, device=out.device) * rows + accepted
+        h = out.index_select(0, pick)
         draft = forward_rows(h).argmax(dim=-1)
         drafts = [draft]
         chain = self.spec_k - 1 if bs == 1 and getattr(batch, "spec_page_row", None) is not None else 0
+        if not hasattr(getattr(self, "attn_backend", None), "chain_step_metadata"):
+            chain = 0
         if chain > 0:
+            h = stream.index_select(0, pick)
             # Position of the accepted row; the head's step j queries position base + j.
             base = batch.positions.view(bs, rows)[:, 0].long() + accepted
             for j in range(1, chain + 1):
-                h = self._head_step(batch, h, draft, base + j)
-                draft = forward_rows(h).argmax(dim=-1)
+                out, h = self._head_step(batch, h, draft, base + j)
+                draft = forward_rows(out).argmax(dim=-1)
                 drafts.append(draft)
         return torch.stack(drafts, dim=1).to(torch.int32)
 
     def _head_step(self, batch: Batch, hidden: torch.Tensor, token: torch.Tensor,
-                   q_pos: torch.Tensor) -> torch.Tensor:
+                   q_pos: torch.Tensor):
         """One autoregressive draft-head row at sequence position ``q_pos`` (one request).
 
         The head is a decoder block, so the step needs its own attention metadata, rope
         position and KV slot; all three are built on the device from ``q_pos`` so the step
         captures into the verify graph. The KV slot is scratch the scheduler allocated past
-        the staged rows (``Req.spec_scratch``) and rolls back with them."""
-        from freetoken.attention.triton import TritonMetadata
-
+        the staged rows (``Req.spec_scratch``) and rolls back with them. Returns
+        ``_head_chain``'s pair."""
         page_row = self.ctx.page_table.index_select(0, batch.spec_page_row).view(-1)
         pos32 = q_pos.to(torch.int32)
-        meta = TritonMetadata(
-            cu_seqlens_q_gpu=torch.arange(2, dtype=torch.int32, device=q_pos.device),
-            indptr=torch.cat([pos32.new_zeros(1), pos32 + 1]),
-            indices=page_row,
-            q_to_req=pos32.new_zeros(1),
-            q_positions=pos32,
-            is_decode=False,
-            prefix_lens=pos32,
-            max_q_len=1,
-            rows_as_decode=True,
-        )
+        meta = self.attn_backend.chain_step_metadata(batch, pos32, page_row)
         saved = batch.attn_metadata, batch.positions, batch.out_loc
         batch.attn_metadata = meta
         batch.positions = pos32.to(saved[1].dtype)
         batch.out_loc = page_row.index_select(0, q_pos).to(saved[2].dtype)
         try:
             embed = self.model.model.embed_tokens.forward(token.to(torch.int64))
-            return self.mtp_head.forward(hidden, embed)
+            return self._head_chain(hidden, embed)
         finally:
             batch.attn_metadata, batch.positions, batch.out_loc = saved
 
@@ -1297,13 +1300,13 @@ class Engine:
                 last_rows.append(offset - 1)
             batch.draft_last_rows = last_rows
             tokens = next_tokens[: ids.shape[0]].to(torch.int64)
-            out = self.mtp_head.forward(hidden, self.model.model.embed_tokens.forward(tokens))
+            out, stream = self._head_chain(hidden, self.model.model.embed_tokens.forward(tokens))
             rows = getattr(batch, "spec_uniform_rows", 0)
             forward_rows = getattr(self.model.lm_head, "forward_rows", None)
             if getattr(self.model.lm_head, "tp_size", 1) != 1:
                 forward_rows = None
             if rows >= 2 and forward_rows is not None:
-                return self._draft_chain(batch, out, tokens, ids, rows, forward_rows)
+                return self._draft_chain(batch, out, stream, tokens, ids, rows, forward_rows)
             return self.model.lm_head.forward(out).argmax(dim=-1).to(torch.int32)
         last_rows: list[int] = []
         offset = 0

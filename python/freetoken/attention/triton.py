@@ -301,6 +301,21 @@ class TritonAttentionBackend(BaseAttnBackend):
             rows_as_decode=True,
         )
 
+    def chain_step_metadata(self, batch: Batch, q_pos: torch.Tensor, page_row: torch.Tensor):
+        """One chained draft-head row at device position ``q_pos`` of a one-request verify,
+        as a decode query over ``page_row`` (built on the device: capture-safe)."""
+        return TritonMetadata(
+            cu_seqlens_q_gpu=torch.arange(2, dtype=torch.int32, device=q_pos.device),
+            indptr=torch.cat([q_pos.new_zeros(1), q_pos + 1]),
+            indices=page_row,
+            q_to_req=q_pos.new_zeros(1),
+            q_positions=q_pos,
+            is_decode=False,
+            prefix_lens=q_pos,
+            max_q_len=1,
+            rows_as_decode=True,
+        )
+
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
         assert self.capture is None, "Capture already initialized."
         max_bs = max(bs_list)

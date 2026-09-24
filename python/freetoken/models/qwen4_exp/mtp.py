@@ -89,6 +89,13 @@ class Qwen4ExpMTPHead(BaseOP):
         ``batch`` defaults to the active one so every family's head takes the same call:
         this architecture's decoder layer wants it explicitly, where Qwen3.5's reads the
         context itself."""
+        return self.forward_chain(hidden, token_embed, batch)[0]
+
+    def forward_chain(
+        self, hidden: torch.Tensor, token_embed: torch.Tensor, batch: "Batch | None" = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``forward`` plus the block's wide output [T, hc*hidden] before the mixer: the
+        input a chained draft step takes, as the trunk's wide residual is this step's."""
         if batch is None:
             from freetoken.core import get_global_ctx
 
@@ -98,7 +105,7 @@ class Qwen4ExpMTPHead(BaseOP):
         e = self.enorm.forward(token_embed).unsqueeze(1).expand(-1, self.hc_count, -1)
         stream = self.eh_proj.forward(torch.cat([e, h], dim=-1))
         out = self.layer.forward(stream.reshape(tokens, -1), batch)
-        return self.hyper_connection_mixer.mix(out)[0]
+        return self.hyper_connection_mixer.mix(out)[0], out
 
 
 __all__ = ["Qwen4ExpMTPHead", "MTP_DRAFT_LAYER_KV"]

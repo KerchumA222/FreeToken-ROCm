@@ -508,6 +508,26 @@ class QSASparseAttnBackend(BaseAttnBackend):
         assert batch.active_table_idx is not None, "decode batch is missing its page-table rows"
         self._stage_decode(md, batch.padded_size, batch.active_table_idx.to(torch.int64))
 
+    def chain_step_metadata(self, batch: Batch, q_pos: torch.Tensor, page_row: torch.Tensor):
+        """One chained draft-head row at device position ``q_pos`` of a one-request verify:
+        a one-token extend over the verify's own addressing, visible up to ``q_pos``.
+        ``page_row`` is implied by the verify's block table."""
+        md = batch.attn_metadata
+        assert isinstance(md, QSASparseMetadata) and md.rows_as_decode
+        zero = q_pos.new_zeros(1)
+        return QSASparseMetadata(
+            is_decode=False,
+            last_indices=zero,
+            qo_indptr_cpu=md.qo_indptr_cpu,
+            kv_len_cpu=md.kv_len_cpu,
+            token_to_req=zero,
+            cu_seqlens=torch.arange(2, dtype=torch.int32, device=q_pos.device),
+            seq_lens=(q_pos + 1).to(torch.int32),
+            ring_slots=md.ring_slots[:1],
+            block_table=md.block_table[:1],
+            rows_as_decode=True,
+        )
+
     def _stage_verify(self, md: QSASparseMetadata, bs: int, rows: int) -> None:
         """Copy an eagerly built verify metadata onto the static buffers a verify graph
         reads, and point the metadata at them."""
