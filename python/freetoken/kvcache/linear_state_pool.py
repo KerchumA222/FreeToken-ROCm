@@ -206,15 +206,29 @@ class LinearStatePool:
         self.spec_recurrent = torch.zeros(
             (n_layers, max_reqs, steps, hv, k, v), dtype=self.recurrent_states.dtype,
             device=self._device)
+        # Declared sibling states (e.g. qwen4_exp's PLE conv and n-gram context) get the
+        # same per-step record; whoever advances them writes it (spec_slot_state).
+        self.spec_slot = {
+            name: torch.zeros((t.shape[0], max_reqs, steps, *t.shape[2:]), dtype=t.dtype,
+                              device=self._device)
+            for name, t in self.slot_states.items()
+        }
 
     @property
     def has_spec(self) -> bool:
-        return getattr(self, "spec_recurrent", None) is not None and not self.slot_states
+        return getattr(self, "spec_recurrent", None) is not None
+
+    def spec_slot_state(self, name: str, layer_id: int | None = None) -> torch.Tensor:
+        """Per-step record of a sibling state, ``[max_reqs, steps, *shape]``."""
+        t = self.spec_slot[name]
+        return t[0] if layer_id is None else t[self._state_layer_index[name][layer_id]]
 
     def restore_spec(self, slot: int, row: int, step: int) -> None:
         """Make ``slot``'s state the one recorded after verify row ``step`` of batch row ``row``."""
         self.conv_states[:, slot].copy_(self.spec_conv[:, row, step])
         self.recurrent_states[:, slot].copy_(self.spec_recurrent[:, row, step])
+        for name, t in self.slot_states.items():
+            t[:, slot].copy_(self.spec_slot[name][:, row, step])
 
     def is_linear_layer(self, layer_id: int) -> bool:
         return layer_id in self._local_index

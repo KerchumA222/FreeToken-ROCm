@@ -370,6 +370,32 @@ def build_ple_metadata(
     )
 
 
+def _verify_context():
+    """(batch, linear_state_pool) of the running forward, or (None, None) for direct-op
+    callers (tests) that run PLE without an engine context."""
+    from freetoken.core import get_global_ctx
+
+    try:
+        ctx = get_global_ctx()
+        return ctx.batch, ctx.linear_state_pool
+    except AssertionError:
+        return None, None
+
+
+def _record_verify_contexts(meta: PLEMetadata, ids: torch.Tensor, ctx_len: int) -> None:
+    """Speculative verify: the n-gram context after every row but the last (the last
+    ``ctx_len`` ids of ``[old context | rows 0..s]``), for a partial-accept rollback."""
+    batch, pool = _verify_context()
+    rows = getattr(batch, "spec_uniform_rows", 0)
+    if not (rows and batch.is_spec_verify and pool is not None and pool.has_spec):
+        return
+    n = meta.ngram_context.shape[0]
+    joined = torch.cat([meta.ngram_context.long(), ids.view(n, rows)], dim=1)
+    spec = pool.spec_slot_state(PLE_NGRAM_STATE)
+    for step in range(rows - 1):
+        spec[:n, step] = joined[:, step + 1 : step + 1 + ctx_len].to(spec.dtype)
+
+
 def commit_ngram_context(meta: PLEMetadata, fla, context_pool: torch.Tensor | None = None) -> None:
     """Roll each request's ``ple_ngram_ctx`` forward past this forward's tokens.
 
@@ -393,6 +419,7 @@ def commit_ngram_context(meta: PLEMetadata, fla, context_pool: torch.Tensor | No
             1, ((cu[1:] - cu[:-1]).unsqueeze(1) + steps).clamp_(max=ctx_len - 1)
         )
         nxt = torch.where(cand >= cu[:-1].unsqueeze(1), ids[cand.clamp_min(0)], old)
+        _record_verify_contexts(meta, ids, ctx_len)
     context_pool.index_copy_(0, meta.state_slots, nxt.to(context_pool.dtype))
     if fla is not None and fla.track_boundary_row is not None:
         win = ids[fla.track_boundary_row.unsqueeze(1) - ctx_len + steps]
@@ -683,10 +710,29 @@ class PLELayer(BaseOP):
             history.unsqueeze(0), self.conv1d.weight, groups=width, dilation=self.dilation
         ).squeeze(0)
         new_state = history.index_select(1, next_state_index).view(width, num_reqs, self.state_len)
+        self._record_verify_windows(history, num_reqs)
         states.index_copy_(
             0, meta.state_slots, new_state.permute(1, 0, 2).to(states.dtype).contiguous()
         )
         return F.silu(out.index_select(1, out_index).transpose(0, 1))
+
+    def _record_verify_windows(self, history: torch.Tensor, num_reqs: int) -> None:
+        """Speculative verify: record the conv window after every row but the last, so a
+        partial accept restores the one it stopped at (LinearStatePool.restore_spec). With
+        uniform rows R the packed history is ``[state | R rows]`` per request, and the
+        window after row s is the ``state_len`` columns ending at it."""
+        batch, pool = _verify_context()
+        rows = getattr(batch, "spec_uniform_rows", 0)
+        if not (rows and batch.is_spec_verify and pool is not None and pool.has_spec):
+            return
+        spec = pool.spec_slot_state(PLE_CONV_STATE, self.layer_id)
+        stride = self.state_len + rows
+        base = torch.arange(num_reqs, device=history.device) * stride
+        span = torch.arange(self.state_len, device=history.device)
+        for step in range(rows - 1):
+            cols = (base.unsqueeze(1) + step + 1 + span).reshape(-1)
+            win = history.index_select(1, cols).view(history.shape[0], num_reqs, self.state_len)
+            spec[:num_reqs, step] = win.permute(1, 0, 2).to(spec.dtype)
 
     def _prefill_indices(self, lens: List[int], device: torch.device):
         """Columns of the packed history: this forward's outputs, the state block, the next state block."""

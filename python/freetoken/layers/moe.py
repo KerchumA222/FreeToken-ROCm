@@ -142,6 +142,25 @@ class MoELayer(BaseOP):
         return self._maybe_all_reduce(self._resident_gemm(hidden_states, topk_weights, topk_ids))
 
 
+# FT_VERIFY_BUDGET=<n>: draft-only expert misses a speculative verify may fetch before its
+# draft is abandoned (see OffloadMoeCache.apply_verify_budget). Unset: count only.
+_VERIFY_BUDGET = (int(os.environ["FT_VERIFY_BUDGET"])
+                  if os.environ.get("FT_VERIFY_BUDGET", "") != "" else None)
+
+
+def _active_batch():
+    """The forward's batch, or None for direct-op callers (tests) with no context."""
+    try:
+        return get_global_ctx().batch
+    except AssertionError:
+        return None
+
+
+def _draft_layers(cache) -> int:
+    """MTP draft-head banks sit past the target's layers; the head is not budgeted."""
+    return getattr(cache, "num_draft_layers", 0)
+
+
 class OffloadMoELayer(MoELayer):
     def __init__(
         self,
@@ -287,6 +306,11 @@ class OffloadMoELayer(MoELayer):
             return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
         if decode_trace.trace_active():
             return self._decode_routed_traced(cache, hidden_states, topk_weights, topk_ids)
+        batch = _active_batch()
+        rows = getattr(batch, "spec_uniform_rows", 0)
+        if rows and batch.is_spec_verify and self.layer_id < cache.num_layers - _draft_layers(cache):
+            cache.apply_verify_budget(self.layer_id, topk_ids, rows, self.layer_id == 0,
+                                      _VERIFY_BUDGET)
         cache.ensure_experts(self.layer_id, topk_ids)
         cache.copy_missing()
         return self._expert_gemm(

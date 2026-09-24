@@ -332,6 +332,8 @@ class Scheduler(SchedulerIOMixin):
         batch = last_data[0].batch
         _, next_tokens_cpu, copy_done, *_extra = last_data[1]
         draft_tokens_cpu = _extra[1] if len(_extra) > 1 else None
+        self._spec_dead_cpu = _extra[2] if len(_extra) > 2 else None
+        self._spec_extra_cpu = _extra[3] if len(_extra) > 3 else None
         row_offsets: List[int] = []
         if batch.is_spec_verify:
             off = 0
@@ -880,9 +882,14 @@ class Scheduler(SchedulerIOMixin):
         drafts = [int(req.input_ids[base + 1 + j]) for j in range(k)]
         targets = [int(next_tokens_cpu[off + j]) for j in range(k + 1)]
         accepted = 0
-        if not _SPEC_FORCE_REJECT:
+        dead = getattr(self, "_spec_dead_cpu", None)
+        dead = bool(dead[row]) if dead is not None else False
+        if not _SPEC_FORCE_REJECT and not dead:
             while accepted < k and drafts[accepted] == targets[accepted]:
                 accepted += 1
+        extra = getattr(self, "_spec_extra_cpu", None)
+        if extra is not None:
+            self._record_verify_budget(int(extra[row]), dead, accepted)
         correction = targets[accepted]
         self._spec_rounds += 1
         pool = self.engine.linear_state_pool
@@ -925,6 +932,21 @@ class Scheduler(SchedulerIOMixin):
                 f"{self._spec_accepted / self._spec_rounds:.3f} drafts accepted per round"
             )
         return drafts[:accepted] + [correction]
+
+    def _record_verify_budget(self, extra: int, dead: bool, accepted: int) -> None:
+        """Histogram of draft-only expert misses per verify round, with how often each
+        bucket's draft was accepted -- the data for choosing FT_VERIFY_BUDGET."""
+        if not hasattr(self, "_vb_hist"):
+            self._vb_hist = {}
+        b = extra if extra < 4 else (4 if extra < 8 else (8 if extra < 16 else 16))
+        n, acc, killed = self._vb_hist.get(b, (0, 0, 0))
+        self._vb_hist[b] = (n + 1, acc + accepted, killed + int(dead))
+        if self._spec_rounds % 256 == 0:
+            rows = ", ".join(
+                f"{'%d' % k if k < 4 else ('4-7' if k == 4 else ('8-15' if k == 8 else '16+'))}: "
+                f"{n} rounds acc {acc / n:.2f} dead {d}"
+                for k, (n, acc, d) in sorted(self._vb_hist.items()))
+            logger.info_rank0(f"verify draft-only expert misses -> {rows}")
 
     def _stage_speculation(self, batch: Batch) -> None:
         """Turn a decode batch into a verify batch by staging each request's draft.

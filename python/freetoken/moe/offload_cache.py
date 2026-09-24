@@ -1182,6 +1182,37 @@ class OffloadMoeCache:
     # Width of the per-layer staging for predicted experts (lookahead prefetch).
     PREFETCH_MAX = 64
 
+    def apply_verify_budget(self, layer_id: int, topk_ids: torch.Tensor, rows: int,
+                            first_layer: bool, budget: int | None) -> None:
+        """Budgeted speculative verify: count, per request, the experts only its draft rows
+        need that are not already resident (and that its pending token does not need anyway),
+        cumulatively over the forward's layers. Once that would exceed ``budget``, the draft
+        is dead: its remaining draft-only experts are swapped for the pending token's, so they
+        are never fetched, and the scheduler rejects the draft. The pending row never reads
+        the draft rows, so its result, and the round's one committed token, stay exact.
+        ``budget=None`` only counts. Device arithmetic throughout, so capture-safe."""
+        k = topk_ids.shape[-1]
+        ids = topk_ids.view(-1, rows, k)
+        bs = ids.shape[0]
+        if first_layer or getattr(self, "spec_extra", None) is None or self.spec_extra.numel() != bs:
+            if getattr(self, "spec_extra", None) is None or self.spec_extra.numel() != bs:
+                self.spec_extra = torch.zeros(bs, dtype=torch.int64, device=ids.device)
+                self.spec_used = torch.zeros(bs, dtype=torch.int64, device=ids.device)
+                self.spec_dead = torch.zeros(bs, dtype=torch.bool, device=ids.device)
+            self.spec_extra.zero_(); self.spec_used.zero_(); self.spec_dead.zero_()
+        row0, draft = ids[:, :1, :], ids[:, 1:, :]
+        resident = self.slot_for_id[layer_id].index_select(0, draft.reshape(-1).long()).view_as(draft) >= 0
+        shared = (draft.unsqueeze(-1) == row0.unsqueeze(-2)).any(-1)
+        need = ~resident & ~shared
+        n_extra = need.sum(dim=(1, 2))
+        self.spec_extra += n_extra
+        if budget is None:
+            return
+        self.spec_dead |= self.spec_used + n_extra > budget
+        self.spec_used += torch.where(self.spec_dead, torch.zeros_like(n_extra), n_extra)
+        swap = need & self.spec_dead.view(-1, 1, 1)
+        ids[:, 1:, :] = torch.where(swap, row0.expand_as(draft), draft)
+
     def stage_prefetch(self, layer_id: int, target_layer: int, expert_ids: torch.Tensor) -> None:
         """Predicted experts of ``target_layer`` (int32 on the device, -1 = skip), to start
         reading into the host tier during ``layer_id``'s admission, ahead of the layer

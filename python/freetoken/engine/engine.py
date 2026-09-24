@@ -357,6 +357,10 @@ class ForwardOutput(NamedTuple):
     # whose prediction becomes the next round's draft.
     draft_tokens_gpu: torch.Tensor | None = None
     draft_tokens_cpu: torch.Tensor | None = None
+    # Budgeted verify (OffloadMoeCache.apply_verify_budget), per request: the draft was
+    # abandoned, and how many draft-only expert misses the verify ran into.
+    spec_dead_cpu: torch.Tensor | None = None
+    spec_extra_cpu: torch.Tensor | None = None
 
 
 class Engine:
@@ -461,9 +465,13 @@ class Engine:
                 slot_states=config.model_config.slot_states,
             )
             self.ctx.linear_state_pool = self.linear_state_pool
-            if self.mtp_head is not None and _gdn_supports_verify_rows(self.model):
+            if (self.mtp_head is not None and _gdn_supports_verify_rows(self.model)
+                    and os.environ.get("FT_SPEC_ROLLBACK", "") != "snapshot"
+                    and (not self.linear_state_pool.slot_states
+                         or getattr(self.model, "supports_spec_slot_states", False))):
                 # A verify of k drafts rolls back to at most row k - 1. A model whose GDN
-                # cannot record per-row state keeps the snapshot-and-restage rollback.
+                # (or sibling slot states) cannot record per-row state keeps the
+                # snapshot-and-restage rollback.
                 self.linear_state_pool.alloc_spec(config.max_running_req, max(1, self.spec_k))
         else:
             self.linear_state_pool = None
@@ -886,7 +894,10 @@ class Engine:
         cache.collect_stats = config.moe_collect_stats
         layers = attach_offload_moe_cache(self.model, cache)
         if self.mtp_head is not None:
-            layers += attach_offload_moe_cache(self.mtp_head, cache)
+            head_layers = attach_offload_moe_cache(self.mtp_head, cache)
+            layers += head_layers
+            # The verify budget covers the target's layers only (apply_verify_budget).
+            cache.num_draft_layers = len(head_layers)
         assert len(layers) == config.model_config.num_moe_layers, (
             f"{len(layers)} MoE layers attached, config says "
             f"{config.model_config.num_moe_layers}"
@@ -1187,6 +1198,9 @@ class Engine:
             return ()
         if os.environ.get("FT_VERIFY_GRAPH", "1") == "0":
             return ()
+        # Capturing a verify needs the backend to run its rows as decode queries.
+        if not hasattr(getattr(self, "attn_backend", None), "prepare_for_capture_rows"):
+            return ()
         return tuple(sorted({2, 1 + self.spec_k}))
 
     def _verify_tail(self, batch: Batch, logits: torch.Tensor):
@@ -1206,6 +1220,10 @@ class Engine:
         bs, k = out.shape[0] // rows, rows - 1
         match = (tokens.view(bs, rows)[:, :k] == ids.view(bs, rows)[:, 1:]).int()
         accepted = match.cumprod(dim=1).sum(dim=1).long()
+        dead = getattr(self.moe_offload_cache, "spec_dead", None)
+        if dead is not None and dead.numel() == bs:
+            # An abandoned draft computed garbage past its pending row: nothing accepted.
+            accepted = torch.where(dead, torch.zeros_like(accepted), accepted)
         h = out.index_select(0, torch.arange(bs, device=out.device) * rows + accepted)
         draft = forward_rows(h).argmax(dim=-1)
         drafts = [draft]
@@ -1348,11 +1366,17 @@ class Engine:
             if draft_tokens_gpu is not None
             else None
         )
+        spec_dead_cpu = spec_extra_cpu = None
+        cache = self.moe_offload_cache
+        if (batch.is_spec_verify and getattr(batch, "spec_uniform_rows", 0)
+                and getattr(cache, "spec_dead", None) is not None):
+            spec_dead_cpu = cache.spec_dead.to("cpu", non_blocking=True)
+            spec_extra_cpu = cache.spec_extra.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
         return ForwardOutput(
             next_tokens_gpu, next_tokens_cpu, copy_done_event,
-            draft_tokens_gpu, draft_tokens_cpu,
+            draft_tokens_gpu, draft_tokens_cpu, spec_dead_cpu, spec_extra_cpu,
         )
 
     @torch.inference_mode()

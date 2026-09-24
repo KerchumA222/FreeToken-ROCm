@@ -177,6 +177,10 @@ class Qwen4ExpModel(BaseOP):
 
 
 class Qwen4ExpForCausalLM(BaseLLMModel):
+    # PLE's sibling slot states record per-row history in a speculative verify
+    # (ple._record_verify_windows / _record_verify_contexts), so the per-row rollback works.
+    supports_spec_slot_states = True
+
     def __init__(self, config: ModelConfig) -> None:
         self._config = config
         self.model = Qwen4ExpModel(config)
