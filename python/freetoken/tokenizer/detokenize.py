@@ -91,6 +91,26 @@ class DetokenizeManager:
         self.decode_map.pop(uid, None)
 
     def detokenize(self, msgs: List[DetokenizeMsg]) -> List[str]:
+        """Incremental text per message, in order. A speculative step commits several
+        tokens for one request in the same reply; each must see the offsets the previous
+        one advanced, so a batch is split into rounds with at most one message per uid."""
+        rounds: List[List[int]] = []
+        depth: Dict[int, int] = {}
+        for i, msg in enumerate(msgs):
+            d = depth.get(msg.uid, 0)
+            depth[msg.uid] = d + 1
+            if d == len(rounds):
+                rounds.append([])
+            rounds[d].append(i)
+        if len(rounds) <= 1:
+            return self._detokenize_round(msgs)
+        out: List[str] = [""] * len(msgs)
+        for idx in rounds:
+            for i, text in zip(idx, self._detokenize_round([msgs[i] for i in idx])):
+                out[i] = text
+        return out
+
+    def _detokenize_round(self, msgs: List[DetokenizeMsg]) -> List[str]:
         read_ids: List[List[int]] = []
         surr_ids: List[List[int]] = []
         for msg in msgs:

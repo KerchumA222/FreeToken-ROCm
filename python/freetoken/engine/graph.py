@@ -106,7 +106,11 @@ class GraphRunner:
         dummy_req: Req,
         moe_offload_cache: OffloadMoeCache | None = None,
         capture_hidden: bool = False,
+        verify_rows: int = 0,
     ) -> None:
+        # Rows per request of a speculative verify forward (1 + draft depth) to capture
+        # graphs for; 0 captures decode graphs only.
+        self.verify_rows = verify_rows
         cuda_graph_bs = _determine_cuda_graph_bs(
             cuda_graph_bs=cuda_graph_bs,
             cuda_graph_max_bs=cuda_graph_max_bs,
@@ -135,10 +139,17 @@ class GraphRunner:
         emit_progress("Capturing CUDA graphs / warming up", 0, 0)
         self.graph_map: Dict[int, torch.cuda.CUDAGraph] = {}
         self.hidden_map: Dict[int, torch.Tensor] = {}
+        self.verify_graph_map: Dict[int, torch.cuda.CUDAGraph] = {}
+        self.verify_hidden_map: Dict[int, torch.Tensor] = {}
         if self.max_graph_bs == 0:
             return logger.info_rank0("CUDA graph is disabled.")
 
-        self.attn_backend.init_capture_graph(max_seq_len=max_seq_len, bs_list=self.graph_bs_list)
+        # Verify graphs run bs * verify_rows query rows, so the attention capture buffers
+        # are sized for the larger of the two.
+        attn_bs = list(self.graph_bs_list)
+        if self.verify_rows:
+            attn_bs.append(self.max_graph_bs * self.verify_rows)
+        self.attn_backend.init_capture_graph(max_seq_len=max_seq_len, bs_list=attn_bs)
 
         torch.cuda.synchronize(self.device)
         torch.cuda.empty_cache()
@@ -184,6 +195,9 @@ class GraphRunner:
             self.buffer.table_idx[:bs].fill_(dummy_slot)
             with get_global_ctx().forward_batch(batch):
                 self.buffer.logits[:bs] = model.forward()
+                # The model stashes the hidden states only when unset; drop the warmup's
+                # eager tensor so the captured forward records the graph's own output.
+                batch.hidden_states = None
                 # Keep the offload cache warmed for capture. Resetting here forces
                 # CUDA graph capture to replay cold-cache expert copies.
                 with torch.cuda.graph(graph, pool=pool, stream=self.stream):
@@ -196,15 +210,90 @@ class GraphRunner:
                 assert batch.hidden_states is not None
                 self.hidden_map[bs] = batch.hidden_states
 
+        if self.verify_rows:
+            self._capture_verify_graphs(vocab_size, model, pool)
+
         self._reset_moe_offload_cache()
         free_memory = get_free_memory(self.device)
         logger.info_rank0(f"Free GPU memory after capturing CUDA graphs: {mem_GB(free_memory)}")
 
+    def _capture_verify_graphs(self, vocab_size: int, model: BaseLLMModel, pool) -> None:
+        """Graphs for the speculative verify forward: ``bs`` requests of ``verify_rows``
+        rows each. The verify is decode-shaped throughout -- attention runs each row as a
+        decode query, the GDN layers run the recurrent decode kernel over each request's
+        rows, the MoE takes its decode path -- so it captures like a decode step. Eager, it
+        spends most of its wall time launching kernels."""
+        from freetoken.attention.linear import FLAMetadata
+
+        R = self.verify_rows
+        rows_max = self.max_graph_bs * R
+        self.vbuffer = GraphCaptureBuffer.init(rows_max, vocab_size, self.device)
+        self.v_cu_seqlens = torch.arange(
+            0, (self.max_graph_bs + 1) * R, R, dtype=torch.int32, device=self.device)
+        self.v_logits_indices = torch.arange(rows_max, device=self.device)
+        dummy_slot = (self.dummy_req.linear_slot_idx
+                      if self.dummy_req.linear_slot_idx is not None
+                      else self.dummy_req.table_idx)
+        for bs in sorted(self.graph_bs_list, reverse=True):
+            rows = bs * R
+            graph = torch.cuda.CUDAGraph()
+            batch = Batch(reqs=[self.dummy_req] * bs, phase="prefill")
+            batch.is_spec_verify = True
+            batch.spec_uniform_rows = R
+            batch.capture_hidden = self.capture_hidden
+            batch.padded_reqs = batch.reqs
+            batch.logits_indices = self.v_logits_indices[:rows]
+            self.attn_backend.prepare_for_capture_rows(batch, rows)
+            vb = self.vbuffer
+            batch.input_ids = vb.input_ids[:rows]
+            batch.out_loc = vb.out_loc[:rows]
+            batch.positions = vb.positions[:rows]
+            vb.table_idx[:bs].fill_(dummy_slot)
+            batch.fla_metadata = FLAMetadata(
+                cu_seqlens=self.v_cu_seqlens[: bs + 1], cache_indices=vb.table_idx[:bs])
+            with get_global_ctx().forward_batch(batch):
+                vb.logits[:rows] = model.forward()
+                batch.hidden_states = None
+                with torch.cuda.graph(graph, pool=pool, stream=self.stream):
+                    vb.logits[:rows] = model.forward()
+                self._reset_moe_offload_cache()
+            self.verify_graph_map[bs] = graph
+            if self.capture_hidden:
+                assert batch.hidden_states is not None
+                self.verify_hidden_map[bs] = batch.hidden_states
+        logger.info_rank0(f"Captured speculative verify graphs ({R} rows/request): "
+                          f"{sorted(self.verify_graph_map)}")
+
+    def _is_verify_graph(self, batch: Batch) -> bool:
+        return (
+            batch.is_spec_verify
+            and getattr(batch, "spec_uniform_rows", 0) == self.verify_rows
+            and batch.size in getattr(self, "verify_graph_map", {})
+            and getattr(getattr(batch, "attn_metadata", None), "rows_as_decode", False)
+        )
+
     def can_use_cuda_graph(self, batch: Batch) -> bool:
+        if batch.is_spec_verify:
+            return self._is_verify_graph(batch)
         return batch.is_decode and batch.size <= self.max_graph_bs
+
+    def _replay_verify(self, batch: Batch) -> torch.Tensor:
+        bs, rows = batch.size, batch.size * self.verify_rows
+        vb = self.vbuffer
+        vb.input_ids[:rows] = batch.input_ids
+        vb.out_loc[:rows] = batch.out_loc
+        vb.positions[:rows] = batch.positions
+        vb.table_idx[:bs] = batch.fla_metadata.cache_indices
+        self.attn_backend.prepare_for_replay_rows(batch, rows)
+        self.verify_graph_map[bs].replay()
+        if self.capture_hidden:
+            batch.hidden_states = self.verify_hidden_map[bs][:rows]
+        return vb.logits[:rows]
 
     def replay(self, batch: Batch) -> torch.Tensor:
         assert self.can_use_cuda_graph(batch)
+        if batch.is_spec_verify:
+            return self._replay_verify(batch)
         self.buffer.copy_from(batch)
         g = self.graph_map[batch.padded_size]
         self.attn_backend.prepare_for_replay(batch)
@@ -230,5 +319,8 @@ class GraphRunner:
         # caller / next capture (GraphRunner._capture_graphs already runs it).
         self.graph_map = {}
         self.hidden_map = {}
+        self.verify_graph_map = {}
+        self.verify_hidden_map = {}
         self.buffer = None
+        self.vbuffer = None
         gc.collect()

@@ -73,4 +73,26 @@ def gdn_decode_fla(
     return o[0]
 
 
-__all__ = ["gdn_prefill_chunk_fla", "gdn_decode_fla"]
+def gdn_verify_fla(
+    q, k, v, a, b, *, A_log, dt_bias, state_source, indices, cu_seqlens, scale,
+    step_states: torch.Tensor,   # [B, steps, num_v, K, V]: state after each row but the last
+    step_rows: torch.Tensor,     # [B] int32 row of step_states per request
+) -> torch.Tensor:
+    """The decode kernel over a speculative verify batch: each request's rows run through
+    the recurrence in order (varlen), the final state is written back like a decode, and
+    the state after every earlier row is recorded for a partial-accept rollback."""
+    from freetoken.kernel.fla import fused_sigmoid_gating_delta_rule_update
+
+    o = fused_sigmoid_gating_delta_rule_update(
+        A_log=A_log, a=a, dt_bias=dt_bias,
+        softplus_beta=1.0, softplus_threshold=20.0,
+        q=q, k=k, v=v, b=b,
+        initial_state_source=state_source, initial_state_indices=indices,
+        scale=scale, use_qk_l2norm_in_kernel=True, cu_seqlens=cu_seqlens,
+        intermediate_states_buffer=step_states, intermediate_state_indices=step_rows,
+        cache_final_step=False,
+    )
+    return o[0]
+
+
+__all__ = ["gdn_prefill_chunk_fla", "gdn_decode_fla", "gdn_verify_fla"]

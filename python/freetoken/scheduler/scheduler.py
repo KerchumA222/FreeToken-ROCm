@@ -375,7 +375,7 @@ class Scheduler(SchedulerIOMixin):
                     continue
                 if batch.is_spec_verify:
                     emitted = self._commit_verified(
-                        req, row_offsets[i], next_tokens_cpu, draft_tokens_cpu
+                        batch, req, i, row_offsets[i], next_tokens_cpu, draft_tokens_cpu
                     )
                 else:
                     tok = next_tokens_cpu[i]
@@ -857,7 +857,9 @@ class Scheduler(SchedulerIOMixin):
             self.cache_manager.cache_req(req, finished=False)
         return finished
 
-    def _commit_verified(self, req, off: int, next_tokens_cpu, draft_tokens_cpu) -> List[int]:
+    def _commit_verified(
+        self, batch, req, row: int, off: int, next_tokens_cpu, draft_tokens_cpu
+    ) -> List[int]:
         """Judge one request's drafts and commit the run the target agrees with.
 
         Row ``j`` of the verify forward is the target's own draw at the position draft
@@ -875,7 +877,13 @@ class Scheduler(SchedulerIOMixin):
                 accepted += 1
         correction = targets[accepted]
         self._spec_rounds += 1
-        if accepted < k and self.engine.linear_state_pool is not None:
+        pool = self.engine.linear_state_pool
+        if accepted < k and pool is not None and getattr(batch, "spec_uniform_rows", 0):
+            # The verify forward recorded the GDN state after each row (gdn._verify):
+            # roll back to the last committed row and commit normally below.
+            slot = req.linear_slot_idx if req.linear_slot_idx is not None else req.table_idx
+            pool.restore_spec(slot, row, accepted)
+        elif accepted < k and pool is not None:
             # A partial accept would leave the GDN state describing tokens that are not
             # being committed, and recurrent state cannot be rewound. Abandon the round
             # instead: restore the pre-verify state and restage the target's own token,
@@ -898,6 +906,11 @@ class Scheduler(SchedulerIOMixin):
             req.pending_draft = int(draft_tokens_cpu[off + accepted])
         req.spec_rejects = 0
         self._spec_accepted += accepted
+        if self._spec_rounds % 256 == 0:
+            logger.info_rank0(
+                f"speculative: {self._spec_rounds} verify rounds, "
+                f"{self._spec_accepted / self._spec_rounds:.3f} drafts accepted per round"
+            )
         return drafts[:accepted] + [correction]
 
     def _stage_speculation(self, batch: Batch) -> None:
@@ -946,7 +959,7 @@ class Scheduler(SchedulerIOMixin):
             else:
                 req.spec_rejects = 0
                 continue
-            if pool is not None and not self._snapshot_linear_state(req, pool):
+            if pool is not None and not pool.has_spec and not self._snapshot_linear_state(req, pool):
                 # No spare slot for the rollback snapshot: run this request unspeculated
                 # rather than risk state we cannot restore.
                 req.drop_drafts()
@@ -954,6 +967,11 @@ class Scheduler(SchedulerIOMixin):
         if staged == len(batch.reqs) and staged:
             batch.phase = "prefill"
             batch.is_spec_verify = True
+            ks = {req.spec_draft_len for req in batch.reqs}
+            if pool is not None and pool.has_spec and len(ks) == 1:
+                # Every request verifies the same number of rows: the GDN layers can run
+                # them through the decode kernels and record per-row state for rollback.
+                batch.spec_uniform_rows = 1 + ks.pop()
         elif staged:
             # Mixed batch: un-stage rather than run some requests unverified.
             for req in batch.reqs:

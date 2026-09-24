@@ -57,6 +57,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     DISABLE_STATE_UPDATE: tl.constexpr = False,
     CACHE_INTERMEDIATE_STATES: tl.constexpr = False,
     HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr = False,
+    CACHE_FINAL_STEP: tl.constexpr = True,
 ):
     """
     Fused kernel that combines sigmoid gating computation with recurrent delta rule update.
@@ -207,6 +208,12 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
 
         # Cache intermediate states if enabled
         if CACHE_INTERMEDIATE_STATES:
+            # The final step's state is the one written back to h0; skipping its copy
+            # lets a buffer hold only the states a partial accept can roll back to.
+            if CACHE_FINAL_STEP:
+                store_mask = mask_h
+            else:
+                store_mask = mask_h & (step_idx < T - 1)
             if cache_idx >= 0:
                 step_offset = step_idx * HV * K * V
                 cache_ptr = (
@@ -217,7 +224,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
                     + o_v[None, :] * K
                     + o_k[:, None]
                 )
-                tl.store(cache_ptr, b_h.to(cache_ptr.dtype.element_ty), mask=mask_h)
+                tl.store(cache_ptr, b_h.to(cache_ptr.dtype.element_ty), mask=store_mask)
 
         step_idx += 1
 
@@ -268,6 +275,7 @@ def fused_sigmoid_gating_delta_rule_update(
         int
     ] = None,  # kept for API compat; stride is derived from ``intermediate_states_buffer.shape[1]``
     retrieve_parent_token: Optional[torch.Tensor] = None,
+    cache_final_step: bool = True,
 ):
     """
     Fused triton implementation of sigmoid gating delta rule update.
@@ -365,6 +373,7 @@ def fused_sigmoid_gating_delta_rule_update(
         DISABLE_STATE_UPDATE=disable_state_update,
         CACHE_INTERMEDIATE_STATES=intermediate_states_buffer is not None,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_parent_token is not None,
+        CACHE_FINAL_STEP=cache_final_step,
         num_warps=num_warps,
         num_stages=num_stages,
     )

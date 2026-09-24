@@ -74,6 +74,9 @@ class TritonMetadata(BaseAttnMetadata):
     attn_lse: torch.Tensor | None = None
     num_kv_splits: torch.Tensor | None = None
     swa_indices: torch.Tensor | None = None
+    # A speculative verify batch whose rows each run as their own decode query (row j of a
+    # request attends to its first cached_len + 1 + j KV slots).
+    rows_as_decode: bool = False
 
     def get_last_indices(self, bs: int) -> torch.Tensor:
         return self.cu_seqlens_q_gpu[1 : 1 + bs] - 1
@@ -161,7 +164,7 @@ class TritonAttentionBackend(BaseAttnBackend):
         if spec.sliding_window is not None and metadata.swa_indices is not None:
             indices = metadata.swa_indices
         scale = spec.sm_scale if spec.sm_scale is not None else q.shape[-1] ** -0.5
-        if metadata.is_decode and q.dtype in (torch.float16, torch.bfloat16):
+        if (metadata.is_decode or metadata.rows_as_decode) and q.dtype in (torch.float16, torch.bfloat16):
             bs = metadata.indptr.numel() - 1
             self._ensure_decode_scratch(metadata, bs, q.shape[1], q.shape[-1])
             assert metadata.attn_logits is not None
@@ -228,6 +231,8 @@ class TritonAttentionBackend(BaseAttnBackend):
         is_decode = max(seqlens_q) == 1
         prefix_lens = torch.tensor(cached_lens, dtype=torch.int32, device=device)
 
+        if getattr(batch, "is_spec_verify", False) and not getattr(self.kvcache, "swa_paged", False):
+            return self._prepare_verify_rows(batch, reqs, page_table)
         indptr = torch.tensor([0] + seqlens_k, dtype=torch.int32, device=device).cumsum_(0)
         if is_decode:
             cu_seqlens_q_gpu = torch.arange(0, padded_size + 1, device=device, dtype=torch.int32)
@@ -266,6 +271,34 @@ class TritonAttentionBackend(BaseAttnBackend):
             prefix_lens=prefix_lens,
             max_q_len=max(seqlens_q),
             swa_indices=swa_indices,
+        )
+
+    def _prepare_verify_rows(self, batch: Batch, reqs, page_table) -> None:
+        """Verify rows as independent decode queries. The extend kernel costs ~0.7 ms a
+        layer for a 2-row verify on RDNA against ~45 us for the split-KV decode kernel; each
+        row only needs its causal prefix, which is a decode query over a shorter KV range."""
+        device = self.device
+        kv_lens, row_req, chunks = [], [], []
+        for i, req in enumerate(reqs):
+            for j in range(req.extend_len):
+                n = req.cached_len + 1 + j
+                kv_lens.append(n)
+                row_req.append(i)
+                chunks.append(page_table[req.table_idx, :n])
+        rows = len(kv_lens)
+        q_positions = getattr(batch, "positions", None)
+        if q_positions is None:
+            q_positions = torch.zeros(rows, dtype=torch.int64, device=device)
+        batch.attn_metadata = TritonMetadata(
+            cu_seqlens_q_gpu=torch.arange(rows + 1, dtype=torch.int32, device=device),
+            indptr=torch.tensor([0] + kv_lens, dtype=torch.int32, device=device).cumsum_(0),
+            indices=torch.cat(chunks),
+            q_to_req=torch.tensor(row_req, dtype=torch.int32, device=device),
+            q_positions=q_positions,
+            is_decode=False,
+            prefix_lens=torch.tensor([r.cached_len for r in reqs], dtype=torch.int32, device=device),
+            max_q_len=max(r.extend_len for r in reqs),
+            rows_as_decode=True,
         )
 
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
@@ -343,6 +376,32 @@ class TritonAttentionBackend(BaseAttnBackend):
             num_kv_splits=capture.num_kv_splits[:bs],
             swa_indices=self._capture_swa_indices(),
         )
+
+    def prepare_for_capture_rows(self, batch: Batch, rows: int) -> None:
+        """Capture a speculative verify forward: ``rows`` query rows run as decode queries
+        (see ``_prepare_verify_rows``), all metadata on the persistent capture buffers."""
+        capture = self.capture
+        assert capture is not None and capture.q_to_req.numel() >= rows
+        batch.attn_metadata = TritonMetadata(
+            cu_seqlens_q_gpu=capture.cu_seqlens_q[: rows + 1],
+            indptr=capture.cu_seqlens_k[: rows + 1],
+            indices=capture.page_table.view(-1),
+            q_to_req=capture.q_to_req[:rows],
+            q_positions=capture.positions[:rows],
+            is_decode=False,
+            prefix_lens=capture.positions[:rows],
+            max_q_len=rows,
+            attn_logits=capture.attn_logits[:rows],
+            attn_lse=capture.attn_lse[:rows],
+            num_kv_splits=capture.num_kv_splits[:rows],
+            swa_indices=self._capture_swa_indices(),
+            rows_as_decode=True,
+        )
+
+    def prepare_for_replay_rows(self, batch: Batch, rows: int) -> None:
+        metadata = batch.attn_metadata
+        assert isinstance(metadata, TritonMetadata) and metadata.rows_as_decode
+        self._point_to_capture(metadata, rows)
 
     def prepare_for_replay(self, batch: Batch) -> None:
         metadata, bs = batch.attn_metadata, batch.padded_size

@@ -145,6 +145,35 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         conv_win = conv_in[fla.track_conv_src].transpose(-1, -2).contiguous()  # [nt, conv_dim, K-1]
         cv.index_copy_(0, fla.track_dst, conv_win.to(cv.dtype))
 
+    def _verify(self, conv_in, a, b, n, rows, pool, li, fla, dtype) -> torch.Tensor:
+        """A speculative verify batch through the decode kernels: ``n`` requests of ``rows``
+        rows each, run row by row through the conv and the recurrence. The state after
+        every row but the last goes to the pool's per-step buffers, so a partial accept
+        can roll back to its last accepted row (``LinearStatePool.restore_spec``)."""
+        from .gdn_kernels import gdn_verify_fla
+
+        idx = fla.cache_indices
+        conv_rows = conv_in.view(n, rows, self.conv_dim)
+        conv_state = pool.conv_states[li]
+        mixed_rows = []
+        for s in range(rows):
+            mixed_rows.append(self._conv_decode(conv_rows[:, s].contiguous(), idx, pool))
+            if s < rows - 1:
+                pool.spec_conv[li, :n, s].copy_(conv_state.index_select(0, idx.long()))
+        mixed = torch.stack(mixed_rows, dim=1).reshape(n * rows, self.conv_dim)
+        total = n * rows
+        qf, kf, vf = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
+        q = qf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)
+        k = kf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)
+        v = vf.reshape(1, total, self.num_v_heads, self.head_v_dim).to(dtype)
+        return gdn_verify_fla(
+            q, k, v, a, b, A_log=self.A_log, dt_bias=self.dt_bias,
+            state_source=pool.recurrent_states[li], indices=idx,
+            cu_seqlens=fla.cu_seqlens.to(torch.int32), scale=self.head_k_dim ** -0.5,
+            step_states=pool.spec_recurrent[li],
+            step_rows=torch.arange(n, dtype=torch.int32, device=conv_in.device),
+        )
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         ctx = get_global_ctx()
         batch = ctx.batch
@@ -173,7 +202,10 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         z = z.reshape(total, self.num_v_heads, self.head_v_dim)
         li = pool.local_index(self.layer_id)
 
-        if batch.is_decode:
+        rows = getattr(batch, "spec_uniform_rows", 0)
+        if batch.is_spec_verify and rows and pool.has_spec and fla.track_dst is None:
+            core_out = self._verify(conv_in, a, b, total // rows, rows, pool, li, fla, dtype)
+        elif batch.is_decode:
             # Fused fla decode kernel: gating + in-kernel l2norm + recurrent update +
             # per-request state read/write-by-index, all in one kernel (no gather/scatter,
             # no clone, no external l2norm). q/k stay at num_k_heads (kernel handles GQA).

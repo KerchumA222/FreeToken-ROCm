@@ -193,6 +193,29 @@ class LinearStatePool:
         for t in self.slot_states.values():
             t[:, dst].copy_(t[:, src])
 
+    def alloc_spec(self, max_reqs: int, steps: int) -> None:
+        """Per-step state buffers for speculative verify: the verify forward runs each
+        request's rows through the recurrent decode kernels and records the state after
+        every row but the last, so a partial accept restores the state at the last
+        accepted row instead of re-running the round. Indexed [layer, batch_row, step]."""
+        n_layers, _, conv_dim, km1 = self.conv_states.shape
+        _, _, hv, k, v = self.recurrent_states.shape
+        self.spec_conv = torch.zeros(
+            (n_layers, max_reqs, steps, conv_dim, km1), dtype=self.conv_states.dtype,
+            device=self._device)
+        self.spec_recurrent = torch.zeros(
+            (n_layers, max_reqs, steps, hv, k, v), dtype=self.recurrent_states.dtype,
+            device=self._device)
+
+    @property
+    def has_spec(self) -> bool:
+        return getattr(self, "spec_recurrent", None) is not None and not self.slot_states
+
+    def restore_spec(self, slot: int, row: int, step: int) -> None:
+        """Make ``slot``'s state the one recorded after verify row ``step`` of batch row ``row``."""
+        self.conv_states[:, slot].copy_(self.spec_conv[:, row, step])
+        self.recurrent_states[:, slot].copy_(self.spec_recurrent[:, row, step])
+
     def is_linear_layer(self, layer_id: int) -> bool:
         return layer_id in self._local_index
 

@@ -402,6 +402,9 @@ class Engine:
                 slot_states=config.model_config.slot_states,
             )
             self.ctx.linear_state_pool = self.linear_state_pool
+            if self.mtp_head is not None:
+                # MTP drafts one token per round; the verify rolls back to at most row 0.
+                self.linear_state_pool.alloc_spec(config.max_running_req, 1)
         else:
             self.linear_state_pool = None
 
@@ -457,6 +460,7 @@ class Engine:
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
             capture_hidden=self.mtp_head is not None,
+            verify_rows=self._verify_graph_rows(),
         )
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
@@ -1107,7 +1111,19 @@ class Engine:
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
             capture_hidden=self.mtp_head is not None,
+            verify_rows=self._verify_graph_rows(),
         )
+
+    def _verify_graph_rows(self) -> int:
+        """Rows per request of the speculative verify graphs (1 + the one MTP draft), or 0
+        when there is nothing to capture. Only the per-step GDN rollback path is
+        decode-shaped enough to capture; see ``LinearStatePool.alloc_spec``."""
+        pool = self.linear_state_pool
+        if self.mtp_head is None or pool is None or not pool.has_spec:
+            return 0
+        if os.environ.get("FT_VERIFY_GRAPH", "1") == "0":
+            return 0
+        return 2
 
     def _draft_tokens(self, batch: Batch, next_tokens: torch.Tensor) -> torch.Tensor:
         """Run the draft head over every row this forward produced.
@@ -1124,6 +1140,20 @@ class Engine:
         # request. Indexing the per-row case by request would feed the head the wrong
         # token at each request's last row.
         per_row = next_tokens.numel() == ids.shape[0]
+        if per_row:
+            # A verify batch sampled every row. Feed the head the target's own draw at
+            # each row rather than the next row's input: they agree wherever a draft is
+            # accepted, and at the first rejected row the draw is the correction that
+            # actually gets committed, so the head's prediction there is a valid next draft.
+            last_rows: list[int] = []
+            offset = 0
+            for req in batch.reqs:
+                offset += req.extend_len
+                last_rows.append(offset - 1)
+            batch.draft_last_rows = last_rows
+            tokens = next_tokens[: ids.shape[0]].to(torch.int64)
+            out = self.mtp_head.forward(hidden, self.model.model.embed_tokens.forward(tokens))
+            return self.model.lm_head.forward(out).argmax(dim=-1).to(torch.int32)
         last_rows: list[int] = []
         offset = 0
         for i, req in enumerate(batch.reqs):
