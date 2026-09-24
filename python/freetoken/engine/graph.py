@@ -107,7 +107,11 @@ class GraphRunner:
         moe_offload_cache: OffloadMoeCache | None = None,
         capture_hidden: bool = False,
         verify_rows: int = 0,
+        verify_tail=None,
     ) -> None:
+        # ``verify_tail(batch, logits) -> (next_tokens, draft_tokens)``: the greedy sample and
+        # the draft head, captured into the verify graph after the target forward.
+        self.verify_tail = verify_tail
         # Rows per request of a speculative verify forward (1 + draft depth) to capture
         # graphs for; 0 captures decode graphs only.
         self.verify_rows = verify_rows
@@ -141,6 +145,7 @@ class GraphRunner:
         self.hidden_map: Dict[int, torch.Tensor] = {}
         self.verify_graph_map: Dict[int, torch.cuda.CUDAGraph] = {}
         self.verify_hidden_map: Dict[int, torch.Tensor] = {}
+        self.verify_tail_out: Dict[int, tuple] = {}
         if self.max_graph_bs == 0:
             return logger.info_rank0("CUDA graph is disabled.")
 
@@ -253,9 +258,14 @@ class GraphRunner:
                 cu_seqlens=self.v_cu_seqlens[: bs + 1], cache_indices=vb.table_idx[:bs])
             with get_global_ctx().forward_batch(batch):
                 vb.logits[:rows] = model.forward()
+                if self.verify_tail is not None:
+                    self.verify_tail(batch, vb.logits[:rows])
                 batch.hidden_states = None
                 with torch.cuda.graph(graph, pool=pool, stream=self.stream):
                     vb.logits[:rows] = model.forward()
+                    if self.verify_tail is not None:
+                        nt, dt = self.verify_tail(batch, vb.logits[:rows])
+                        self.verify_tail_out[bs] = (nt, dt)
                 self._reset_moe_offload_cache()
             self.verify_graph_map[bs] = graph
             if self.capture_hidden:
@@ -288,6 +298,9 @@ class GraphRunner:
         self.verify_graph_map[bs].replay()
         if self.capture_hidden:
             batch.hidden_states = self.verify_hidden_map[bs][:rows]
+        tail = self.verify_tail_out.get(bs)
+        if tail is not None:
+            batch.graph_next_tokens, batch.graph_draft_tokens = tail
         return vb.logits[:rows]
 
     def replay(self, batch: Batch) -> torch.Tensor:
@@ -321,6 +334,7 @@ class GraphRunner:
         self.hidden_map = {}
         self.verify_graph_map = {}
         self.verify_hidden_map = {}
+        self.verify_tail_out = {}
         self.buffer = None
         self.vbuffer = None
         gc.collect()

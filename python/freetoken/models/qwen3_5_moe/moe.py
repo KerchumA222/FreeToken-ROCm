@@ -16,17 +16,23 @@ if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
 
 
-_SMALL_ROUTER_ROWS = 4
+def _fused_router(moe: "Qwen3_5MoE", x: torch.Tensor):
+    """Router and shared-expert gate logits in one small-M GEMV, or None to use the linears.
 
+    At decode batch sizes rocBLAS runs these [256, H] / [1, H] GEMVs as large Tensile tiles
+    on RDNA (~160 us a layer on an RX 6800). One Triton GEMV over the concatenated
+    [257, H] weight reads it once for every row in ~5 us."""
+    from freetoken.kernel.triton.small_gemv import MAX_ROWS, small_gemv
 
-def _router_linear(gate: LinearReplicated, x: torch.Tensor) -> torch.Tensor:
-    """The router GEMVs ([E, H] and [1, H]) at decode batch sizes. rocBLAS picks large
-    Tensile GEMM tiles for these on RDNA (118 us for the [256, 2048] router on an
-    RX 6800, 40 layers a token); a broadcast multiply-and-sum reads the same bytes in
-    15 us with the same fp32-accumulated result."""
-    if torch.version.hip is not None and x.shape[0] <= _SMALL_ROUTER_ROWS:
-        return (x.unsqueeze(1) * gate.weight).sum(-1)
-    return gate.forward(x)
+    if torch.version.hip is None or x.shape[0] > MAX_ROWS:
+        return None
+    w = moe._router_weight
+    if w is None:
+        w = moe._router_weight = torch.cat(
+            [moe.gate.weight, moe.shared_expert_gate.weight], dim=0).contiguous()
+    out = small_gemv(x.contiguous(), w, block_n=1, block_k=2048, num_warps=2)
+    e = moe.gate.weight.shape[0]
+    return out[:, :e].contiguous(), out[:, e:]
 
 
 class _SharedExpert(BaseOP):
@@ -81,6 +87,7 @@ class Qwen3_5MoE(BaseOP):
             prefix=f"{prefix}.shared_expert",
         )
         self.shared_expert_gate = LinearReplicated(config.hidden_size, 1, has_bias=False)
+        self._router_weight = None
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
@@ -88,9 +95,14 @@ class Qwen3_5MoE(BaseOP):
         # Compute the router + shared expert BEFORE the routed experts: the fused MoE
         # kernel may write into ``hidden_states`` in place, which would corrupt the
         # shared expert's input (HF also evaluates the shared expert first).
-        router_logits = _router_linear(self.gate, hidden_states)
+        fused = _fused_router(self, hidden_states)
+        if fused is None:
+            router_logits = self.gate.forward(hidden_states)
+            shared_gate = self.shared_expert_gate.forward(hidden_states)
+        else:
+            router_logits, shared_gate = fused
         shared = self.shared_expert.forward(hidden_states)
-        shared = shared * torch.sigmoid(_router_linear(self.shared_expert_gate, hidden_states))
+        shared = shared * torch.sigmoid(shared_gate)
         routed = self.experts.forward(hidden_states=hidden_states, router_logits=router_logits)
         return (routed + shared).view(num_tokens, hidden_dim)
 

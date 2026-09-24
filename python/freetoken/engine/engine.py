@@ -461,6 +461,7 @@ class Engine:
             moe_offload_cache=self.moe_offload_cache,
             capture_hidden=self.mtp_head is not None,
             verify_rows=self._verify_graph_rows(),
+            verify_tail=self._verify_tail if self._verify_graph_rows() else None,
         )
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
@@ -1112,6 +1113,7 @@ class Engine:
             moe_offload_cache=self.moe_offload_cache,
             capture_hidden=self.mtp_head is not None,
             verify_rows=self._verify_graph_rows(),
+            verify_tail=self._verify_tail if self._verify_graph_rows() else None,
         )
 
     def _verify_graph_rows(self) -> int:
@@ -1124,6 +1126,13 @@ class Engine:
         if os.environ.get("FT_VERIFY_GRAPH", "1") == "0":
             return 0
         return 2
+
+    def _verify_tail(self, batch: Batch, logits: torch.Tensor):
+        """Greedy sample + draft head for a verify batch, captured into its graph.
+        Speculation only stages drafts for greedy requests, so the argmax here is exactly
+        what the sampler would return."""
+        next_tokens = torch.argmax(logits, dim=-1).to(torch.int32)
+        return next_tokens, self._draft_tokens(batch, next_tokens)
 
     def _draft_tokens(self, batch: Batch, next_tokens: torch.Tensor) -> torch.Tensor:
         """Run the draft head over every row this forward produced.
@@ -1175,17 +1184,29 @@ class Engine:
         draft_tokens_gpu = None
         decode_profile.step(batch)
         with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, use_graph):
+            batch.graph_next_tokens = batch.graph_draft_tokens = None
             logits = self.graph_runner.replay(batch) if use_graph else self.model.forward()
-            # Sampling is inside the context because the draft head below needs both its
-            # result and the live attention metadata.
-            # A verify batch scores every staged row, not one per request: each row either
-            # judges a draft or is the token past the last of them.
-            rows = logits.shape[0] if batch.is_spec_verify else batch.size
-            next_tokens_gpu = self.sampler.sample(logits[:rows], args).to(torch.int32)
-            if spec_trace.enabled():
-                spec_trace.record(batch, logits, rows)
-            if self.mtp_head is not None and batch.capture_hidden:
-                draft_tokens_gpu = self._draft_tokens(batch, next_tokens_gpu)
+            if batch.graph_next_tokens is not None:
+                # The verify graph ran the greedy sample and the draft head itself.
+                next_tokens_gpu, draft_tokens_gpu = batch.graph_next_tokens, batch.graph_draft_tokens
+                if spec_trace.enabled():
+                    spec_trace.record(batch, logits, logits.shape[0])
+                offset, last_rows = 0, []
+                for req in batch.reqs:
+                    offset += req.extend_len
+                    last_rows.append(offset - 1)
+                batch.draft_last_rows = last_rows
+            else:
+                # Sampling is inside the context because the draft head below needs both its
+                # result and the live attention metadata.
+                # A verify batch scores every staged row, not one per request: each row either
+                # judges a draft or is the token past the last of them.
+                rows = logits.shape[0] if batch.is_spec_verify else batch.size
+                next_tokens_gpu = self.sampler.sample(logits[:rows], args).to(torch.int32)
+                if spec_trace.enabled():
+                    spec_trace.record(batch, logits, rows)
+                if self.mtp_head is not None and batch.capture_hidden:
+                    draft_tokens_gpu = self._draft_tokens(batch, next_tokens_gpu)
         if self.cpu_moe_executor is not None:
             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
             # -> stale expert outputs) as a loud error instead of silent corruption.
