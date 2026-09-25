@@ -338,3 +338,24 @@ on staging and reads. Kept for hosts with faster storage or more page cache. Gre
 7.5k/2.8k-token chats differs from the old path no earlier than the old path differs from
 itself run to run (atomic fp32 accumulation in both); `tests/moe/test_grouped_down_flip.py`
 checks both layouts against a per-token reference.
+
+## Prefill tier fills as DMA, and a warm GPU cache (2026-09-25)
+
+The disk-tier prefill fill moved staged and pooled expert rows into the GPU buffer with the
+zero-copy index kernel. In isolation it and DMA both reach ~25-28 GB/s on this link, but
+during prefill the kernel's ~3 s per 7.5k chunk runs on compute units beside the GEMMs.
+The fill now issues `copy_` DMA per run of consecutive rows (`FT_TIER_DMA`, default on;
+more than 128 runs per bank falls back to the kernel). tok/s at ~630 / ~2.5k / ~7.5k:
+
+| | 630 | 2.5k | 7.5k |
+|---|---:|---:|---:|
+| cold GPU cache, kernel | 70.4 | 259 | 523 |
+| cold GPU cache, DMA | 68.7 | 266 | 566 |
+| warm GPU cache, kernel | 86.3 | 301 | 585 |
+| warm GPU cache, DMA | 83.7 | 304 | 582 |
+
+"Warm" is `bench_prefill.py --warm-tokens 512`: a decode first fills the GPU expert cache
+(7374 slots, ~30% of experts), and prefill then gathers ~26% of a long chunk's rows device to
+device. Every earlier number here was cold, because `max_tokens=1` requests never populate
+the cache; warm is what a second turn of a conversation sees and is 10-20% faster. The page
+cache cannot be prewarmed usefully on this VM: 32.2 GiB of experts against 30 GB of RAM.

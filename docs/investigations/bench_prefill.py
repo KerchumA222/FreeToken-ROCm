@@ -5,6 +5,10 @@ prefill tokens/second (prompt tokens from the server's usage block). Each prompt
 with a unique nonce so no run reuses another's prefix cache.
 
   python bench_prefill.py --lengths 512 2048 6000 --runs 3 --out prefill.json
+
+``--warm-tokens N`` decodes N tokens first, so a disk-tier server's GPU expert cache holds
+what a conversation leaves behind (prefill reads cached experts device to device) rather
+than starting empty, which ``max_tokens=1`` requests never change.
 """
 
 from __future__ import annotations
@@ -26,10 +30,11 @@ def prompt_of(approx_tokens: int) -> str:
     return f"[{uuid.uuid4().hex}]\n" + body[: approx_tokens * 4]
 
 
-def complete(url: str, model: str, prompt: str) -> tuple[float, int]:
+def complete(url: str, model: str, prompt: str, max_tokens: int = 1) -> tuple[float, int]:
     req = urllib.request.Request(
         url,
-        data=json.dumps({"model": model, "prompt": prompt, "max_tokens": 1, "temperature": 0}).encode(),
+        data=json.dumps({"model": model, "prompt": prompt, "max_tokens": max_tokens,
+                         "temperature": 0, "ignore_eos": True}).encode(),
         headers={"Content-Type": "application/json"},
     )
     t0 = time.perf_counter()
@@ -44,10 +49,11 @@ def main() -> None:
     ap.add_argument("--model", default="default")
     ap.add_argument("--lengths", type=int, nargs="+", default=[512, 2048, 6000])
     ap.add_argument("--runs", type=int, default=3)
+    ap.add_argument("--warm-tokens", type=int, default=0)
     ap.add_argument("--out")
     args = ap.parse_args()
 
-    complete(args.url, args.model, prompt_of(64))  # warm the path
+    complete(args.url, args.model, prompt_of(64), max(1, args.warm_tokens))  # warm the path
     results = []
     for n in args.lengths:
         runs = []

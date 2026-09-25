@@ -29,6 +29,11 @@ _ENV_TRUE = {"1", "true", "yes", "on"}
 # whole layer is tiny) and are excluded from the hit gather, so every per-run
 # entry the batch sees is >= this size.
 _SMALL_BANK_FEAT_BYTES = 256 * 1024
+# Prefill tier fills cross PCIe as DMA copies of coalesced expert runs (copy engine, ~27
+# GB/s on an RX 6800) instead of the zero-copy index kernel (~10 GB/s, and on the compute
+# units the GEMMs want). Above this many runs per bank the kernel's one launch wins.
+_TIER_DMA = os.getenv("FT_TIER_DMA", "1").strip().lower() in {"1", "true", "yes", "on"}
+_TIER_DMA_MAX_RUNS = 128
 
 from freetoken.utils import init_logger
 
@@ -103,6 +108,24 @@ _BANK_BYTES_PER_EXPERT = {
 # vLLM's marlin grouped-GEMM hands the full [cache_size] slot cache as its expert
 # dimension; moe_align_block_size requires round_up(experts, 32) < 1024, i.e. <= 992.
 MARLIN_MAX_CACHE_SIZE = 992
+
+
+def _row_runs(dst_rows, src_rows) -> list[tuple[int, int, int]]:
+    """``(dst_start, src_start, length)`` runs where both row sequences step by one."""
+    runs: list[list[int]] = []
+    for d, s in zip(dst_rows, src_rows):
+        d, s = int(d), int(s)
+        if runs and runs[-1][0] + runs[-1][2] == d and runs[-1][1] + runs[-1][2] == s:
+            runs[-1][2] += 1
+        else:
+            runs.append([d, s, 1])
+    return [tuple(r) for r in runs]
+
+
+def _copy_runs(dst: torch.Tensor, src: torch.Tensor, runs) -> None:
+    """``dst[d:d+n] = src[s:s+n]`` per run, as async copies on the current stream."""
+    for d, s, n in runs:
+        dst[d : d + n].copy_(src[s : s + n], non_blocking=True)
 
 
 @dataclass
@@ -617,16 +640,26 @@ class OffloadMoeCache:
             gpu_dst = torch.tensor(gpu_e, dtype=torch.int32).to(self.device, non_blocking=True)
             gpu_src = torch.tensor(gpu_s, dtype=torch.int32).to(self.device, non_blocking=True)
             gpu_n = torch.tensor([n_gpu], dtype=torch.int64).to(self.device, non_blocking=True)
+        hit_runs = _row_runs(hit_e, hit_s) if _TIER_DMA and n_hit else None
+        miss_runs = _row_runs(miss, range(n_miss)) if _TIER_DMA and n_miss else None
+        if hit_runs is not None and len(hit_runs) > _TIER_DMA_MAX_RUNS:
+            hit_runs = None
+        if miss_runs is not None and len(miss_runs) > _TIER_DMA_MAX_RUNS:
+            miss_runs = None
         for name, buffer in zip(self.bank_schema, self.prefill_bank_buffers):
             dst = buffer[buffer_id]
             if n_gpu:
                 fast_index_copy_jit(dst, gpu_dst, self.bank_caches[name], gpu_src, gpu_n)
-            if n_hit:
+            if hit_runs is not None:
+                _copy_runs(dst, self.bank_sources[name][0], hit_runs)
+            elif n_hit:
                 fast_index_copy_jit(
                     dst, idx["hit_dst"], self.bank_sources[name][0], idx["hit_src"],
                     idx["n_hit"],
                 )
-            if n_miss:
+            if miss_runs is not None:
+                _copy_runs(dst, self._stage[name][buffer_id], miss_runs)
+            elif n_miss:
                 fast_index_copy_jit(
                     dst, idx["miss_dst"], self._stage[name][buffer_id], idx["miss_src"],
                     idx["n_miss"],
