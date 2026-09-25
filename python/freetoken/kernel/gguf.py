@@ -180,6 +180,18 @@ def ggml_mul_mat_vec_a8(
     return _module().ggml_mul_mat_vec_a8(weight, x, quant_type, row)
 
 
+def ggml_quantize_q8_1(x: torch.Tensor) -> torch.Tensor:
+    """``x`` as q8_1 blocks: int32 ``[rows, padded / 32 * 9]``, the MMVQ activation format."""
+    return _module().ggml_quantize_q8_1(x)
+
+
+def ggml_mul_mat_vec_q8(
+    weight: torch.Tensor, x_q8: torch.Tensor, like: torch.Tensor, quant_type: int, row: int, col: int
+) -> torch.Tensor:
+    """MMVQ over an activation already in q8_1; ``like`` sets the output dtype."""
+    return _module().ggml_mul_mat_vec_q8(weight, x_q8, like, quant_type, row, col)
+
+
 def ggml_mul_mat_a8(
     weight: torch.Tensor, x: torch.Tensor, quant_type: int, row: int
 ) -> torch.Tensor:

@@ -75,7 +75,9 @@ class Qwen4ExpMoE(Qwen3_5MoE):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
-        hidden_states = hidden_states.view(-1, hidden_dim)
+        # Already [T, H]: no view, which would drop q8_1 blocks attached upstream.
+        if hidden_states.dim() != 2:
+            hidden_states = hidden_states.view(-1, hidden_dim)
         router_logits = self._router(hidden_states)
         if _ROUTE_TRACE:
             _record_route(self, hidden_states, router_logits)

@@ -93,14 +93,32 @@ class MmvqGgufLinearKernel(LinearKernel):
         # A fused module may mix packed and dense slots; the dense ones are tiny
         # (0.69% of the bytes in Qwen4-Exp) but must still be multiplied as dense.
         runs = getattr(layer, "_gguf_runs", None) or tuple(zip(layer.gguf_slots, layer.gguf_types))
+        x_q8 = _shared_q8(x, runs)
         outs = [
-            fused_mul_mat_gguf(x, getattr(layer, n), t) if _is_packed(t)
+            fused_mul_mat_gguf(x, getattr(layer, n), t, x_q8) if _is_packed(t)
             else dense_linear(x, getattr(layer, n))
             for n, t in runs
         ]
         out = outs[0] if len(outs) == 1 else torch.cat(outs, dim=-1)
         bias = getattr(layer, "bias", None)
         return out + bias.to(out.dtype) if bias is not None else out
+
+
+def _shared_q8(x: torch.Tensor, runs) -> torch.Tensor | None:
+    """One q8_1 quantization of ``x`` for a fused module with several packed GEMV runs
+    (e.g. a GDN in_proj split into Q4_K and IQ2_XS runs), instead of one per run."""
+    from freetoken.layers.gguf import _use_triton, is_mmvq_type, mmvq_rows_ok
+    from freetoken.layers.q8_act import ENABLED, attached
+
+    if (not ENABLED or x.dim() != 2 or not x.is_cuda or not mmvq_rows_ok(x.shape[0]) or _use_triton(x)
+            or sum(1 for _n, t in runs if is_mmvq_type(t)) < 2):
+        return None
+    q8 = attached(x)
+    if q8 is None:
+        from freetoken.kernel.gguf import ggml_quantize_q8_1
+
+        q8 = ggml_quantize_q8_1(x.contiguous())
+    return q8
 
 
 @register_method(QuantKind.GGUF, LayerKind.LINEAR)

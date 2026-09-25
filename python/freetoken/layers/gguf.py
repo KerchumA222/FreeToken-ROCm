@@ -116,8 +116,22 @@ def _use_triton(x: torch.Tensor) -> bool:
     )
 
 
-def fused_mul_mat_gguf(x: torch.Tensor, qweight: torch.Tensor, qweight_type: int) -> torch.Tensor:
-    """y = x @ dequant(qweight).T, dispatched by batch size and quant type."""
+def mmvq_rows_ok(rows: int) -> bool:
+    """Whether a ``rows``-row input takes the MMVQ GEMV (the q8_1-activation kernels)."""
+    return 0 < rows <= _MMVQ_SAFE
+
+
+def is_mmvq_type(qweight_type) -> bool:
+    return qweight_type in _MMVQ
+
+
+def fused_mul_mat_gguf(
+    x: torch.Tensor, qweight: torch.Tensor, qweight_type: int, x_q8: torch.Tensor | None = None
+) -> torch.Tensor:
+    """y = x @ dequant(qweight).T, dispatched by batch size and quant type.
+
+    ``x_q8`` (or blocks attached to ``x``, see ``layers/q8_act.py``) is ``x`` already in
+    q8_1; the GEMV path then skips its own quantization."""
     out_features = qweight.shape[0]
     if x.shape[0] == 0:
         return x.new_empty((0, out_features))
@@ -131,6 +145,13 @@ def fused_mul_mat_gguf(x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
     if qweight_type in _UNQUANTIZED:
         return x @ qweight.T
     if x.shape[0] <= _MMVQ_SAFE and qweight_type in _MMVQ:
+        from freetoken.layers.q8_act import attached
+
+        q8 = x_q8 if x_q8 is not None else attached(x)
+        if q8 is not None:
+            from freetoken.kernel.gguf import ggml_mul_mat_vec_q8
+
+            return ggml_mul_mat_vec_q8(qweight, q8, x, qweight_type, out_features, x.shape[1])
         return ggml_mul_mat_vec_a8(qweight, x, qweight_type, out_features)
     if qweight_type in _MMQ:
         return ggml_mul_mat_a8(qweight, x, qweight_type, out_features)

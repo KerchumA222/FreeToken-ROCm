@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
+from freetoken.layers.q8_act import attach, wants_q8
 from freetoken.layers import (
     BaseOP,
     LinearColParallelMerged,
@@ -51,7 +52,13 @@ class _SharedExpert(BaseOP):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj.forward(silu_and_mul(self.gate_up_proj.forward(x)))
+        h = self.gate_up_proj.forward(x)
+        if h.dim() == 2 and wants_q8(self.down_proj, h.shape[0]):
+            # The activation writes the down projection's q8_1 input itself.
+            from freetoken.kernel.triton.activation import silu_and_mul as triton_silu_and_mul
+
+            return self.down_proj.forward(attach(*triton_silu_and_mul(h, q8=True)))
+        return self.down_proj.forward(silu_and_mul(h))
 
 
 class Qwen3_5DenseMLP(_SharedExpert):

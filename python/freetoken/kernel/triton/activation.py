@@ -18,6 +18,8 @@ import functools
 import torch
 import triton
 import triton.language as tl
+
+from .q8_1 import q8_1_empty, q8_1_padded, q8_1_store
 from triton.language.extra import libdevice
 from triton.language.extra.cuda import gdc_wait, gdc_launch_dependents
 
@@ -80,12 +82,16 @@ def _fast_ex2(x):
 def _act_and_mul_kernel(
     out_ptr,
     x_ptr,
+    q_ptr,
+    stride_q,
     d,
     alpha,
     limit,
     ACT: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    PADDED: tl.constexpr,
+    WRITE_Q: tl.constexpr,
 ):
     # One program handles a contiguous BLOCK_D chunk of one output row.
     row = tl.program_id(0).to(tl.int64)
@@ -127,6 +133,10 @@ def _act_and_mul_kernel(
         y = act * up
     out_row = out_ptr + row * d
     tl.store(out_row + cols, y.to(out_ptr.dtype.element_ty), mask=mask)
+    if WRITE_Q:
+        y = tl.where(mask, y, 0.0)
+        n_blocks = tl.minimum(BLOCK_D, PADDED - col_blk * BLOCK_D) // 32
+        q8_1_store(y, q_ptr + row * stride_q, col_blk * (BLOCK_D // 32), n_blocks, BLOCK_D // 32)
 
 
 def _act_and_mul(
@@ -135,7 +145,9 @@ def _act_and_mul(
     out: torch.Tensor | None,
     alpha: float = 0.0,
     limit: float = 0.0,
+    q8: bool = False,
 ):
+    """``q8=True`` returns ``(out, out as q8_1 blocks)`` (``kernel/triton/q8_1.py``)."""
     assert x.is_cuda and x.is_contiguous()
     d = x.shape[-1] // 2
     out_shape = x.shape[:-1] + (d,)
@@ -149,16 +161,20 @@ def _act_and_mul(
     # Fixed via H100 sweep (72-config grid; 512/w4/s3 within 11% everywhere,
     # 1024/w4/s2 best at rows>=4096).
     block_d = min(triton.next_power_of_2(d), 1024 if M >= 4096 else 512)
+    # q8_1 blocks are written per 512-column tile, which then covers the padding exactly.
+    block_d = 512 if q8 else block_d
     num_stages = 2 if block_d == 1024 else 3
+    q = q8_1_empty(M, d, x.device) if q8 else o2
     _act_and_mul_kernel[grid](
-        o2, x2, d, alpha, limit, ACT=kind, ENABLE_PDL=pdl, **pdl_launch_kwargs(pdl),
-        BLOCK_D=block_d, num_warps=4, num_stages=num_stages,
+        o2, x2, q.view(torch.int8) if q8 else o2, q.shape[1] * 4 if q8 else 0,
+        d, alpha, limit, ACT=kind, ENABLE_PDL=pdl, **pdl_launch_kwargs(pdl),
+        BLOCK_D=block_d, PADDED=q8_1_padded(d), WRITE_Q=q8, num_warps=4, num_stages=num_stages,
     )
-    return out
+    return (out, q) if q8 else out
 
 
-def silu_and_mul(x: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
-    return _act_and_mul(SILU, x, out)
+def silu_and_mul(x: torch.Tensor, out: torch.Tensor | None = None, q8: bool = False):
+    return _act_and_mul(SILU, x, out, q8=q8)
 
 
 def gelu_and_mul(x: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:

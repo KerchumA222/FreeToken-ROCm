@@ -105,3 +105,31 @@ a per-shape MMVQ microbenchmark (random packed weights, M=1, inside a CUDA graph
   prompt). Stream-memop waits are not captured on this HIP (the PLE disk backend probes
   them and falls back to launch-gating). A device-side skip would therefore need a
   GPU-side spin on a pinned flag, answered by a host poller thread.
+
+## Third pass: q8_1 activations from their producers
+
+A packed GEMV quantizes its fp16 input to q8_1 (one launch per matmul, 531 a token).
+Now:
+
+- the C++ op splits into `ggml_quantize_q8_1` and `ggml_mul_mat_vec_q8`;
+- a fused GGUF module with several packed runs (GDN in_proj, attention qkv) quantizes
+  once;
+- the hyper-connection rmsnorm, silu and gate-mix kernels and the shared expert's
+  `silu_and_mul` write q8_1 blocks next to their fp16 output (`kernel/triton/q8_1.py`,
+  bit-identical to the CUDA quantizer). The blocks ride on the output tensor
+  (`layers/q8_act.py`) to the GEMV.
+
+Plain decode is identical to before (zero logit drift over 1,024 tokens against
+`FT_Q8_FUSE=0`). Short prompt: 36.7 -> 37.9 tok/s.
+
+Same session (the long run's absolute numbers move with page-cache state between
+sessions):
+
+| tok/s | short | long |
+|---|---:|---:|
+| plain | 37.8 | 23.4 |
+| MTP adaptive, depth up to 3 | 47.9 | 26.0 |
+
+MTP now wins on both prompts. Admitting draft-only experts as least recently used
+(`FT_SPEC_COLD_DRAFT`) was tried and removed: short 42.3, long 25.9. Accepted drafts
+reuse those experts.

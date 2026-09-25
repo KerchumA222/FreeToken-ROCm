@@ -21,6 +21,7 @@ from freetoken.kernel.triton.hc import (
     hc_silu,
 )
 from freetoken.layers import BaseOP, LinearReplicated
+from freetoken.layers.q8_act import attach, wants_q8
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
@@ -120,9 +121,24 @@ class GatedResidual(BaseOP):
         return down[:, : self.lowrank], down[:, self.lowrank : self.lowrank + self.hc_count]
 
     def _mix_kernel(self, R: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor | None]:
-        rn = grouped_gemma_rmsnorm(R, self.hc_norm.weight, self.hc_norm.eps, self.hc_count)
+        # At decode sizes on a packed GGUF checkpoint, each producer also writes its output
+        # as q8_1 blocks, so the GEMVs downstream skip their own quantize (layers/q8_act.py).
+        down = self.input_mix_weight_down_block_inject if self.use_combine else self.input_mix_weight_down
+        q8 = wants_q8(down, R.shape[0])
+        if q8:
+            rn, rq = grouped_gemma_rmsnorm(
+                R, self.hc_norm.weight, self.hc_norm.eps, self.hc_count, q8=True)
+            attach(rn, rq)
+        else:
+            rn = grouped_gemma_rmsnorm(R, self.hc_norm.weight, self.hc_norm.eps, self.hc_count)
         lora, s = self._down(rn)
-        gate = self.input_mix_weight_up.forward(hc_silu(lora, self.hc_count))
+        if wants_q8(self.input_mix_weight_up, lora.shape[0]):
+            y = attach(*hc_silu(lora, self.hc_count, q8=True))
+        else:
+            y = hc_silu(lora, self.hc_count)
+        gate = self.input_mix_weight_up.forward(y)
+        if q8:
+            return attach(*hc_gate_mix(rn, gate, self.hc_count, q8=True)), s
         return hc_gate_mix(rn, gate, self.hc_count), s
 
     def _mix_torch(self, R: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor | None]:

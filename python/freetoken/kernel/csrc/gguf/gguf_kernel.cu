@@ -91,6 +91,90 @@ torch::Tensor ggml_dequantize(
   return DW;
 }
 
+// The MMVQ kernels by weight type, over an activation already quantized to q8_1.
+template <typename scalar_t>
+static void mmvq_dispatch(const torch::Tensor& W, const torch::Tensor& quant_X, torch::Tensor& Y,
+                          int64_t type, int col, int row, int vecs, cudaStream_t stream) {
+  switch (type) {
+    case 2:
+      mul_mat_vec_q4_0_q8_1_cuda<scalar_t>(
+          (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
+      break;
+    case 3:
+      mul_mat_vec_q4_1_q8_1_cuda<scalar_t>(
+          (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
+      break;
+    case 6:
+      mul_mat_vec_q5_0_q8_1_cuda<scalar_t>(
+          (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
+      break;
+    case 7:
+      mul_mat_vec_q5_1_q8_1_cuda<scalar_t>(
+          (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
+      break;
+    case 8:
+      mul_mat_vec_q8_0_q8_1_cuda<scalar_t>(
+          (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
+      break;
+    case 10:
+      mul_mat_vec_q2_K_q8_1_cuda<scalar_t>(
+          (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
+      break;
+    case 11:
+      mul_mat_vec_q3_K_q8_1_cuda<scalar_t>(
+          (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
+      break;
+    case 12:
+      mul_mat_vec_q4_K_q8_1_cuda<scalar_t>(
+          (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
+      break;
+    case 13:
+      mul_mat_vec_q5_K_q8_1_cuda<scalar_t>(
+          (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
+      break;
+    case 14:
+      mul_mat_vec_q6_K_q8_1_cuda<scalar_t>(
+          (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
+      break;
+    case 16:
+      mul_mat_vec_iq2_xxs_q8_1_cuda<scalar_t>(
+          (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
+      break;
+    case 17:
+      mul_mat_vec_iq2_xs_q8_1_cuda<scalar_t>(
+          (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
+      break;
+    case 18:
+      mul_mat_vec_iq3_xxs_q8_1_cuda<scalar_t>(
+          (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
+      break;
+    case 19:
+      mul_mat_vec_iq1_s_q8_1_cuda<scalar_t>(
+          (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
+      break;
+    case 20:
+      mul_mat_vec_iq4_nl_q8_1_cuda<scalar_t>(
+          (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
+      break;
+    case 21:
+      mul_mat_vec_iq3_s_q8_1_cuda<scalar_t>(
+          (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
+      break;
+    case 22:
+      mul_mat_vec_iq2_s_q8_1_cuda<scalar_t>(
+          (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
+      break;
+    case 23:
+      mul_mat_vec_iq4_xs_q8_1_cuda<scalar_t>(
+          (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
+      break;
+    case 29:
+      mul_mat_vec_iq1_m_q8_1_cuda<scalar_t>(
+          (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
+      break;
+  }
+}
+
 torch::Tensor ggml_mul_mat_vec_a8(
     torch::Tensor W,  // quant weight
     torch::Tensor X,  // input
@@ -107,84 +191,38 @@ torch::Tensor ggml_mul_mat_vec_a8(
   at::Tensor quant_X = torch::empty({vecs, padded / 32 * 9}, options);
   DISPATCH_FLOAT_TYPES(X.scalar_type(), "ggml_mul_mat_vec_a8", [&] {
     quantize_row_q8_1_cuda<scalar_t>((scalar_t*)X.data_ptr(), (void*)quant_X.data_ptr(), col, vecs, stream);
-    switch (type) {
-      case 2:
-        mul_mat_vec_q4_0_q8_1_cuda<scalar_t>(
-            (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
-        break;
-      case 3:
-        mul_mat_vec_q4_1_q8_1_cuda<scalar_t>(
-            (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
-        break;
-      case 6:
-        mul_mat_vec_q5_0_q8_1_cuda<scalar_t>(
-            (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
-        break;
-      case 7:
-        mul_mat_vec_q5_1_q8_1_cuda<scalar_t>(
-            (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
-        break;
-      case 8:
-        mul_mat_vec_q8_0_q8_1_cuda<scalar_t>(
-            (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
-        break;
-      case 10:
-        mul_mat_vec_q2_K_q8_1_cuda<scalar_t>(
-            (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
-        break;
-      case 11:
-        mul_mat_vec_q3_K_q8_1_cuda<scalar_t>(
-            (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
-        break;
-      case 12:
-        mul_mat_vec_q4_K_q8_1_cuda<scalar_t>(
-            (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
-        break;
-      case 13:
-        mul_mat_vec_q5_K_q8_1_cuda<scalar_t>(
-            (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
-        break;
-      case 14:
-        mul_mat_vec_q6_K_q8_1_cuda<scalar_t>(
-            (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
-        break;
-      case 16:
-        mul_mat_vec_iq2_xxs_q8_1_cuda<scalar_t>(
-            (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
-        break;
-      case 17:
-        mul_mat_vec_iq2_xs_q8_1_cuda<scalar_t>(
-            (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
-        break;
-      case 18:
-        mul_mat_vec_iq3_xxs_q8_1_cuda<scalar_t>(
-            (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
-        break;
-      case 19:
-        mul_mat_vec_iq1_s_q8_1_cuda<scalar_t>(
-            (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
-        break;
-      case 20:
-        mul_mat_vec_iq4_nl_q8_1_cuda<scalar_t>(
-            (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
-        break;
-      case 21:
-        mul_mat_vec_iq3_s_q8_1_cuda<scalar_t>(
-            (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
-        break;
-      case 22:
-        mul_mat_vec_iq2_s_q8_1_cuda<scalar_t>(
-            (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
-        break;
-      case 23:
-        mul_mat_vec_iq4_xs_q8_1_cuda<scalar_t>(
-            (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
-        break;
-      case 29:
-        mul_mat_vec_iq1_m_q8_1_cuda<scalar_t>(
-            (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
-        break;
-    }
+    mmvq_dispatch<scalar_t>(W, quant_X, Y, type, col, row, vecs, stream);
+  });
+  return Y;
+}
+
+// X quantized to q8_1 blocks, padded to 512 columns: [vecs, padded / 32 * 9] int32. Lets
+// several GEMVs over one input share a single quantization.
+torch::Tensor ggml_quantize_q8_1(torch::Tensor X) {
+  int col = X.sizes()[1];
+  int vecs = X.sizes()[0];
+  const int padded = (col + 512 - 1) / 512 * 512;
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(X));
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+  auto options = torch::TensorOptions().dtype(torch::kInt32).device(X.device());
+  at::Tensor quant_X = torch::empty({vecs, padded / 32 * 9}, options);
+  DISPATCH_FLOAT_TYPES(X.scalar_type(), "ggml_quantize_q8_1", [&] {
+    quantize_row_q8_1_cuda<scalar_t>((scalar_t*)X.data_ptr(), (void*)quant_X.data_ptr(), col, vecs, stream);
+  });
+  return quant_X;
+}
+
+// MMVQ over an activation already in q8_1 (ggml_quantize_q8_1 or a fused producer);
+// ``like`` supplies the output dtype.
+torch::Tensor ggml_mul_mat_vec_q8(
+    torch::Tensor W, torch::Tensor quant_X, torch::Tensor like, int64_t type, int64_t row, int64_t col) {
+  int vecs = quant_X.sizes()[0];
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(W));
+  auto options = torch::TensorOptions().dtype(like.dtype()).device(W.device());
+  at::Tensor Y = torch::empty({vecs, row}, options);
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+  DISPATCH_FLOAT_TYPES(like.scalar_type(), "ggml_mul_mat_vec_q8", [&] {
+    mmvq_dispatch<scalar_t>(W, quant_X, Y, type, (int)col, (int)row, vecs, stream);
   });
   return Y;
 }
@@ -870,6 +908,8 @@ int64_t ggml_moe_get_block_size(int64_t type) {
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("ggml_dequantize", &ggml_dequantize, "");
   m.def("ggml_mul_mat_vec_a8", &ggml_mul_mat_vec_a8, "");
+  m.def("ggml_quantize_q8_1", &ggml_quantize_q8_1, "");
+  m.def("ggml_mul_mat_vec_q8", &ggml_mul_mat_vec_q8, "");
   m.def("ggml_mul_mat_a8", &ggml_mul_mat_a8, "");
   m.def("ggml_moe_a8", &ggml_moe_a8, "");
   m.def("ggml_moe_a8_vec", &ggml_moe_a8_vec, "");

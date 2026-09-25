@@ -310,7 +310,9 @@ class OffloadMoELayer(MoELayer):
             return self._decode_routed_traced(cache, hidden_states, topk_weights, topk_ids)
         batch = _active_batch()
         rows = getattr(batch, "spec_uniform_rows", 0)
-        if _VERIFY_COUNT and rows and batch.is_spec_verify and self.layer_id < cache.num_layers - _draft_layers(cache):
+        verify = bool(rows and batch.is_spec_verify
+                      and self.layer_id < cache.num_layers - _draft_layers(cache))
+        if _VERIFY_COUNT and verify:
             cache.apply_verify_budget(self.layer_id, topk_ids, rows, self.layer_id == 0,
                                       _VERIFY_BUDGET)
         cache.ensure_experts(self.layer_id, topk_ids)

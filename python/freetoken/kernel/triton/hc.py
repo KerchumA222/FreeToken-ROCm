@@ -11,6 +11,8 @@ import torch
 import triton
 import triton.language as tl
 
+from .q8_1 import q8_1_empty, q8_1_padded, q8_1_store
+
 from freetoken.utils.arch import is_sm90_supported
 
 
@@ -24,12 +26,15 @@ def _grouped_gemma_rmsnorm_kernel(
     x_ptr,
     w_ptr,
     y_ptr,
+    q_ptr,
     stride_x,
     stride_y,
+    stride_q,
     DIM: tl.constexpr,
     NUM_GROUPS: tl.constexpr,
     W_SHARED: tl.constexpr,
     EPS: tl.constexpr,
+    WRITE_Q: tl.constexpr,
     launch_pdl: tl.constexpr,
 ) -> None:
     GROUP_DIM: tl.constexpr = DIM // NUM_GROUPS
@@ -61,11 +66,15 @@ def _grouped_gemma_rmsnorm_kernel(
     if launch_pdl:
         tl.extra.cuda.gdc_launch_dependents()
     tl.store(y_ptr + row * stride_y + offsets, y, mask)
+    if WRITE_Q:
+        q8_1_store(y, q_ptr + row * stride_q, group_id * (GROUP_DIM // 32), GROUP_DIM // 32,
+                   BLOCK_SIZE // 32)
 
 
 def grouped_gemma_rmsnorm(
-    x: torch.Tensor, weight: torch.Tensor, eps: float, num_groups: int
-) -> torch.Tensor:
+    x: torch.Tensor, weight: torch.Tensor, eps: float, num_groups: int, q8: bool = False
+):
+    """``q8=True`` also returns the output as q8_1 blocks (``kernel/triton/q8_1.py``)."""
     N, DIM = x.shape
     assert x.stride(1) == 1, "grouped Gemma RMSNorm requires unit inner stride"
     assert weight.is_contiguous(), "grouped Gemma RMSNorm weight must be contiguous"
@@ -74,32 +83,43 @@ def grouped_gemma_rmsnorm(
     assert weight.numel() in (group_dim, DIM)
 
     y = x.new_empty(x.shape)
+    requested = q8
+    # Blocks are written per group, so there must be no padding past the last one.
+    q8 = q8 and DIM % 512 == 0 and group_dim % 32 == 0
+    q = q8_1_empty(N, DIM, x.device) if q8 else y
     _grouped_gemma_rmsnorm_kernel[(N * num_groups,)](
         x,
         weight,
         y,
+        q.view(torch.int8) if q8 else y,
         x.stride(0),
         y.stride(0),
+        q.shape[1] * 4 if q8 else 0,
         DIM,
         num_groups,
         W_SHARED=weight.numel() == group_dim,
         EPS=eps,
+        WRITE_Q=q8,
         launch_pdl=_pdl_supported(),
     )
-    return y
+    return (y, q if q8 else None) if requested else y
 
 
 @triton.jit
 def _hc_silu_kernel(
     x_ptr,
     y_ptr,
+    q_ptr,
     stride_x,
     stride_y,
+    stride_q,
     DIM: tl.constexpr,
     HC: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    PADDED: tl.constexpr,
+    WRITE_Q: tl.constexpr,
     launch_pdl: tl.constexpr,
 ) -> None:
-    BLOCK_SIZE: tl.constexpr = triton.next_power_of_2(DIM)
 
     row = tl.program_id(0).to(tl.int64)
     offs = tl.arange(0, BLOCK_SIZE)
@@ -108,29 +128,40 @@ def _hc_silu_kernel(
     if launch_pdl:
         tl.extra.cuda.gdc_wait()
 
-    x = tl.load(x_ptr + row * stride_x + offs, mask).to(tl.float32) / HC
+    x = tl.load(x_ptr + row * stride_x + offs, mask, other=0.0).to(tl.float32) / HC
     y = x * tl.sigmoid(x)
 
     if launch_pdl:
         tl.extra.cuda.gdc_launch_dependents()
     tl.store(y_ptr + row * stride_y + offs, y, mask)
+    if WRITE_Q:
+        q8_1_store(y, q_ptr + row * stride_q, 0, PADDED // 32, BLOCK_SIZE // 32)
 
 
-def hc_silu(x: torch.Tensor, hc_count: int) -> torch.Tensor:
+def hc_silu(x: torch.Tensor, hc_count: int, q8: bool = False):
+    """``q8=True`` returns ``(y, y as q8_1 blocks)``."""
     num_tokens, DIM = x.shape
     assert x.stride(1) == 1
 
     output = x.new_empty(x.shape)
+    padded = q8_1_padded(DIM)
+    q = q8_1_empty(num_tokens, DIM, x.device) if q8 else output
+    block = max(triton.next_power_of_2(DIM), 512) if q8 else triton.next_power_of_2(DIM)
     _hc_silu_kernel[(num_tokens,)](
         x,
         output,
+        q.view(torch.int8) if q8 else output,
         x.stride(0),
         output.stride(0),
+        q.shape[1] * 4 if q8 else 0,
         DIM=DIM,
         HC=hc_count,
+        BLOCK_SIZE=block,
+        PADDED=padded,
+        WRITE_Q=q8,
         launch_pdl=_pdl_supported(),
     )
-    return output
+    return (output, q) if q8 else output
 
 
 @triton.jit
@@ -138,12 +169,16 @@ def _hc_gate_mix_kernel(
     x_ptr,
     g_ptr,
     y_ptr,
+    q_ptr,
     stride_x,
     stride_g,
     stride_y,
+    stride_q,
     DIM: tl.constexpr,
     HC: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    PADDED: tl.constexpr,
+    WRITE_Q: tl.constexpr,
     launch_pdl: tl.constexpr,
 ) -> None:
     HC_DIM: tl.constexpr = DIM // HC
@@ -169,9 +204,14 @@ def _hc_gate_mix_kernel(
     if launch_pdl:
         tl.extra.cuda.gdc_launch_dependents()
     tl.store(y_ptr + row * stride_y + offs_inner, acc, mask)
+    if WRITE_Q:
+        n_blocks = tl.minimum(BLOCK_SIZE, PADDED - tile_id * BLOCK_SIZE) // 32
+        q8_1_store(acc, q_ptr + row * stride_q, tile_id * (BLOCK_SIZE // 32), n_blocks,
+                   BLOCK_SIZE // 32)
 
 
-def hc_gate_mix(x: torch.Tensor, gate: torch.Tensor, hc_count: int) -> torch.Tensor:
+def hc_gate_mix(x: torch.Tensor, gate: torch.Tensor, hc_count: int, q8: bool = False):
+    """``q8=True`` returns ``(out, out as q8_1 blocks)``."""
     N, DIM = gate.shape
     assert x.shape == gate.shape
     assert DIM % hc_count == 0
@@ -181,19 +221,24 @@ def hc_gate_mix(x: torch.Tensor, gate: torch.Tensor, hc_count: int) -> torch.Ten
     HC_DIM = DIM // hc_count
     out = x.new_empty(N, HC_DIM)
     BLOCK_SIZE = 512
+    q = q8_1_empty(N, HC_DIM, x.device) if q8 else out
     _hc_gate_mix_kernel[(N, triton.cdiv(HC_DIM, BLOCK_SIZE))](
         x,
         gate,
         out,
+        q.view(torch.int8) if q8 else out,
         x.stride(0),
         gate.stride(0),
         out.stride(0),
+        q.shape[1] * 4 if q8 else 0,
         DIM,
         hc_count,
         BLOCK_SIZE,
+        PADDED=q8_1_padded(HC_DIM),
+        WRITE_Q=q8,
         launch_pdl=_pdl_supported(),
     )
-    return out
+    return (out, q) if q8 else out
 
 
 @triton.jit
