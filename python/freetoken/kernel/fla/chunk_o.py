@@ -10,7 +10,7 @@ import triton.language as tl
 
 from freetoken.kernel.fla.index import prepare_chunk_indices
 from freetoken.kernel.fla.op import exp, safe_exp
-from freetoken.kernel.fla.utils import check_shared_mem, is_nvidia_hopper
+from freetoken.kernel.fla.utils import check_shared_mem, is_nvidia_hopper, is_rdna2
 
 BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
@@ -164,11 +164,12 @@ def chunk_fwd_o(
         K=K,
         V=V,
         BT=BT,
-        BK=128,
+        # RDNA2: (32, 64, 8 warps) runs 2.2x the (128, 64, 4) tile (RX 6800, 7.5k tokens).
+        BK=32 if is_rdna2 else 128,
         BV=64,
         USE_G=g is not None,
         IS_VARLEN=cu_seqlens is not None,
-        num_warps=4,
+        num_warps=8 if is_rdna2 else 4,
         num_stages=2,
     )
     return o

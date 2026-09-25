@@ -295,3 +295,20 @@ mid-length chunks now take as long as their reads.
 These benchmarks run with an empty GPU expert cache (the startup probe resets it, and
 `max_tokens=1` requests never decode), so every chunk reads ~29.5 GB. With a warm cache,
 the GPU-resident experts (~1/3) are gathered device to device.
+
+## Prefill: GDN kernel tiles for RDNA2
+
+The fla chunked GDN kernels carry NVIDIA-tuned tiles. On gfx1030 (no matrix units) the
+same kernels run 1.3-3.3x faster with smaller tiles and more warps. At a 7.5k-token
+prefill of Flash-Next's 48 value heads, per layer:
+
+| kernel | NVIDIA tile | RDNA2 tile | time |
+|---|---|---|---:|
+| `chunk_fwd_o` | BK 128, BV 64, 4 warps | BK 32, BV 64, 8 warps | 17.4 -> 7.8 ms |
+| `chunk_gated_delta_rule_fwd_h` | BV 32, 4 warps | BV 16, 8 warps | 15.8 -> 4.9 ms |
+| `recompute_w_u` | 4 warps, 3 stages | 2 warps, 1 stage | 8.6 -> 6.8 ms |
+
+Outputs are identical: the divergence harness trace is byte-identical. They apply on
+gfx103x only (`fla.utils.is_rdna2`, from Triton's driver target, so CUDA is not
+initialized at import). The `SGLANG_GDN_CHUNK_H_*` env knobs still override
+`delta_h`. Prefill at ~7.5k tokens 485 -> 545 tok/s; shorter prompts are read-bound.

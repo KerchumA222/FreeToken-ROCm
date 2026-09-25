@@ -17,12 +17,15 @@ from freetoken.kernel.fla.op import exp, safe_exp
 from freetoken.kernel.fla.utils import (
     autotune_cache_kwargs,
     is_nvidia_hopper,
+    is_rdna2,
 )
 
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8, 16]
 CHUNK_SIZE = 64
-GDN_CHUNK_H_BV = int(os.getenv("SGLANG_GDN_CHUNK_H_BV", "32"))
-GDN_CHUNK_H_NUM_WARPS = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_WARPS", "4"))
+# RDNA2 default: BV=16 with 8 warps, 3.3x the (32, 4) tile at a 7.5k-token prefill of
+# Qwen3.8-Flash-Next's 48 value heads on an RX 6800 (15.8 -> 4.8 ms a layer), identical output.
+GDN_CHUNK_H_BV = int(os.getenv("SGLANG_GDN_CHUNK_H_BV", "16" if is_rdna2 else "32"))
+GDN_CHUNK_H_NUM_WARPS = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_WARPS", "8" if is_rdna2 else "4"))
 GDN_CHUNK_H_NUM_STAGES = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_STAGES", "2"))
 
 

@@ -267,6 +267,19 @@ device_torch_lib = getattr(torch, device)
 device_platform = _check_platform()
 
 is_amd = device_platform == "amd"
+
+
+def _amd_arch() -> str:
+    try:
+        return str(triton.runtime.driver.active.get_current_target().arch)
+    except BaseException:
+        return ""
+
+
+# RDNA2 (gfx103x) has no matrix units; the fla kernels' NVIDIA-tuned tiles run 1.3-3x
+# slower there than the ones picked for it (measured on an RX 6800, see the chunk_o /
+# chunk_delta_h / wy_fast launch sites).
+is_rdna2 = is_amd and _amd_arch().startswith("gfx103")
 is_intel = device_platform == "intel"
 is_nvidia = device_platform == "nvidia"
 is_intel_alchemist = is_intel and "Intel(R) Arc(TM) A" in torch.xpu.get_device_name(0)
