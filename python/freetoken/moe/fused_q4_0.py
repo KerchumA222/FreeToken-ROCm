@@ -106,6 +106,8 @@ def _dequant_rows(q: torch.Tensor, ggml_type: int, dtype: torch.dtype) -> torch.
 
 
 def _fused_experts_grouped(x, gate_up_q, down_q, topk_weights, topk_ids, act_fn, gu_type, dn_type):
+    from freetoken.kernel.triton.moe_prefill import gather_transposed, silu_and_mul_transposed
+
     """Prefill MoE: route (token, expert) pairs by expert, and for groups of experts of
     similar load dequantize their weights and run two padded batched GEMMs. Each group
     gathers its own rows from ``x`` and adds its weighted outputs into one fp32 [T, H]
@@ -136,11 +138,16 @@ def _fused_experts_grouped(x, gate_up_q, down_q, topk_weights, topk_ids, act_fn,
         # gate_up as W [n, 2I, H] @ x^T: rocBLAS on gfx1030 runs this batched shape ~2.4x
         # faster than x @ W^T over the dequantized (row = output) layout. down keeps
         # x @ W^T, which is already fast at K = I.
-        xt = x.index_select(0, tok).view(n, maxc, h).transpose(1, 2).contiguous()
+        # The two transposes run in Triton (kernel/triton/moe_prefill.py): torch's strided
+        # copies of them were 21% of a long prefill.
+        xt = gather_transposed(x, tok.view(n, maxc))
         w_gu = _dequant_rows(gate_up_q.index_select(0, ids), gu_type, x.dtype)
-        gu = torch.bmm(w_gu, xt).transpose(1, 2).contiguous()
+        gu = torch.bmm(w_gu, xt)                                   # [n, 2I, maxc]
         del xt, w_gu
-        inter = act_fn(gu.view(n * maxc, -1))
+        if act_fn is silu_and_mul:
+            inter = silu_and_mul_transposed(gu)
+        else:
+            inter = act_fn(gu.transpose(1, 2).contiguous().view(n * maxc, -1))
         del gu
         w_dn = _dequant_rows(down_q.index_select(0, ids), dn_type, x.dtype)
         y = torch.bmm(inter.view(n, maxc, -1), w_dn.transpose(1, 2)).view(n * maxc, h)
