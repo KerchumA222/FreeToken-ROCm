@@ -28,6 +28,7 @@ def step(batch):
         prof = torch.profiler.profile(
             activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
             with_stack=bool(os.environ.get("FT_PROFILE_STACK")),
+            record_shapes=bool(os.environ.get("FT_PROFILE_SHAPES")),
         )
         prof.__enter__()
         _state["prof"] = prof
@@ -42,6 +43,10 @@ def step(batch):
                                           max_name_column_width=90)
         with open(path, "w") as f:
             f.write(f"forwards profiled: {count}\n{table}\n")
+            if os.environ.get("FT_PROFILE_SHAPES"):
+                f.write(prof.key_averages(group_by_input_shape=True).table(
+                    sort_by="self_cuda_time_total", row_limit=25, max_name_column_width=40,
+                    max_shapes_column_width=120))
             if os.environ.get("FT_PROFILE_STACK"):
                 f.write(prof.key_averages(group_by_stack_n=6).table(
                     sort_by="self_cuda_time_total", row_limit=40, max_name_column_width=60))

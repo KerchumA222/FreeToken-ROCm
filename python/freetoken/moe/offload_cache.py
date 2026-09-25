@@ -1302,6 +1302,7 @@ class OffloadMoeCache:
 
     def _admit_callback(self, layer_id: int, bufs: dict):
         def _run() -> None:
+            t0 = time.perf_counter()
             try:
                 # The callback runs on a driver thread, outside the engine's
                 # inference-mode context. Its pinned buffers were created there.
@@ -1321,6 +1322,9 @@ class OffloadMoeCache:
             except BaseException as exc:  # never unwind into the driver
                 if self._admit_error is None:
                     self._admit_error = exc
+            stats = self.host_tier.stats
+            stats.callbacks += 1
+            stats.callback_seconds += time.perf_counter() - t0
 
         return _run
 

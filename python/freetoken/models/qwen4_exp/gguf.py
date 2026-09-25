@@ -288,15 +288,12 @@ def gguf_module_types(
             globals_[t.name] = t.ggml_type
 
     # linear_attn.out_proj is the one module whose value-head permutation moves
-    # COLUMNS rather than rows, so it can only be served packed when a head lands on
-    # quant-block boundaries -- true for the 32-wide block types, false for a K-quant
-    # whose 256-element superblock is wider than this model's 128-wide head. Claiming
-    # it regardless left the reader with a permutation it could not apply.
-    md = load_gguf_metadata(model_path)
-    n_v = int(md[f"{_ARCH}.ssm.time_step_rank"])
-    n_k = int(md[f"{_ARCH}.ssm.group_count"])
-    d_v = int(md[f"{_ARCH}.ssm.inner_size"]) // n_v
-    perm_needed = _v_head_permutation(n_v, n_k) is not None
+    # COLUMNS rather than rows. When a head lands on quant-block boundaries (the 32-wide
+    # block types) the reader permutes the packed column blocks. When it does not (a
+    # 256-wide superblock over this model's 128-wide heads) the weight stays packed in
+    # the file's column order and the module gathers its INPUT instead
+    # (``linear_attn.out_in_perm``). Serving it dense instead cost ~19 ms a token: a
+    # [1, 6144] x [6144, 2560] fp16 rocBLAS GEMM at ~0.5 ms, in 36 layers.
 
     name = GGML_NAME.__getitem__
     out: dict[str, tuple[str, ...]] = {}
@@ -318,9 +315,6 @@ def gguf_module_types(
             return
         if any(module.endswith(x) for x in _force_dense):
             return
-        if (suffix == "ssm_out.weight" and perm_needed
-                and _head_block_bytes(n_v * d_v, d_v, t) is None):
-            return      # served dense; the reader permutes the columns there
         out[module] = (name(t),)
 
     for tensor, module in (("output.weight", "lm_head"),
@@ -570,11 +564,14 @@ def iter_gguf_weights(
                 # gguf_module_types only marks this packed when the heads land on
                 # block boundaries, so this holds by construction.
                 per_head = _head_block_bytes(n_v * d_v, d_v, t.ggml_type)
-                assert per_head is not None, (
-                    f"{name}: value heads do not land on {t.ggml_type} block boundaries, "
-                    "so the dialect should not have marked out_proj packed"
-                )
-                yield key, _permute_packed_heads(t.packed(), v_perm, per_head)
+                if per_head is not None:
+                    yield key, _permute_packed_heads(t.packed(), v_perm, per_head)
+                else:
+                    # Heads split a quant block: keep the file's column order and have the
+                    # module put its input into that order (x_file = x[argsort(cols)]).
+                    cols = (v_perm[:, None] * d_v + torch.arange(d_v)).reshape(-1)
+                    yield key, t.packed()
+                    yield stem + "linear_attn.out_in_perm", torch.argsort(cols)
             else:
                 cols = (v_perm[:, None] * d_v + torch.arange(d_v)).reshape(-1)
                 yield key, _to_bf16(t)[:, cols].contiguous()

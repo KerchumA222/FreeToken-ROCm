@@ -84,6 +84,16 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
             self.value_dim, hidden_size, has_bias=False,
             quant_config=quant_config, prefix=f"{prefix}.out_proj",
         )
+        # Input column order of a packed out_proj whose value heads split its quant blocks
+        # (models/qwen4_exp/gguf.py): the weight stays in the file's order, so the input
+        # is gathered into it. Optional, so not a state-dict tensor.
+        self._out_in_perm: torch.Tensor | None = None
+
+    def load_state_dict(self, state_dict, *, prefix: str = "", _internal: bool = False) -> None:
+        perm = state_dict.pop(f"{prefix}.out_in_perm" if prefix else "out_in_perm", None)
+        if perm is not None:
+            self._out_in_perm = perm.to(torch.int64)
+        super().load_state_dict(state_dict, prefix=prefix, _internal=_internal)
 
     # Same parameters and kernels as Qwen3.5's GDN, so the same speculative verify path.
     supports_verify_rows = True
@@ -205,6 +215,8 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
         core_out = core_out.reshape(-1, self.head_v_dim)
         z = z.reshape(-1, self.head_v_dim)
         out = self.norm.forward(core_out, z).reshape(total, -1)
+        if self._out_in_perm is not None:
+            out = out.index_select(-1, self._out_in_perm)
         return self.out_proj.forward(out)
 
 

@@ -76,3 +76,33 @@ Two costs sink it:
   filter and compaction to a short list (~3 non-resident experts a layer).
 - Keep the host callback Python-free when that list is empty, and cheap when it is not.
 - Rank by predicted probability *and* recency outside the GPU cache, not raw top-K.
+
+## Follow-up: the reads are bandwidth-bound, and misses are hard to predict (2026-09-24)
+
+A read microbenchmark on the VM's disk (random experts, 1.41 MB each in three parts,
+one `pread` per part) shows that a stall is set by bandwidth, not by round trips:
+
+| experts in flight | ms per batch | GB/s |
+|---:|---:|---:|
+| 1 | 0.83 | 1.4 |
+| 2 | 1.15 | 2.5 |
+| 4 | 1.78 | 3.1 |
+| 8 | 2.98 | 3.9 |
+| 16 | 4.17-4.88 | 4.5-5.4 |
+
+A wasted prefetch therefore costs real bandwidth, and an early read helps only by using
+the idle half of it. `route_prediction.py --cache-slots 168` simulates a per-layer LRU
+GPU cache. It ranks layer L+1's non-resident experts by its router applied to layer L's
+input:
+
+| rank | P(used) | misses covered by top-r |
+|---:|---:|---:|
+| 1 | 27% | 34% |
+| 2 | 14% | 53% |
+| 3 | 8.5% | 64% |
+| 5 | 3.7% | 75% |
+
+The router predicts the resident experts well and the misses poorly. Even one guess per
+layer reads ~68 MB of extra data per token, against ~123 MB of real misses, to overlap a
+third of them. That is not worth building a fused predictor for. The next step is fewer
+bytes read per token (host-tier sizing), not earlier reads.

@@ -70,6 +70,8 @@ class HostTierStats:
     prefetched: int = 0          # reads issued ahead of their layer
     prefetch_used: int = 0       # of those, found by the layer's ensure
     prefetch_wait_seconds: float = 0.0
+    callbacks: int = 0                 # graph admission host nodes run
+    callback_seconds: float = 0.0      # wall time inside them, reads included
 
     def as_dict(self) -> dict[str, float]:
         touched = self.hits + self.misses
@@ -308,7 +310,8 @@ class HostExpertCache:
                 f"({s.stalled_ensures / s.ensures:.1%}), {s.misses} expert misses of "
                 f"{s.hits + s.misses}, {s.read_seconds:.3f} s in disk reads; "
                 f"prefetched {s.prefetched}, used {s.prefetch_used}, "
-                f"{s.prefetch_wait_seconds:.3f} s waiting on them"
+                f"{s.prefetch_wait_seconds:.3f} s waiting on them; "
+                f"{s.callbacks} host callbacks, {s.callback_seconds:.3f} s inside them"
             )
             self.stats = HostTierStats()
 

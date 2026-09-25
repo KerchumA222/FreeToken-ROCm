@@ -62,10 +62,21 @@ class Qwen4ExpMoE(Qwen3_5MoE):
         cache.stage_prefetch(self.experts.layer_id, target,
                              torch.where(skip, torch.full_like(ids, -1), ids).to(torch.int32))
 
+    def _router(self, x: torch.Tensor) -> torch.Tensor:
+        """Router logits. At decode sizes on RDNA, rocBLAS runs this [512, H] GEMV as a
+        large Tensile tile (~85 us a layer on an RX 6800); the Triton small-M GEMV reads the
+        weight once in a few us."""
+        from freetoken.kernel.triton.small_gemv import MAX_ROWS, small_gemv
+
+        w = self.gate.weight
+        if torch.version.hip is None or x.shape[0] > MAX_ROWS or w.dtype != x.dtype:
+            return self.gate.forward(x)
+        return small_gemv(x.contiguous(), w, block_n=1, block_k=2048, num_warps=2)
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
-        router_logits = self.gate.forward(hidden_states)
+        router_logits = self._router(hidden_states)
         if _ROUTE_TRACE:
             _record_route(self, hidden_states, router_logits)
         if self._lookahead is not None:

@@ -38,6 +38,10 @@ def main() -> None:
     ap.add_argument("trace")
     ap.add_argument("model")
     ap.add_argument("--max-d", type=int, default=4)
+    ap.add_argument("--cache-slots", type=int, default=0,
+                    help="simulate a per-layer LRU GPU cache of this many experts and report "
+                         "how often each rank of the non-resident predictions is used")
+    ap.add_argument("--max-rank", type=int, default=12)
     args = ap.parse_args()
 
     rows = torch.load(args.trace)
@@ -85,9 +89,56 @@ def main() -> None:
                 hit_all += int((p & a).sum()); tot_all += int(a.sum())
                 hit_new += int((p & n).sum()); tot_new += int(n.sum())
             print(f"{d}  {K:<4} {hit_all / tot_all:10.1%}  {hit_new / max(tot_new, 1):10.1%}")
+    if args.cache_slots:
+        precision_by_rank(X, W, ids, num_layers, E, args.cache_slots, args.max_rank)
     # Temporal baseline: the previous token's experts at the same layer.
     print("\nprevious token's set at the same layer: recall(all) "
           f"{sum(int((p[1:] & a[1:]).sum()) for p, a in zip(prev, actual)) / n_all:.1%}")
+
+
+def precision_by_rank(X, W, ids, num_layers, E, slots, max_rank, d=1) -> None:
+    """Prefetch as the disk tier sees it: at layer L, rank layer L+d's experts by its
+    router applied to L's input, drop the ones a per-layer LRU cache of ``slots`` experts
+    already holds, and ask how often the r-th remaining one is then routed. Also: how
+    many of L+d's misses the top-r of that list covers."""
+    from collections import OrderedDict
+
+    T = X.shape[1]
+    used = torch.zeros(max_rank, dtype=torch.long)
+    seen = torch.zeros(max_rank, dtype=torch.long)
+    covered = torch.zeros(max_rank + 1, dtype=torch.long)
+    misses = 0
+    layers_all = 0
+    layers_full = torch.zeros(max_rank + 1, dtype=torch.long)  # every miss of the layer covered
+    lru = [OrderedDict() for _ in range(num_layers)]
+    for t in range(T):
+        for L in range(num_layers):
+            routed = [int(e) for e in ids[L, t]]
+            if L >= d and t > 0:
+                src = L - d
+                logits = X[src, t] @ W[L].T
+                order = logits.topk(max_rank + 32).indices.tolist()
+                cand = [e for e in order if e not in lru[L]][:max_rank]
+                miss = [e for e in routed if e not in lru[L]]
+                misses += len(miss)
+                layers_all += 1
+                for r, e in enumerate(cand):
+                    seen[r] += 1
+                    used[r] += int(e in routed)
+                for r in range(max_rank + 1):
+                    top = set(cand[:r])
+                    covered[r] += sum(e in top for e in miss)
+                    layers_full[r] += int(all(e in top for e in miss))
+            for e in routed:
+                lru[L][e] = True
+                lru[L].move_to_end(e)
+                if len(lru[L]) > slots:
+                    lru[L].popitem(last=False)
+    print(f"\nLRU cache of {slots} experts/layer, d={d}: {misses / max(layers_all, 1):.2f} misses a layer")
+    print("rank  P(used)  misses covered by top-r  layers with every miss covered")
+    for r in range(max_rank):
+        print(f"{r + 1:4d}  {used[r] / max(int(seen[r]), 1):7.1%}  {covered[r + 1] / max(misses, 1):10.1%}"
+              f"  {layers_full[r + 1] / max(layers_all, 1):10.1%}")
 
 
 if __name__ == "__main__":
