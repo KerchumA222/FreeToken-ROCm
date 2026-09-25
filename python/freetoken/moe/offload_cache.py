@@ -535,9 +535,14 @@ class OffloadMoeCache:
         uses, one launch per bank per half, so the scatter costs no more than the
         contiguous copy it replaces.
         """
-        from freetoken.kernel import fast_index_copy_jit
+        plan = self._plan_tier_fill(layer_id, wanted)
+        self._read_tier_fill(layer_id, buffer_id, plan)
+        self._enqueue_tier_fill(buffer_id, plan)
 
-        tier, idx = self.host_tier, self._stage_idx[buffer_id]
+    def _plan_tier_fill(self, layer_id: int, wanted: Sequence[int] | None) -> dict:
+        """Host-side bookkeeping of a layer's fill (main thread): which experts come from
+        the GPU cache, the host pool, free pool slots claimed now, and disk."""
+        tier = self.host_tier
         # Experts the GPU slot cache already holds (outside the 2E slots the prefill buffers
         # borrow) are gathered device to device instead of crossing PCIe again, or being
         # read off disk: ~1/3 of the experts at an 8k-slot cache.
@@ -559,24 +564,41 @@ class OffloadMoeCache:
         # Park what we are about to read in any free slots rather than throwing it
         # away: an unadmitted prefill leaves a cold pool cold, so the first requests
         # read 100% from disk no matter how large the pool is. Free slots only -- see
-        # admit_free.
-        admitted = tier.admit_free(layer_id, miss)
-        if admitted:
-            taken = {e for e, _ in admitted}
-            hit_e += [e for e, _ in admitted]
-            hit_s += [slot for _, slot in admitted]
+        # admit_free. The slots are claimed here and filled with the read.
+        claims = tier.claim_free(layer_id, miss)
+        if claims:
+            taken = {e for e, _ in claims}
+            hit_e += [e for e, _ in claims]
+            hit_s += [slot for _, slot in claims]
             miss = [e for e in miss if e not in taken]
-        n_hit, n_miss = len(hit_e), len(miss)
         # Same counters the GPU-tier hit/miss split reports through
         # decode_miss_stats: rows served without re-fetching, over rows needed.
-        self.prefill_hit_rows += n_hit + len(gpu_e)
+        self.prefill_hit_rows += len(hit_e) + len(gpu_e)
         self.prefill_total_rows += (self.num_experts if wanted is None else len(wanted)) + len(gpu_e)
         self.prefill_gpu_rows = getattr(self, "prefill_gpu_rows", 0) + len(gpu_e)
+        return {"layer": layer_id, "gpu_e": gpu_e, "gpu_s": gpu_s, "hit_e": hit_e,
+                "hit_s": hit_s, "miss": miss, "claims": claims}
 
-        if n_miss:
-            tier.read_into(
-                layer_id, miss, {n: self._stage[n][buffer_id] for n in self.bank_schema}
+    def _read_tier_fill(self, layer_id: int, buffer_id: int, plan: dict) -> None:
+        """The disk half of a layer's fill: claimed pool slots, then the misses into the
+        pinned stage. Thread-safe against the main thread's planning of other layers."""
+        t0 = time.perf_counter()
+        self.host_tier.fill_claims(layer_id, plan["claims"])
+        if plan["miss"]:
+            self.host_tier.read_into(
+                layer_id, plan["miss"], {n: self._stage[n][buffer_id] for n in self.bank_schema}
             )
+        self.prefill_read_seconds = getattr(self, "prefill_read_seconds", 0.0) + time.perf_counter() - t0
+
+    def _enqueue_tier_fill(self, buffer_id: int, plan: dict) -> None:
+        """Queue a layer's fill copies on the current stream: GPU cache -> buffer (D2D),
+        host pool -> buffer and stage -> buffer (H2D)."""
+        from freetoken.kernel import fast_index_copy_jit
+
+        idx = self._stage_idx[buffer_id]
+        gpu_e, gpu_s, hit_e, hit_s, miss = (plan[k] for k in ("gpu_e", "gpu_s", "hit_e", "hit_s", "miss"))
+        n_hit, n_miss = len(hit_e), len(miss)
+        if n_miss:
             idx["miss_dst"][:n_miss].copy_(
                 torch.tensor(miss, dtype=torch.int32), non_blocking=False
             )
@@ -916,11 +938,15 @@ class OffloadMoeCache:
         if self.host_tier is not None:
             logger.info(
                 "disk tier prefill: %.1f%% of expert rows from the host pool, "
-                "%.2f GiB read from disk",
+                "%.2f GiB read from disk; %.2f s reading, %.2f s in the whole chunk; "
+                "%.1f%% of rows from the GPU cache",
                 hit * 100.0,
                 (self.prefill_total_rows - self.prefill_hit_rows)
                 * sum(self.disk_store.expert_bytes(b) for b in self.bank_schema)
                 / (1 << 30),
+                getattr(self, "prefill_read_seconds", 0.0),
+                time.perf_counter() - getattr(self, "_prefill_started", time.perf_counter()),
+                100.0 * getattr(self, "prefill_gpu_rows", 0) / self.prefill_total_rows,
             )
         else:
             per_expert = sum(self._copy_feat_bytes_host)
@@ -934,6 +960,11 @@ class OffloadMoeCache:
     def begin_prefill(self) -> None:
         if not self.prefill_overlap:
             return
+        self._prefill_started = time.perf_counter()
+        for b in list(getattr(self, "_pending_fill", {})):
+            self._finish_tier_fill(b)
+        self.prefill_read_seconds = 0.0
+        self.prefill_gpu_rows = 0
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
         self._prefill_buffer_layer = [None, None]
@@ -962,7 +993,7 @@ class OffloadMoeCache:
             self.prefill_copy_stream.synchronize()
 
     def prefetch_prefill_layer(
-        self, layer_id: int, wanted: Sequence[int] | None = None
+        self, layer_id: int, wanted: Sequence[int] | None = None, lookahead: bool = False
     ) -> None:
         """Stage ``layer_id`` into its double buffer.
 
@@ -994,7 +1025,10 @@ class OffloadMoeCache:
             for (per_layer, _), buffer in zip(self.banks, self.prefill_bank_buffers):
                 buffer[buffer_id].copy_(per_layer[layer_id], non_blocking=True)
 
-        if self._prefill_hit_d2d_active:
+        if (lookahead and self.host_tier is not None and self.prefill_copy_stream is not None
+                and not self._prefill_hit_d2d_active):
+            self._submit_tier_fill(layer_id, buffer_id, wanted)
+        elif self._prefill_hit_d2d_active:
             self._prefetch_split(layer_id, buffer_id)
         elif self.prefill_copy_stream is None:
             copy()
@@ -1168,6 +1202,40 @@ class OffloadMoeCache:
             n,
         )
 
+    def _submit_tier_fill(self, layer_id: int, buffer_id: int, wanted) -> None:
+        """The look-ahead layer's fill, off the main thread: plan it here, read its misses
+        on a worker while this layer's GEMMs are queued and run, and queue the copies in
+        :meth:`wait_prefill_layer`. Read synchronously, a chunk spent ~60% of its time
+        with the GPU idle behind the host's disk reads."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        if getattr(self, "_prefill_reader", None) is None:
+            self._prefill_reader = ThreadPoolExecutor(max_workers=1, thread_name_prefix="prefill-read")
+            self._pending_fill = {}
+        plan = self._plan_tier_fill(layer_id, wanted)
+        # The stage rows are rewritten; the previous fill's H2D out of them must be done.
+        previous = self.prefill_ready_events[buffer_id] if self._prefill_buffer_has_release_event[buffer_id] else None
+
+        def read() -> None:
+            if previous is not None:
+                previous.synchronize()
+            self._read_tier_fill(layer_id, buffer_id, plan)
+
+        self._pending_fill[buffer_id] = (layer_id, plan, self._prefill_reader.submit(read))
+
+    def _finish_tier_fill(self, buffer_id: int) -> None:
+        pending = getattr(self, "_pending_fill", {}).pop(buffer_id, None)
+        if pending is None:
+            return
+        layer_id, plan, future = pending
+        future.result()
+        with torch.cuda.stream(self.prefill_copy_stream):
+            if self._prefill_buffer_has_release_event[buffer_id]:
+                self.prefill_copy_stream.wait_event(self.prefill_release_events[buffer_id])
+            self._invalidate_prefill_buffer(buffer_id)
+            self._enqueue_tier_fill(buffer_id, plan)
+            self.prefill_ready_events[buffer_id].record(self.prefill_copy_stream)
+
     def wait_prefill_layer(self, layer_id: int) -> tuple[torch.Tensor, ...]:
         """Full-layer ``[num_experts, ...]`` bank views for ``layer_id``, one per
         registered bank in registration order: bf16 ``(gate_up, down)``; nvfp4
@@ -1178,6 +1246,7 @@ class OffloadMoeCache:
         self.prefetch_prefill_layer(layer_id)
         buffer_id = layer_id % 2
         assert self._prefill_buffer_layer[buffer_id] == layer_id
+        self._finish_tier_fill(buffer_id)
         if self.prefill_ready_events:
             torch.cuda.current_stream(self.device).wait_event(self.prefill_ready_events[buffer_id])
         return tuple(buffer[buffer_id] for buffer in self.prefill_bank_buffers)

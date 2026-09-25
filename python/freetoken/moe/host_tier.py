@@ -102,7 +102,7 @@ class HostExpertCache:
         capacity: int,
         *,
         pin: bool = True,
-        workers: int = 8,
+        workers: int | None = None,
     ):
         if capacity < 1:
             raise ValueError(f"capacity must be >= 1, got {capacity}")
@@ -126,6 +126,10 @@ class HostExpertCache:
         self._lru: OrderedDict[int, int] = OrderedDict()
         self._free: list[int] = list(range(self.capacity))
         self._id_of_slot: list[int] = [MISS] * self.capacity
+        # Reads are latency-bound per request, so throughput grows with reads in flight:
+        # ~4.5 GB/s at 8-16 on the RX 6800 VM's disk. FT_TIER_READ_WORKERS overrides.
+        if workers is None:
+            workers = int(os.environ.get("FT_TIER_READ_WORKERS", "8"))
         self._pool = ThreadPoolExecutor(max_workers=max(1, workers)) if workers > 1 else None
         # Prefetches still in flight or not yet claimed: flat id -> (slot, futures, clock
         # at issue). Their slots are in neither the LRU nor the free list, so nothing can
@@ -353,14 +357,29 @@ class HostExpertCache:
 
         Returns the ``(expert, slot)`` pairs admitted, in claim order.
         """
+        claims = self.claim_free(layer, experts)
+        self.fill_claims(layer, claims)
+        return claims
+
+    def claim_free(self, layer: int, experts: Sequence[int]) -> list[tuple[int, int]]:
+        """The bookkeeping half of :meth:`admit_free`: claim free slots and enter them
+        in the pool. Their bytes arrive with :meth:`fill_claims`, which may run on
+        another thread; nothing reads those slots before prefill has used them."""
         claims: list[tuple[int, int]] = []
         for e in experts:
             if not self._free:
                 break
             claims.append((int(e), self._free.pop()))
-        if not claims:
-            return []
+        for e, slot in claims:
+            fid = self._fid(layer, e)
+            self._lru[fid] = slot
+            self._id_of_slot[slot] = fid
+        return claims
 
+    def fill_claims(self, layer: int, claims: Sequence[tuple[int, int]]) -> None:
+        """Read claimed experts into their slots (the disk half of :meth:`admit_free`)."""
+        if not claims:
+            return
         jobs = [(e, slot, name) for e, slot in claims for name in self.banks]
 
         def fill(job: tuple[int, int, str]) -> None:
@@ -372,13 +391,7 @@ class HostExpertCache:
         else:
             for job in jobs:
                 fill(job)
-
-        for e, slot in claims:
-            fid = self._fid(layer, e)
-            self._lru[fid] = slot
-            self._id_of_slot[slot] = fid
         self.stats.reads += len(jobs)
-        return claims
 
     def residency_split(
         self,

@@ -147,6 +147,8 @@ class MoELayer(BaseOP):
 # with FT_TIER_STATS -- the per-layer counting costs ~8% of an in-VRAM MTP round.
 _VERIFY_BUDGET = (int(os.environ["FT_VERIFY_BUDGET"])
                   if os.environ.get("FT_VERIFY_BUDGET", "") != "" else None)
+# FT_PREFILL_ASYNC=0: read the look-ahead layer's experts on the main thread (A/B switch).
+_PREFILL_ASYNC = os.environ.get("FT_PREFILL_ASYNC", "1") != "0"
 _VERIFY_COUNT = _VERIFY_BUDGET is not None or os.environ.get("FT_TIER_STATS", "0") not in ("", "0")
 
 
@@ -587,7 +589,7 @@ class OffloadMoELayer(MoELayer):
                 wanted = routed
         cache.prefetch_prefill_layer(self.layer_id, wanted)
         if wanted is None:
-            cache.prefetch_prefill_layer(self.layer_id + 1)
+            cache.prefetch_prefill_layer(self.layer_id + 1, lookahead=_PREFILL_ASYNC)
         return cache.wait_prefill_layer(self.layer_id)
 
     # ------------------------------------------------------------------

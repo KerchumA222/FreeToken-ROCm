@@ -264,3 +264,34 @@ Prefill batches of 256+ rows use it (`FT_QSA_GEMM=0` disables). Prefill tok/s:
 |---|---:|---:|---:|
 | start of the day (0.96 memory ratio) | ~43 | OOM | OOM |
 | now | 61 | 190 | 385 |
+
+## Prefill: overlapping the disk reads
+
+The disk-tier log now reports read and chunk time per prefill chunk. Reads were not
+overlapped: the look-ahead layer's experts were read on the main thread before the
+current layer's expert GEMMs were queued, so the GPU idled behind the host.
+
+| prompt | chunk | reading |
+|---|---:|---:|
+| ~630 tokens | 10 s | 7.5 s |
+| ~2.5k | 13 s | 7.5 s |
+| ~7.5k | 19 s | 7.8 s |
+
+The look-ahead fill now splits into:
+
+- a plan on the main thread (host-tier bookkeeping; `claim_free` claims pool slots);
+- a read on a worker thread (`fill_claims` and the misses into the pinned stage), after
+  the previous copy out of that stage has retired;
+- the H2D/D2D copies, queued when the layer is waited on.
+
+Output is byte-identical to the synchronous path (`FT_PREFILL_ASYNC=0`). Short and
+mid-length chunks now take as long as their reads.
+
+| prefill tok/s | ~630 | ~2.5k | ~7.5k |
+|---|---:|---:|---:|
+| synchronous reads | 61 | 190 | 385 |
+| async look-ahead reads | 71 | 256 | 485 |
+
+These benchmarks run with an empty GPU expert cache (the startup probe resets it, and
+`max_tokens=1` requests never decode), so every chunk reads ~29.5 GB. With a warm cache,
+the GPU-resident experts (~1/3) are gathered device to device.
