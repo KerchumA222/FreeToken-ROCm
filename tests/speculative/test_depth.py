@@ -20,43 +20,43 @@ def _run(sel: DepthSelector, seconds, rounds: int, accept=None) -> list[int]:
 
 def test_seeds_every_depth_deepest_first():
     sel = DepthSelector(3, seed_rounds=2, settle=0)
-    assert _run(sel, {1: 0.10, 2: 0.11, 3: 0.12}, 6) == [3, 3, 2, 2, 1, 1]
+    assert _run(sel, {0: 0.09, 1: 0.10, 2: 0.11, 3: 0.12}, 8) == [3, 3, 2, 2, 1, 1, 0, 0]
 
 
 def test_a_deep_round_scores_every_shallower_depth():
     sel = DepthSelector(3)
     sel.record(3, [2], 0.1)
-    assert [sel.stats[d].tokens for d in (1, 2, 3)] == [2, 3, 3]
+    assert [sel.stats[d].tokens for d in (0, 1, 2, 3)] == [1, 2, 3, 3]
     assert sel.stats[1].rounds == 0          # timing only counts at the depth that ran
 
 
 def test_settles_on_the_fastest_depth():
     # Disk-bound shape: extra rows cost more than the tokens they add.
     sel = DepthSelector(3, seed_rounds=4, settle=0)
-    chosen = _run(sel, {1: 0.070, 2: 0.120, 3: 0.170}, 80)
+    chosen = _run(sel, {0: 0.060, 1: 0.070, 2: 0.120, 3: 0.170}, 80)
     assert sel.best() == 1
     assert chosen[-20:] == [1] * 20
 
 
 def test_settles_deep_when_rows_are_cheap():
     sel = DepthSelector(3, seed_rounds=4, settle=0)
-    chosen = _run(sel, {1: 0.022, 2: 0.025, 3: 0.028}, 80)
+    chosen = _run(sel, {0: 0.020, 1: 0.022, 2: 0.025, 3: 0.028}, 80)
     assert sel.best() == 3
     assert chosen[-20:] == [3] * 20
 
 
 def test_follows_a_change_in_costs():
     sel = DepthSelector(3, seed_rounds=4, settle=0, probe_every=16, probe_rounds=4, alpha=0.3)
-    _run(sel, {1: 0.070, 2: 0.120, 3: 0.170}, 60)
+    _run(sel, {0: 0.060, 1: 0.070, 2: 0.120, 3: 0.170}, 60)
     assert sel.best() == 1
     # The cache warms: deeper rounds stop costing extra reads.
-    _run(sel, {1: 0.070, 2: 0.075, 3: 0.080}, 200)
+    _run(sel, {0: 0.060, 1: 0.070, 2: 0.075, 3: 0.080}, 200)
     assert sel.best() == 3
 
 
 def test_probes_the_stalest_depth_periodically():
     sel = DepthSelector(3, seed_rounds=2, settle=0, probe_every=10, probe_rounds=3)
-    chosen = _run(sel, {1: 0.05, 2: 0.10, 3: 0.15}, 60)
+    chosen = _run(sel, {0: 0.04, 1: 0.05, 2: 0.10, 3: 0.15}, 60)
     assert {2, 3} <= set(chosen[10:])
 
 
@@ -70,7 +70,7 @@ def test_drops_rounds_that_swallowed_a_gap():
 
 def test_fixed_mode_keeps_the_configured_depth():
     sel = DepthSelector(3, adapt=False)
-    assert set(_run(sel, {1: 0.05, 2: 0.10, 3: 0.15}, 20)) == {3}
+    assert set(_run(sel, {0: 0.04, 1: 0.05, 2: 0.10, 3: 0.15}, 20)) == {3}
     assert "fixed k=3" in sel.summary()
 
 
@@ -86,6 +86,15 @@ def test_ignores_the_cold_rounds_after_a_switch():
             run["k"], run["n"] = k, 0
         run["n"] += 1
         cold = run["n"] <= 3
-        seconds = {1: 0.070, 2: 0.300 if cold else 0.075}[k]
+        seconds = {0: 0.060, 1: 0.070, 2: 0.300 if cold else 0.075}[k]
         sel.record(k, [min(next(accept), k)], seconds)
     assert sel.best() == 2
+
+
+def test_stops_speculating_when_verify_rounds_cost_too_much():
+    """Depth 0 is a plain step: one token, no verify rows. When a verify round's extra
+    expert reads cost more than its drafts return, the selector stops speculating."""
+    sel = DepthSelector(3, seed_rounds=4, settle=0)
+    chosen = _run(sel, {0: 0.038, 1: 0.086, 2: 0.114, 3: 0.130}, 80)
+    assert sel.best() == 0
+    assert chosen[-20:] == [0] * 20

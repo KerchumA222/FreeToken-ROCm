@@ -51,3 +51,14 @@ Compute is ~1.7x faster, so a verify round's extra expert reads now weigh more:
 | MTP depth 1 | 39.1 | 22.4 |
 
 A depth-1 round spends ~31 ms on disk, against ~6 ms for a plain token.
+
+The selector (`speculative/depth.py`) now also considers depth 0, a plain step. On the
+long run it still settles on depth 2 (22.4 tok/s): inside the MTP configuration a plain
+step costs 52.5 ms, not a plain server's 38 ms. Three things add to it:
+
+- the draft head still runs, to keep a draft ready;
+- verify rounds churn the expert cache (13 ms of disk against ~6);
+- the head and the verify graphs take ~130 GPU cache slots.
+
+On this model, disk-tier MTP pays on the short, repetitive run (41.1 against 34.0) and
+not on the long run (22.4 against 26.4).

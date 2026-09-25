@@ -945,8 +945,8 @@ class Scheduler(SchedulerIOMixin):
         """The draft-depth selector, or None when the head drafts one token.
         FT_SPEC_ADAPT=0 keeps the configured depth (still measured and logged)."""
         if self._depth_sel is None:
-            max_k = int(getattr(getattr(self, "engine", None), "spec_k", 1) or 1)
-            if max_k <= 1:
+            max_k = int(getattr(getattr(self, "engine", None), "spec_k", 0) or 0)
+            if max_k < 1:
                 return None
             from freetoken.speculative.depth import DepthSelector
 
@@ -963,15 +963,17 @@ class Scheduler(SchedulerIOMixin):
         tier = getattr(cache, "host_tier", None)
         now = (time.perf_counter(), getattr(tier, "read_seconds_total", 0.0))
         prev, self._step_clock = self._step_clock, now
-        rows = getattr(batch, "spec_uniform_rows", 0)
-        if prev is None or not batch.is_spec_verify or not rows or not accepted:
-            return
         sel = self._depth_selector()
-        if sel is None:
+        if prev is None or sel is None:
             return
-        sel.record(rows - 1, accepted, now[0] - prev[0], now[1] - prev[1])
-        if self._spec_rounds % 64 == 0:
-            logger.info_rank0(sel.summary())
+        rows = getattr(batch, "spec_uniform_rows", 0)
+        if batch.is_spec_verify and rows and accepted:
+            sel.record(rows - 1, accepted, now[0] - prev[0], now[1] - prev[1])
+            if self._spec_rounds % 64 == 0:
+                logger.info_rank0(sel.summary())
+        elif batch.is_decode and batch.reqs:
+            # A plain step is depth 0: one token each, no verify rows.
+            sel.record(0, [0] * len(batch.reqs), now[0] - prev[0], now[1] - prev[1])
 
     def _record_verify_budget(self, extra: int, dead: bool, accepted: int) -> None:
         """Histogram of draft-only expert misses per verify round, with how often each
@@ -1012,7 +1014,13 @@ class Scheduler(SchedulerIOMixin):
         # extra head steps, each a scratch KV slot past the staged rows).
         sel = self._depth_selector()
         spec_k = int(getattr(self.engine, "spec_k", 1) or 1)
-        chain = (sel.choose() if sel is not None else spec_k) - 1
+        plan = sel.choose() if sel is not None else spec_k
+        if plan == 0 and not any(r.spec_draft_len for r in batch.reqs):
+            # Depth 0: a plain step. Its draft head still seeds the next round's draft.
+            for req in batch.reqs:
+                req.pending_draft = None
+            return
+        chain = max(plan, 1) - 1
         for req in batch.reqs:
             draft = req.pending_draft
             req.pending_draft = None

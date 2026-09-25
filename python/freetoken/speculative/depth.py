@@ -19,6 +19,10 @@ exponential moving average, estimated separately:
   old one ran, so its first rounds pay reads the steady state does not. A probe measured
   cold always loses.
 
+Depth 0 is a plain decode step: one token, no verify rows. On the disk tier a verify
+round's extra experts can cost more than its drafts return, and then not speculating
+is the best choice. A plain step still runs the draft head, so speculation can resume.
+
 The selector runs the best depth. Every ``probe_every`` rounds it spends a short burst on
 the depth whose timing is oldest, so it notices a depth that got better (the cache
 warmed) and refreshes the token estimates of depths deeper than it has been running.
@@ -49,7 +53,7 @@ class _DepthStat:
 
 
 class DepthSelector:
-    """Pick the draft depth in ``1..max_k`` with the best measured tokens per second.
+    """Pick the draft depth in ``0..max_k`` with the best measured tokens per second.
 
     ``choose()`` names the depth of the NEXT round: the head's chain drafts that many
     tokens during the current verify."""
@@ -69,13 +73,13 @@ class DepthSelector:
         assert max_k >= 1
         self.max_k = max_k
         self.fixed_k = min(fixed_k or max_k, max_k)
-        self.adapt = adapt and max_k > 1 and fixed_k is None
+        self.adapt = adapt and fixed_k is None
         self.alpha = alpha
         self.seed_rounds = seed_rounds
         self.probe_every = probe_every
         self.probe_rounds = probe_rounds
         self.settle = settle
-        self.stats = {k: _DepthStat() for k in range(1, max_k + 1)}
+        self.stats = {k: _DepthStat() for k in range(0, max_k + 1)}
         self.round = 0
         self._probe: int | None = None
         self._probe_left = 0
@@ -90,7 +94,7 @@ class DepthSelector:
         stat = self.stats.get(k)
         if stat is None or seconds <= 0 or not accepted:
             return
-        for d in range(1, k + 1):
+        for d in range(0, k + 1):
             s = self.stats[d]
             tokens = sum(min(a, d) + 1 for a in accepted) / len(accepted)
             s.tokens = _ema(s.tokens, tokens, self.alpha, s.token_rounds == 0)
