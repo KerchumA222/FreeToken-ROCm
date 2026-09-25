@@ -96,3 +96,12 @@ a per-shape MMVQ microbenchmark (random packed weights, M=1, inside a CUDA graph
 - **Launch floor.** A trivial kernel costs 2.8 us inside a HIP graph on the RX 6800, and a
   Flash-Next decode token runs ~2,800 kernels. Of those, 531 are `quantize_q8_1`, one per
   packed matmul, and ~900 are the hyper-connection mix/combine chain (twice a layer).
+- **Split-K MMVQ for thin matrices (4 waves per row) was tried and reverted.** Hyper-
+  connection down went from 10.4 to 9.5 us, and `ssm_out` got slower (19.2 -> 23.6 us).
+  Thin GEMVs sit at a two-kernel floor (quantize + GEMV), not at their arithmetic.
+- **Disk-tier admission host nodes: ~66 us each, 48 a token (~3.2 ms, ~12%).** Measured in
+  a HIP graph (`kernel + D2H/H2D copies` 11.9 us, `+ empty host node` 62.5 us per layer).
+  A graph cannot skip the node on a layer without GPU misses (~31 of 48 on the short
+  prompt). Stream-memop waits are not captured on this HIP (the PLE disk backend probes
+  them and falls back to launch-gating). A device-side skip would therefore need a
+  GPU-side spin on a pinned flag, answered by a host poller thread.
