@@ -133,10 +133,15 @@ def _fused_experts_grouped(x, gate_up_q, down_q, topk_weights, topk_ids, act_fn,
         valid = span[None, :] < counts[g : g + n, None]
         pos = torch.where(valid, pos, torch.zeros_like(pos))  # padding rows compute on row 0
         tok = tok_sorted.index_select(0, pos.reshape(-1))
-        xs = x.index_select(0, tok).view(n, maxc, h)
+        # gate_up as W [n, 2I, H] @ x^T: rocBLAS on gfx1030 runs this batched shape ~2.4x
+        # faster than x @ W^T over the dequantized (row = output) layout. down keeps
+        # x @ W^T, which is already fast at K = I.
+        xt = x.index_select(0, tok).view(n, maxc, h).transpose(1, 2).contiguous()
         w_gu = _dequant_rows(gate_up_q.index_select(0, ids), gu_type, x.dtype)
-        inter = act_fn(torch.bmm(xs, w_gu.transpose(1, 2)).view(n * maxc, -1))
-        del xs, w_gu
+        gu = torch.bmm(w_gu, xt).transpose(1, 2).contiguous()
+        del xt, w_gu
+        inter = act_fn(gu.view(n * maxc, -1))
+        del gu
         w_dn = _dequant_rows(down_q.index_select(0, ids), dn_type, x.dtype)
         y = torch.bmm(inter.view(n, maxc, -1), w_dn.transpose(1, 2)).view(n * maxc, h)
         del inter, w_dn

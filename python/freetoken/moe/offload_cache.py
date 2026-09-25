@@ -538,6 +538,23 @@ class OffloadMoeCache:
         from freetoken.kernel import fast_index_copy_jit
 
         tier, idx = self.host_tier, self._stage_idx[buffer_id]
+        # Experts the GPU slot cache already holds (outside the 2E slots the prefill buffers
+        # borrow) are gathered device to device instead of crossing PCIe again, or being
+        # read off disk: ~1/3 of the experts at an 8k-slot cache.
+        gpu_e, gpu_s = [], []
+        snap = getattr(self, "_tier_slot_snapshot", None)
+        if snap is not None:
+            row = snap[layer_id]
+            lo = 2 * self.num_experts
+            keep = []
+            for e in (range(self.num_experts) if wanted is None else wanted):
+                slot = int(row[e])
+                if slot >= lo:
+                    gpu_e.append(int(e))
+                    gpu_s.append(slot)
+                else:
+                    keep.append(int(e))
+            wanted = keep
         hit_e, hit_s, miss = tier.residency_split(layer_id, self.num_experts, wanted)
         # Park what we are about to read in any free slots rather than throwing it
         # away: an unadmitted prefill leaves a cold pool cold, so the first requests
@@ -552,8 +569,9 @@ class OffloadMoeCache:
         n_hit, n_miss = len(hit_e), len(miss)
         # Same counters the GPU-tier hit/miss split reports through
         # decode_miss_stats: rows served without re-fetching, over rows needed.
-        self.prefill_hit_rows += n_hit
-        self.prefill_total_rows += self.num_experts if wanted is None else len(wanted)
+        self.prefill_hit_rows += n_hit + len(gpu_e)
+        self.prefill_total_rows += (self.num_experts if wanted is None else len(wanted)) + len(gpu_e)
+        self.prefill_gpu_rows = getattr(self, "prefill_gpu_rows", 0) + len(gpu_e)
 
         if n_miss:
             tier.read_into(
@@ -572,8 +590,15 @@ class OffloadMoeCache:
         idx["n_hit"].fill_(n_hit)
         idx["n_miss"].fill_(n_miss)
 
+        n_gpu = len(gpu_e)
+        if n_gpu:
+            gpu_dst = torch.tensor(gpu_e, dtype=torch.int32).to(self.device, non_blocking=True)
+            gpu_src = torch.tensor(gpu_s, dtype=torch.int32).to(self.device, non_blocking=True)
+            gpu_n = torch.tensor([n_gpu], dtype=torch.int64).to(self.device, non_blocking=True)
         for name, buffer in zip(self.bank_schema, self.prefill_bank_buffers):
             dst = buffer[buffer_id]
+            if n_gpu:
+                fast_index_copy_jit(dst, gpu_dst, self.bank_caches[name], gpu_src, gpu_n)
             if n_hit:
                 fast_index_copy_jit(
                     dst, idx["hit_dst"], self.bank_sources[name][0], idx["hit_src"],
@@ -923,6 +948,11 @@ class OffloadMoeCache:
             self.prefill_begin_event.record(torch.cuda.current_stream(self.device))
             self.prefill_copy_stream.wait_event(self.prefill_begin_event)
         self._prefill_hit_d2d_active = self.prefill_hit_d2d and self._hit_d2d_usable()
+        if self.host_tier is not None:
+            # The disk-tier fill reuses GPU-resident experts; the slot map does not move
+            # during a chunk (prefill runs out of the borrowed buffers), so one snapshot
+            # after everything already enqueued serves every layer.
+            self._tier_slot_snapshot = self.slot_for_id.to("cpu").numpy()
         if self._prefill_hit_d2d_active:
             # The copy stream is fenced behind the previous decode, so the snapshot
             # observes its final slot map; one host sync per chunk, then per-layer
