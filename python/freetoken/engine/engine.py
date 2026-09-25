@@ -4,6 +4,7 @@ import gc
 import math
 import os
 import sys
+import time
 from types import SimpleNamespace
 from datetime import timedelta
 from typing import Any, Dict, Iterable, NamedTuple, Tuple
@@ -535,6 +536,20 @@ class Engine:
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
             self._warmup_prefill()
+        # The prefill chunk the scheduler may run (None: its own configured budget).
+        self.prefill_chunk_cap: int | None = None
+        fit = os.environ.get("FT_PREFILL_FIT", "1" if config.moe_cache_auto else "0") == "1"
+        want = int(getattr(config, "max_extend_tokens", 0) or 0)
+        if fit and want > self._PREFILL_FIT_MIN:
+            started = time.perf_counter()
+            self.prefill_chunk_cap = self._fit_prefill_chunk(want)
+            per_token, fixed, free = self._prefill_fit_report
+            logger.info_rank0(
+                f"prefill chunk: {self.prefill_chunk_cap} tokens fit in the activation "
+                f"headroom (asked {want}): {per_token / 1024:.0f} KiB/token + "
+                f"{fixed / 2**20:.0f} MiB, {free / 2**20:.0f} MiB free; probed in "
+                f"{time.perf_counter() - started:.1f} s"
+            )
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup | None:
         # TheRock's ROCm Windows wheels are built USE_DISTRIBUTED=0, so
@@ -598,6 +613,7 @@ class Engine:
 
         cache_per_page, fixed_cache_size, page_tokens, min_reserve = self._pool_cls.kv_cost(config)
         fixed_cache_size += state_pool_bytes(config)  # sibling GDN state pool, engine-summed
+        fixed_cache_size += _prefill_reserve_bytes(config)
         num_experts = config.model_config.num_experts
         total_experts = config.model_config.num_moe_layers * num_experts
         return resolve_moe_cache_auto(
@@ -1398,6 +1414,94 @@ class Engine:
         )
 
     @torch.inference_mode()
+    def _dummy_prefill(self, length: int) -> None:
+        """One ``length``-token prefill forward on the dummy request's row (restored
+        after), token id 0 throughout: it routes to a handful of experts, so on a disk
+        tier it reads little. The model's host context stages it like a real prefill."""
+        dummy_row = self.page_table[self.dummy_req.table_idx]
+        dummy_slot = int(dummy_row[0].item())
+        try:
+            dummy_row[:length] = torch.arange(length, dtype=torch.int32, device=self.device)
+            warm_req = Req(
+                input_ids=torch.zeros(length, dtype=torch.int32, device="cpu"),
+                table_idx=self.dummy_req.table_idx,
+                cached_len=0,
+                output_len=1,
+                uid=-1,
+                sampling_params=None,  # type: ignore[arg-type]
+                cache_handle=None,  # type: ignore[arg-type]
+            )
+            batch = Batch(reqs=[warm_req], phase="prefill")
+            batch.padded_reqs = batch.reqs
+            batch.input_ids = torch.zeros(length, dtype=torch.int32, device=self.device)
+            batch.positions = torch.arange(length, dtype=torch.int32, device=self.device)
+            batch.out_loc = dummy_row[:length]
+            self.attn_backend.prepare_metadata(batch)
+            with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, False):
+                self.model.forward()
+        finally:
+            dummy_row.fill_(dummy_slot)
+            if self.moe_offload_cache is not None:
+                self.moe_offload_cache.reset()
+
+    # Kept free at the chosen chunk: allocator fragmentation, library workspaces
+    # (hipBLASLt allocates its own), a request's own tensors.
+    _PREFILL_FIT_SLACK = 128 << 20
+    _PREFILL_FIT_MIN = 256
+    _PREFILL_FIT_STEP = 128
+    _PREFILL_FIT_MARGIN = 1.2
+
+    def _prefill_peak_bytes(self, length: int) -> int:
+        """Peak torch-allocated bytes a ``length``-token dummy prefill adds."""
+        torch.cuda.synchronize(self.device)
+        torch.cuda.empty_cache()
+        base = torch.cuda.memory_allocated(self.device)
+        torch.cuda.reset_peak_memory_stats(self.device)
+        self._dummy_prefill(length)
+        torch.cuda.synchronize(self.device)
+        return torch.cuda.max_memory_allocated(self.device) - base
+
+    def _fit_prefill_chunk(self, want: int) -> int:
+        """The largest prefill chunk (at most ``want``, a multiple of 128) whose
+        activations fit in what --memory-ratio left over after the caches, the weights
+        and the graphs.
+
+        --moe-cache-auto sizes the expert cache and KV pool to ``memory_ratio`` of free
+        VRAM and leaves the rest as graph/activation headroom (~0.3 GB free after graph
+        capture at 0.96 on a 16 GB card). Nothing sized that against the prefill chunk,
+        so an 8192-token chunk OOMed in the first GDN layer on a ~2k-token prompt.
+
+        OOM cannot be probed for: hipBLASLt aborts the process on its own workspace
+        allocation failure. So dummy prefills of growing length (256 up to 2048 tokens,
+        each only while its predicted peak is under half the free memory) measure the
+        activation slope, and the chunk is extrapolated from the last two with a margin:
+        from 256/512 alone the slope came out ~25% low against a 7k-token chunk, as
+        GDN's chunked-prefill intermediates grow faster than the fixed costs."""
+        lo = self._PREFILL_FIT_MIN
+        free, _total = torch.cuda.mem_get_info(self.device)
+        peaks: list[tuple[int, int]] = []
+        for n in (lo, 2 * lo, 1024, 2048):
+            if n > want:
+                break
+            if len(peaks) >= 2:
+                (n1, p1), (n2, p2) = peaks[-2:]
+                predicted = p2 + (p2 - p1) / (n2 - n1) * (n - n2)
+                if self._PREFILL_FIT_SLACK + predicted > free / 2:
+                    break
+            peaks.append((n, self._prefill_peak_bytes(n)))
+        if len(peaks) < 2:
+            return lo
+        (n1, p1), (n2, p2) = peaks[-2:]
+        per_token = max(1, int((p2 - p1) / (n2 - n1) * self._PREFILL_FIT_MARGIN))
+        fixed = max(0, p2 - per_token * n2)
+        torch.cuda.empty_cache()
+        free, _total = torch.cuda.mem_get_info(self.device)
+        fit = (free - self._PREFILL_FIT_SLACK - fixed) // per_token
+        step = self._PREFILL_FIT_STEP
+        chunk = max(lo, min(want, int(fit) // step * step))
+        self._prefill_fit_report = (per_token, fixed, free)
+        return chunk
+
     def _warmup_prefill(self) -> None:
         """Compile the Triton prefill path before the first real request.
 
@@ -1416,37 +1520,11 @@ class Engine:
         if not warmup_lens:
             return
 
-        dummy_row = self.page_table[self.dummy_req.table_idx]
-        dummy_slot = int(dummy_row[0].item())
         started = torch.cuda.Event(enable_timing=True)
         ended = torch.cuda.Event(enable_timing=True)
         started.record(self.stream)
-        try:
-            for length in warmup_lens:
-                dummy_row[:length] = torch.arange(
-                    length, dtype=torch.int32, device=self.device
-                )
-                warm_req = Req(
-                    input_ids=torch.zeros(length, dtype=torch.int32, device="cpu"),
-                    table_idx=self.dummy_req.table_idx,
-                    cached_len=0,
-                    output_len=1,
-                    uid=-1,
-                    sampling_params=None,  # type: ignore[arg-type]
-                    cache_handle=None,  # type: ignore[arg-type]
-                )
-                batch = Batch(reqs=[warm_req], phase="prefill")
-                batch.padded_reqs = batch.reqs
-                batch.input_ids = torch.zeros(length, dtype=torch.int32, device=self.device)
-                batch.positions = torch.arange(length, dtype=torch.int32, device=self.device)
-                batch.out_loc = dummy_row[:length]
-                self.attn_backend.prepare_metadata(batch)
-                with self.ctx.forward_batch(batch):
-                    self.model.forward()
-        finally:
-            dummy_row.fill_(dummy_slot)
-            if self.moe_offload_cache is not None:
-                self.moe_offload_cache.reset()
+        for length in warmup_lens:
+            self._dummy_prefill(length)
         ended.record(self.stream)
         torch.cuda.synchronize(self.device)
         logger.info_rank0(
@@ -1467,6 +1545,18 @@ def _profile_gpu(index: "int | None" = None) -> Tuple[str | None, str | None]:
         return None, None
     ident = gpu_identity(torch.cuda.current_device() if index is None else index)
     return ident["name"], ident["uuid"]
+
+
+def _prefill_reserve_bytes(config) -> int:
+    """VRAM --moe-cache-auto leaves out of the caches for prefill activations.
+
+    The (1 - memory_ratio) headroom is sized for CUDA graphs, not for a prefill chunk; at
+    0.96 on a 16 GB card ~0.2 GB is left after capture, a 256-token chunk. On a disk tier
+    every chunk re-streams the experts it routes to (most of the model once a chunk is a
+    few hundred tokens), so the chunk size is the prefill speed: 512 MB (~360 expert
+    slots of Qwen3.8-Flash-Next) buys ~4k-token chunks. FT_PREFILL_RESERVE_MB overrides."""
+    default = 512 if getattr(config, "moe_host_cache_size", 0) else 0
+    return int(os.environ.get("FT_PREFILL_RESERVE_MB", default)) << 20
 
 
 def _ensure_expandable_segments() -> None:

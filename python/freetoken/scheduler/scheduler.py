@@ -153,6 +153,10 @@ class Scheduler(SchedulerIOMixin):
         self.prefill_budget = (
             min(config.max_extend_tokens, _chunk_cap) if _chunk_cap else config.max_extend_tokens
         )
+        # ...and by what the engine measured fits in its activation headroom.
+        _fit = getattr(getattr(self, "engine", None), "prefill_chunk_cap", None)
+        if _fit:
+            self.prefill_budget = min(self.prefill_budget, _fit)
         self.config = config
         self.status_reporter = SchedulerStatusReporter(
             log=logger.info_rank0,
@@ -212,6 +216,9 @@ class Scheduler(SchedulerIOMixin):
             min(self.config.max_extend_tokens, _chunk_cap)
             if _chunk_cap else self.config.max_extend_tokens
         )
+        _fit = getattr(self.engine, "prefill_chunk_cap", None)
+        if _fit:
+            self.prefill_budget = min(self.prefill_budget, _fit)
         if self.config.tp_info.size > 1:
             self.sync_all_ranks()
 

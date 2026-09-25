@@ -16,7 +16,10 @@ _state = {"n": 0, "prof": None, "done": False}
 
 def step(batch):
     """Context for one forward; a no-op outside the profiled window."""
-    if not _SPEC or _state["done"] or batch.is_prefill and not batch.is_spec_verify:
+    # FT_PROFILE_PHASE=prefill profiles prefill forwards instead of decode/verify ones.
+    want_prefill = os.environ.get("FT_PROFILE_PHASE", "decode") == "prefill"
+    is_prefill = batch.is_prefill and not batch.is_spec_verify
+    if not _SPEC or _state["done"] or is_prefill != want_prefill:
         return nullcontext()
     skip, count, path = _SPEC.split(",", 2)
     skip, count = int(skip), int(count)
