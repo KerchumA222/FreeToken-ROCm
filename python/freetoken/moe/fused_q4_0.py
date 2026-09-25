@@ -16,6 +16,8 @@ gate_up and down may use different types (Q4_K_M mixes Q4_K/Q6_K). The historica
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from freetoken.layers.activation import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
@@ -81,6 +83,9 @@ _GROUPED_MIN_PER_EXPERT = 16
 # the chunk: the engine sizes the prefill chunk from a probe that routes to few experts.
 _GROUP = 8
 _GROUP_ROWS = 8192
+# Groups padded to fewer rows than this run down as W @ a: rocBLAS on gfx1030 runs that
+# ~1.4x faster at ~150 rows (x @ W^T catches up by ~300). FT_MOE_DOWN_FLIP=0 turns it off.
+_DOWN_FLIP_ROWS = int(os.environ.get("FT_MOE_DOWN_FLIP", "256"))
 
 
 def _dequant_rows(q: torch.Tensor, ggml_type: int, dtype: torch.dtype) -> torch.Tensor:
@@ -106,7 +111,8 @@ def _dequant_rows(q: torch.Tensor, ggml_type: int, dtype: torch.dtype) -> torch.
 
 
 def _fused_experts_grouped(x, gate_up_q, down_q, topk_weights, topk_ids, act_fn, gu_type, dn_type):
-    from freetoken.kernel.triton.moe_prefill import gather_transposed, silu_and_mul_transposed
+    from freetoken.kernel.triton.moe_prefill import (
+        gather_transposed, scatter_add_transposed, silu_and_mul_cols, silu_and_mul_transposed)
 
     """Prefill MoE: route (token, expert) pairs by expert, and for groups of experts of
     similar load dequantize their weights and run two padded batched GEMMs. Each group
@@ -144,17 +150,25 @@ def _fused_experts_grouped(x, gate_up_q, down_q, topk_weights, topk_ids, act_fn,
         w_gu = _dequant_rows(gate_up_q.index_select(0, ids), gu_type, x.dtype)
         gu = torch.bmm(w_gu, xt)                                   # [n, 2I, maxc]
         del xt, w_gu
-        if act_fn is silu_and_mul:
-            inter = silu_and_mul_transposed(gu)
-        else:
-            inter = act_fn(gu.transpose(1, 2).contiguous().view(n * maxc, -1))
-        del gu
+        weight = w_sorted.index_select(0, pos.reshape(-1)) * valid.reshape(-1)
         w_dn = _dequant_rows(down_q.index_select(0, ids), dn_type, x.dtype)
-        y = torch.bmm(inter.view(n, maxc, -1), w_dn.transpose(1, 2)).view(n * maxc, h)
-        del inter, w_dn
-        keep = valid.reshape(-1)
-        weight = w_sorted.index_select(0, pos.reshape(-1)) * keep
-        out.index_add_(0, tok, y.float() * weight[:, None])
+        if act_fn is silu_and_mul and maxc < _DOWN_FLIP_ROWS:
+            # Below ~256 columns W [n, H, I] @ a [n, I, c] is ~1.4x faster than a @ W^T;
+            # the output comes back [n, H, c] and is scattered in one Triton pass.
+            inter = silu_and_mul_cols(gu)
+            del gu
+            y = torch.bmm(w_dn, inter)                             # [n, H, maxc]
+            del inter, w_dn
+            scatter_add_transposed(out, y, tok.view(n, maxc), weight.view(n, maxc))
+        else:
+            if act_fn is silu_and_mul:
+                inter = silu_and_mul_transposed(gu)
+            else:
+                inter = act_fn(gu.transpose(1, 2).contiguous().view(n * maxc, -1))
+            del gu
+            y = torch.bmm(inter.view(n, maxc, -1), w_dn.transpose(1, 2)).view(n * maxc, h)
+            del inter, w_dn
+            out.index_add_(0, tok, y.float() * weight[:, None])
         g += n
     return out.to(x.dtype)
 

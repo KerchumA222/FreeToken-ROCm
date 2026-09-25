@@ -330,7 +330,11 @@ tokens each keep the expert GEMMs small. Up to ~2.5k tokens a chunk is bound by 
 ~29.5 GB of expert reads (~3.5 GB/s from page cache + virtual disk). More read threads
 (16, 32) did not help.
 
-Tried and reverted: running the grouped down projection as `W @ a` (1.4x faster in isolation
-at ~150 rows per expert, 7.5% faster per MoE layer in a 7.5k-token microbench) moved a real
-7.5k prefill by nothing (524 vs 542 tok/s, 13.2-14.3 s chunks either way). Shaving GPU time
-off the expert GEMMs does not shorten the chunk; it waits on staging and reads.
+Grouped down projection as `W @ a` (kept, `FT_MOE_DOWN_FLIP`, default below 256 padded rows):
+1.4x faster in isolation at ~150 rows per expert and 7.5% faster per MoE layer in a 7.5k-token
+microbench (99 vs 107 ms), but no end-to-end change on this VM (524 vs 542 tok/s, 13.2-14.3 s
+chunks either way): shaving GPU time off the expert GEMMs does not shorten a chunk that waits
+on staging and reads. Kept for hosts with faster storage or more page cache. Greedy output on
+7.5k/2.8k-token chats differs from the old path no earlier than the old path differs from
+itself run to run (atomic fp32 accumulation in both); `tests/moe/test_grouped_down_flip.py`
+checks both layouts against a per-token reference.

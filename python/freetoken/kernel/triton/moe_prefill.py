@@ -67,4 +67,52 @@ def silu_and_mul_transposed(gu: torch.Tensor) -> torch.Tensor:
     return out
 
 
-__all__ = ["gather_transposed", "silu_and_mul_transposed"]
+@triton.jit
+def _silu_mul_kernel(gu_ptr, out_ptr, inter, cols, BLOCK_C: tl.constexpr, BLOCK_I: tl.constexpr):
+    """out[n, i, c] = silu(gu[n, i, c]) * gu[n, inter + i, c]."""
+    n = tl.program_id(0).to(tl.int64)
+    c = tl.program_id(1) * BLOCK_C + tl.arange(0, BLOCK_C)
+    i = tl.program_id(2) * BLOCK_I + tl.arange(0, BLOCK_I)
+    m = (i[:, None] < inter) & (c[None, :] < cols)
+    base = gu_ptr + n * (2 * inter) * cols
+    gate = tl.load(base + i[:, None] * cols + c[None, :], mask=m, other=0.0).to(tl.float32)
+    up = tl.load(base + (inter + i[:, None]) * cols + c[None, :], mask=m, other=0.0).to(tl.float32)
+    y = gate / (1.0 + tl.exp(-gate)) * up
+    tl.store(out_ptr + (n * inter + i[:, None]) * cols + c[None, :], y.to(out_ptr.dtype.element_ty), mask=m)
+
+
+def silu_and_mul_cols(gu: torch.Tensor) -> torch.Tensor:
+    """``gu`` [n, 2I, c] -> silu(gate) * up as [n, I, c]."""
+    n, two_i, cols = gu.shape
+    inter = two_i // 2
+    out = torch.empty((n, inter, cols), dtype=gu.dtype, device=gu.device)
+    bc, bi = 64, 64
+    _silu_mul_kernel[(n, triton.cdiv(cols, bc), triton.cdiv(inter, bi))](
+        gu, out, inter, cols, BLOCK_C=bc, BLOCK_I=bi, num_warps=4)
+    return out
+
+
+@triton.jit
+def _scatter_add_t_kernel(y_ptr, tok_ptr, w_ptr, out_ptr, h, cols,
+                          BLOCK_C: tl.constexpr, BLOCK_H: tl.constexpr):
+    """out[tok[n, c], :] += w[n, c] * y[n, :, c]  (y is [n, h, cols], out fp32)."""
+    n = tl.program_id(0).to(tl.int64)
+    c = tl.program_id(1) * BLOCK_C + tl.arange(0, BLOCK_C)
+    hh = tl.program_id(2) * BLOCK_H + tl.arange(0, BLOCK_H)
+    cm = c < cols
+    w = tl.load(w_ptr + n * cols + c, mask=cm, other=0.0)
+    rows = tl.load(tok_ptr + n * cols + c, mask=cm, other=0).to(tl.int64)
+    m = cm[:, None] & (hh[None, :] < h)
+    tile = tl.load(y_ptr + (n * h + hh[None, :]) * cols + c[:, None], mask=m, other=0.0).to(tl.float32)
+    tl.atomic_add(out_ptr + rows[:, None] * h + hh[None, :], tile * w[:, None], mask=m & (w[:, None] != 0.0))
+
+
+def scatter_add_transposed(out: torch.Tensor, y: torch.Tensor, tok: torch.Tensor, w: torch.Tensor) -> None:
+    """``out[tok[n, c]] += w[n, c] * y[n, :, c]`` for ``y`` [n, H, c] and fp32 ``out`` [T, H]."""
+    n, h, cols = y.shape
+    bc, bh = 64, 64
+    _scatter_add_t_kernel[(n, triton.cdiv(cols, bc), triton.cdiv(h, bh))](
+        y, tok.contiguous(), w.contiguous(), out, h, cols, BLOCK_C=bc, BLOCK_H=bh, num_warps=4)
+
+
+__all__ = ["gather_transposed", "scatter_add_transposed", "silu_and_mul_cols", "silu_and_mul_transposed"]
