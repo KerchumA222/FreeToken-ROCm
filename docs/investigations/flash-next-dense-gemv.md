@@ -312,3 +312,20 @@ Outputs are identical: the divergence harness trace is byte-identical. They appl
 gfx103x only (`fla.utils.is_rdna2`, from Triton's driver target, so CUDA is not
 initialized at import). The `SGLANG_GDN_CHUNK_H_*` env knobs still override
 `delta_h`. Prefill at ~7.5k tokens 485 -> 545 tok/s; shorter prompts are read-bound.
+
+## Where a long prefill stands (7.5k tokens, one chunk)
+
+~13-14 s wall with ~9 s of overlapped reads; 12.3 s of GPU time (eager profile):
+
+| part | GPU s | note |
+|---|---:|---|
+| grouped expert GEMMs | 3.4 | ~35 TFLOP (48 layers x 0.74), ~10 TF/s |
+| expert staging copies | 3.1 | on the copy stream, mostly overlapped |
+| dense GEMMs | 2.2 | ~37 TFLOP, ~17 TF/s |
+| GDN | 0.8 | |
+| gathers / index_add / sort | ~1.0 | |
+
+The GEMMs are near what rocBLAS reaches on this card (15-27 TF/s); 512 experts at ~150
+tokens each keep the expert GEMMs small. Up to ~2.5k tokens a chunk is bound by its
+~29.5 GB of expert reads (~3.5 GB/s from page cache + virtual disk). More read threads
+(16, 32) did not help.
