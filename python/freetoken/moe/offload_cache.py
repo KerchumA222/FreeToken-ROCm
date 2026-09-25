@@ -1335,9 +1335,33 @@ class OffloadMoeCache:
         request for a layer must not be the captured one."""
         for layer_id in layer_ids:
             self._admit_graph_bufs(int(layer_id))
+        self._start_spin_admission()
+
+    def _start_spin_admission(self) -> None:
+        """Captured graphs admit through ``kernel/admit_spin.py`` (a kernel that skips
+        miss-free layers and hands the rest to a host poller) instead of a host node per
+        layer: default on ROCm, ``FT_ADMIT_SPIN=0`` / ``=1`` forces it. Not with the
+        lookahead prefetch, which rides the host node."""
+        default = "1" if torch.version.hip is not None else "0"
+        if (getattr(self, "_spin", None) is not None or os.environ.get("FT_ADMIT_SPIN", default) != "1"
+                or self.host_tier is None or getattr(self, "_prefetch_stage", None)):
+            return
+        import atexit
+
+        from freetoken.kernel.admit_spin import SpinAdmission
+
+        tier = self.host_tier
+        self._spin = SpinAdmission(self.src_indices.numel(), self.src_indices.device,
+                                   lambda layer, ids: tier.ensure(layer, ids))
+        atexit.register(self._spin.close)
 
     def raise_admission_error(self) -> None:
         """Re-raise on the engine thread whatever a host node swallowed."""
+        spin = getattr(self, "_spin", None)
+        if spin is not None:
+            spin_exc = spin.take_error()
+            if spin_exc is not None:
+                raise RuntimeError("disk-tier expert admission failed inside a graph replay") from spin_exc
         exc = getattr(self, "_admit_error", None)
         if exc is not None:
             self._admit_error = None
@@ -1346,6 +1370,10 @@ class OffloadMoeCache:
     def _admit_capture(self, layer_id: int) -> None:
         from freetoken.moe import graph_host
 
+        spin = getattr(self, "_spin", None)
+        if spin is not None and not getattr(self, "_prefetch_stage", None):
+            spin.launch(self.num_indices, self.src_indices, layer_id)
+            return
         b = self._admit_graph_bufs(layer_id)
         stream = torch.cuda.current_stream().cuda_stream
         b["n"].copy_(self.num_indices, non_blocking=True)

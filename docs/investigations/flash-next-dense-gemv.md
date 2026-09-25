@@ -133,3 +133,29 @@ sessions):
 MTP now wins on both prompts. Admitting draft-only experts as least recently used
 (`FT_SPEC_COLD_DRAFT`) was tried and removed: short 42.3, long 25.9. Accepted drafts
 reuse those experts.
+
+## Fourth pass: admission without host nodes
+
+Captured decode graphs admitted each MoE layer's GPU-cache misses through a host function
+node: ~66 us a layer (51 us of it the node itself), 48 layers a token, including the ~31
+without a miss. Now (`kernel/admit_spin.py`, `csrc/admit/admit_spin.cu`, default on ROCm,
+`FT_ADMIT_SPIN=0` to disable):
+
+- a one-block kernel reads the miss count and returns at once when it is zero;
+- otherwise it posts the miss list into coherent pinned memory (`hipHostMallocCoherent`)
+  and spin-waits for a C++ poller thread, which runs the host tier's `ensure` under the
+  GIL and writes the host slots back;
+- the spin is capped at 5 s wall clock (`s_memrealtime`). On timeout the kernel flags an
+  error, the step computes garbage and the engine raises, so it cannot hang the GPU.
+
+A standalone harness measured a 5.3 us handshake (13.9 us with the Python callback),
+against a 66 us host node. It also exercised the timeout path (poller stopped: the
+kernel returns after the cap). Output is bit-identical to the host-node path (zero drift
+over 1,024 tokens).
+
+| tok/s (same session) | short | long |
+|---|---:|---:|
+| plain, host nodes | 37.8 | 23.4 |
+| plain, spin admission | 40.9 | 24.6 |
+| MTP adaptive, host nodes | 47.9 | 26.0 |
+| MTP adaptive, spin admission | 50.0 | 25.4 |

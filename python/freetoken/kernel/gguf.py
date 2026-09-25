@@ -98,6 +98,19 @@ def _default_rocm_arch() -> str | None:
 
 @functools.cache
 def _module():
+    # gguf_kernel.cu carries its own PYBIND11_MODULE (appended at the end), so a
+    # plain `load` of the single source compiles + binds the ggml_* ops.
+    return jit_extension(
+        "freetoken_gguf_kernels",
+        [str(_CSRC / "gguf_kernel.cu")],
+        [str(_CSRC / "jit_shim"), str(_CSRC)],
+    )
+
+
+def jit_extension(name: str, sources: list[str], include_paths: list[str]):
+    """Build (or load the cached build of) a torch C++/CUDA/HIP extension with this
+    repo's toolchain fixes: a single-arch ROCm build, a ROCm prefix that keeps
+    ``/usr/include`` off ``-isystem``, and a compatible host compiler on CUDA."""
     from torch.utils.cpp_extension import load
 
     is_hip = getattr(torch.version, "hip", None) is not None
@@ -152,12 +165,10 @@ def _module():
 
         sysconfig.get_path = _patched_get_path
 
-    # gguf_kernel.cu carries its own PYBIND11_MODULE (appended at the end), so a
-    # plain `load` of the single source compiles + binds the ggml_* ops.
     return load(
-        name="freetoken_gguf_kernels",
-        sources=[str(_CSRC / "gguf_kernel.cu")],
-        extra_include_paths=[str(_CSRC / "jit_shim"), str(_CSRC)],
+        name=name,
+        sources=sources,
+        extra_include_paths=include_paths,
         extra_cuda_cflags=extra_cuda_cflags,
         verbose=True,
     )
