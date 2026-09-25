@@ -216,3 +216,32 @@ Where a prefill spends its time now:
 - **~7.5k tokens:** ~20 s of GPU (eager). Grouped expert GEMMs are 32% (~115 GFLOP/s
   before the flip), and QSA sparse attention is 25% (the per-row split-K decode kernel
   runs for every prefill row, ~100 GFLOP/s).
+
+## QSA prefill attention as batched GEMMs
+
+The per-row QSA kernel (`_qsa_sparse_paged_gqa_splitk_kernel`) runs one program per
+(query row, KV head), each gathering that row's ~2k selected tokens. On a 7.5k-token
+prefill it was 25% of GPU time (404 ms a layer). The selections of neighbouring rows
+nearly coincide. Dumping one prefill's selections (`FT_QSA_DUMP=<path>`), with a row
+selecting ~55 of its visible 64-token blocks:
+
+| rows per tile | union of blocks | K/V loads / | extra work |
+|---:|---:|---:|---:|
+| 4 | 57.7 | 3.8x | +5% |
+| 8 | 58.5 | 7.5x | +6% |
+| 32 | 59.0 | 29.9x | +7% |
+
+- **A Triton tiled kernel** (5 rows x 12 heads per program, exact per-row token masks) was
+  correct and no faster (421 vs 404 ms). It scaled with 1/tile rows because on gfx1030
+  (no matrix units) Triton's `tl.dot` runs ~0.9 TFLOP/s: compute-bound, not load-bound.
+- **As rocBLAS batched GEMMs** (`qsa_gemm_attention`), with tiles of 32 rows, 8 tiles a
+  batch:
+  - gather the union's pages once per KV head, straight into GEMM layout;
+  - one Triton row kernel does scale, the per-row token mask and softmax in fp32;
+  - PV, then `index_copy_` back.
+  - Result: 119 ms a layer (3.4x), max abs error 0.002 vs the per-row kernel (fp16
+    scores). Permuting a gathered [page, token, head, dim] block had run at ~26 GB/s and
+    cost more than the GEMMs; per-head gathers fixed that.
+
+Prefill batches of 256+ rows use it (`FT_QSA_GEMM=0` disables). Prefill tok/s:
+~630 tokens 61, ~2.5k 164, ~7.5k 369 (from 305).

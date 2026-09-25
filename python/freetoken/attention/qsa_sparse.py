@@ -97,6 +97,27 @@ class QSASparseMetadata(BaseAttnMetadata):
         return self.last_indices[:bs]
 
 
+# Prefill attention as batched GEMMs over tiles of consecutive rows (kernel/triton/qsa/
+# attend_tiled.py): neighbouring rows select nearly the same blocks, and rocBLAS runs the
+# dots ~10x faster than Triton on RDNA2. 3.4x over the per-row kernel at 7.5k rows.
+_GEMM_PREFILL = os.getenv("FT_QSA_GEMM", "1") != "0"
+_GEMM_MIN_ROWS = 256
+_DUMP = os.getenv("FT_QSA_DUMP")  # diagnostic: save one long prefill's selection per layer
+
+
+def _maybe_dump_selection(indices: torch.Tensor, md, slot: int) -> None:
+    """FT_QSA_DUMP=<path>: save the token selection of the first >= 4096-row prefill,
+    per QSA layer, with the query positions (for block-overlap studies)."""
+    global _DUMP
+    if not _DUMP or indices.shape[0] < 4096 or torch.cuda.is_current_stream_capturing():
+        return
+    store = _maybe_dump_selection.__dict__.setdefault("store", {})
+    store[slot] = (indices.cpu(), md.positions.cpu())
+    if len(store) == 12:
+        torch.save(store, _DUMP)
+        _DUMP = None
+
+
 class QSASparseAttnBackend(BaseAttnBackend):
     def __init__(self, config: ModelConfig) -> None:
         from freetoken.kvcache.qsa_pool import QSAKVCache
@@ -288,6 +309,15 @@ class QSASparseAttnBackend(BaseAttnBackend):
 
         self._update_index_cache(index, md, slot)
         indices = self._select(index, md, slot)
+        _maybe_dump_selection(indices, md, slot)
+        if (_GEMM_PREFILL and not md.is_decode and not md.rows_as_decode
+                and q.shape[0] >= _GEMM_MIN_ROWS and not torch.cuda.is_current_stream_capturing()):
+            from freetoken.kernel.triton.qsa.attend_tiled import qsa_gemm_attention
+
+            return qsa_gemm_attention(
+                q, self.kvcache.k_cache(layer_id), self.kvcache.v_cache(layer_id), indices,
+                md.block_table, md.qo_indptr_cpu.tolist(), torch.empty_like(q),
+            )
         return qsa_sparse_paged_attention(
             q,
             self.kvcache.k_cache(layer_id),
