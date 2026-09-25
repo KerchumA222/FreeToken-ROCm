@@ -245,3 +245,22 @@ selecting ~55 of its visible 64-token blocks:
 
 Prefill batches of 256+ rows use it (`FT_QSA_GEMM=0` disables). Prefill tok/s:
 ~630 tokens 61, ~2.5k 164, ~7.5k 369 (from 305).
+
+## Prefill: layout work
+
+- **MoE transposes in Triton** (`kernel/triton/moe_prefill.py`). The flipped gate_up GEMM
+  needs its gathered rows transposed and its result transposed back. torch's strided
+  copies ran at ~26 GB/s (21% of a 7.5k-token prefill). A gather-transpose (6x faster
+  than torch's) and a silu_and_mul that reads the transposed GEMM output replace them.
+  7.5k 369 -> 383 tok/s, 2.5k 164 -> 179.
+- **Dense GEMMs by row count** (`layers/gguf._dense_gemm`). On gfx1030 rocBLAS runs
+  `x @ W^T` at 4-6 TF/s for 64-1024 rows, but `W @ x^T` (x^T as a view) at 15-25 TF/s at
+  every size, and `x @ W^T` at ~25 TF/s from 2k rows up. Below 2k rows the dequantized
+  path runs `W @ x^T` and a Triton transpose.
+- **Q4_K and the other MMQ types** dequantize once and use that path from 256 rows: MMQ
+  ran ~12 TF/s. 2.5k tokens 179 -> 190 tok/s.
+
+| prefill tok/s | ~630 | ~2.5k | ~7.5k |
+|---|---:|---:|---:|
+| start of the day (0.96 memory ratio) | ~43 | OOM | OOM |
+| now | 61 | 190 | 385 |

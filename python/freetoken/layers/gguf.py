@@ -70,6 +70,9 @@ _MMVQ_SAFE = 6
 # Above this many rows a type without MMQ dequantizes and runs one GEMM rather than
 # chunking through MMVQ (dequantizing a weight costs about a dozen GEMV launches).
 _DEQUANT_GEMM_ROWS = 64
+# Above this many rows even a type with an MMQ kernel dequantizes and runs rocBLAS.
+_MMQ_MAX_ROWS = int(os.environ.get("FT_MMQ_MAX_ROWS", "256"))
+_FLIP_BELOW_ROWS = 2048
 
 
 def _gemm_triton(x: torch.Tensor, qweight: torch.Tensor, qweight_type: int) -> torch.Tensor:
@@ -119,6 +122,21 @@ def _use_triton(x: torch.Tensor) -> bool:
     )
 
 
+def _dense_gemm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """``x @ weight.T`` for a dequantized weight, in the form rocBLAS runs fast on RDNA2.
+
+    Below ~2k rows it picks slow kernels for ``x @ W^T`` (4-6 TF/s on an RX 6800, 64-1024
+    rows) but runs ``W @ x^T`` at 15-25 TF/s; that result is [N, M], so a Triton transpose
+    brings it back. From ~2k rows ``x @ W^T`` itself runs ~25 TF/s."""
+    if x.shape[0] >= _FLIP_BELOW_ROWS or not x.is_cuda or torch.version.hip is None:
+        return x @ weight.T
+    from freetoken.kernel.triton.moe_prefill import gather_transposed
+
+    yt = weight @ x.T                                              # [N, M]
+    rows = torch.arange(yt.shape[0], device=x.device).view(1, -1)
+    return gather_transposed(yt, rows)[0]                          # [M, N]
+
+
 def mmvq_rows_ok(rows: int) -> bool:
     """Whether a ``rows``-row input takes the MMVQ GEMV (the q8_1-activation kernels)."""
     return 0 < rows <= _MMVQ_SAFE
@@ -156,8 +174,14 @@ def fused_mul_mat_gguf(
 
             return ggml_mul_mat_vec_q8(qweight, q8, x, qweight_type, out_features, x.shape[1])
         return ggml_mul_mat_vec_a8(qweight, x, qweight_type, out_features)
-    if qweight_type in _MMQ:
+    if qweight_type in _MMQ and x.shape[0] < _MMQ_MAX_ROWS:
         return ggml_mul_mat_a8(qweight, x, qweight_type, out_features)
+    if qweight_type in _MMQ:
+        # Dequantized once, rocBLAS runs ~2x the vendored MMQ's ~12 TF/s (RX 6800).
+        block, type_size = BLOCK_SHAPE[qweight_type]
+        in_features = qweight.shape[1] // type_size * block
+        weight = ggml_dequantize(qweight, qweight_type, out_features, in_features, x.dtype)
+        return _dense_gemm(x, weight)
     if qweight_type in _MMVQ and x.shape[0] > _DEQUANT_GEMM_ROWS:
         # No MMQ kernel for this type (the IQ quants): dequantize once and run one GEMM.
         # Chunking a 2k-token prefill through the GEMV kernel, 6 rows at a time, was 35%
@@ -165,7 +189,7 @@ def fused_mul_mat_gguf(
         block, type_size = BLOCK_SHAPE[qweight_type]
         in_features = qweight.shape[1] // type_size * block
         weight = ggml_dequantize(qweight, qweight_type, out_features, in_features, x.dtype)
-        return x @ weight.T
+        return _dense_gemm(x, weight)
     if qweight_type in _MMVQ:
         # no MMQ kernel for this type and a small batch: chunk it through the GEMV kernel
         chunks = [
