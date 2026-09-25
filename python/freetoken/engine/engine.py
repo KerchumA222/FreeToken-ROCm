@@ -1553,9 +1553,17 @@ def _prefill_reserve_bytes(config) -> int:
     The (1 - memory_ratio) headroom is sized for CUDA graphs, not for a prefill chunk; at
     0.96 on a 16 GB card ~0.2 GB is left after capture, a 256-token chunk. On a disk tier
     every chunk re-streams the experts it routes to (most of the model once a chunk is a
-    few hundred tokens), so the chunk size is the prefill speed: 512 MB (~360 expert
-    slots of Qwen3.8-Flash-Next) buys ~4k-token chunks. FT_PREFILL_RESERVE_MB overrides."""
-    default = 512 if getattr(config, "moe_host_cache_size", 0) else 0
+    few hundred tokens), so the chunk size is the prefill speed. Measured on the RX 6800
+    (Qwen3.8-Flash-Next, 7.5k-token prompt): 0 MB -> 384-token chunks, 36 tok/s; 512 MB
+    -> 2432, 93; 1 GB -> 4608, 115; 2 GB -> 8192, 134, with decode unchanged (~40 tok/s)
+    as the expert cache went from 8898 to 7372 slots. Default 2 GB, at most 1/8 of the
+    card; FT_PREFILL_RESERVE_MB overrides."""
+    default = 0
+    if getattr(config, "moe_host_cache_size", 0):
+        import torch
+
+        total_mb = torch.cuda.get_device_properties(0).total_memory >> 20 if torch.cuda.is_available() else 0
+        default = min(2048, total_mb // 8)
     return int(os.environ.get("FT_PREFILL_RESERVE_MB", default)) << 20
 
 
