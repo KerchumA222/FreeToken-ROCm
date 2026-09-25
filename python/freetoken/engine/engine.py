@@ -1358,7 +1358,15 @@ class Engine:
                 if spec_trace.enabled():
                     spec_trace.record(batch, logits, rows)
                 if self.mtp_head is not None and batch.capture_hidden:
-                    draft_tokens_gpu = self._draft_tokens(batch, next_tokens_gpu)
+                    refresh = getattr(self.mtp_head, "refresh_kv", None)
+                    if (getattr(batch, "skip_draft", False) and refresh is not None
+                            and not batch.is_spec_verify and batch.is_decode):
+                        # Depth 0 next round: keep the head's KV current, skip the draft.
+                        refresh(batch.hidden_states[: batch.size],
+                                self.model.model.embed_tokens.forward(
+                                    next_tokens_gpu.to(torch.int64)))
+                    else:
+                        draft_tokens_gpu = self._draft_tokens(batch, next_tokens_gpu)
         if self.cpu_moe_executor is not None:
             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
             # -> stale expert outputs) as a loud error instead of silent corruption.

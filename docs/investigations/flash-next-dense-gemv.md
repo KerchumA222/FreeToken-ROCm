@@ -62,3 +62,10 @@ step costs 52.5 ms, not a plain server's 38 ms. Three things add to it:
 
 On this model, disk-tier MTP pays on the short, repetitive run (41.1 against 34.0) and
 not on the long run (22.4 against 26.4).
+
+A plain step whose next round is also plain now skips the draft: the head only refreshes
+its attention state (`Qwen4ExpMTPHead.refresh_kv`: KV and QSA index keys, no MoE, mixer
+or lm_head), so a later draft still attends to every position. Long run 22.4 -> 24.0
+tok/s (short 41.0). A depth-0 step inside the MTP configuration now costs 47.9 ms,
+against 52.5 before and 38 in a plain server. What remains is mostly cache churn from the
+verify rounds in between (10.8 ms of disk against ~6).

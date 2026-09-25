@@ -107,6 +107,24 @@ class Qwen4ExpMTPHead(BaseOP):
         out = self.layer.forward(stream.reshape(tokens, -1), batch)
         return self.hyper_connection_mixer.mix(out)[0], out
 
+    def refresh_kv(
+        self, hidden: torch.Tensor, token_embed: torch.Tensor, batch: "Batch | None" = None
+    ) -> None:
+        """Write the block's attention state (KV and QSA index keys) for these rows without
+        drafting: no MoE, no mixer, no lm_head. For plain decode steps the scheduler is not
+        speculating after: a later draft attends to these positions, so their KV must
+        exist, but nothing reads this step's draft."""
+        if batch is None:
+            from freetoken.core import get_global_ctx
+
+            batch = get_global_ctx().batch
+        tokens = hidden.shape[0]
+        h = self.hnorm.forward(hidden).view(tokens, self.hc_count, self.hidden_size)
+        e = self.enorm.forward(token_embed).unsqueeze(1).expand(-1, self.hc_count, -1)
+        stream = self.eh_proj.forward(torch.cat([e, h], dim=-1)).reshape(tokens, -1)
+        block_input, _ = self.layer.attn_hyper_connection.mix(stream)
+        self.layer.self_attn.forward(block_input, batch)
+
 
 __all__ = ["Qwen4ExpMTPHead", "MTP_DRAFT_LAYER_KV"]
 

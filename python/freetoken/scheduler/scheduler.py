@@ -1015,8 +1015,10 @@ class Scheduler(SchedulerIOMixin):
         sel = self._depth_selector()
         spec_k = int(getattr(self.engine, "spec_k", 1) or 1)
         plan = sel.choose() if sel is not None else spec_k
+        # A plain step drafts for the next round only if that round speculates; otherwise
+        # the head just keeps its KV current (engine: refresh_kv).
+        batch.skip_draft = plan == 0
         if plan == 0 and not any(r.spec_draft_len for r in batch.reqs):
-            # Depth 0: a plain step. Its draft head still seeds the next round's draft.
             for req in batch.reqs:
                 req.pending_draft = None
             return
