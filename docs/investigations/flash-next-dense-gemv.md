@@ -329,3 +329,8 @@ The GEMMs are near what rocBLAS reaches on this card (15-27 TF/s); 512 experts a
 tokens each keep the expert GEMMs small. Up to ~2.5k tokens a chunk is bound by its
 ~29.5 GB of expert reads (~3.5 GB/s from page cache + virtual disk). More read threads
 (16, 32) did not help.
+
+Tried and reverted: running the grouped down projection as `W @ a` (1.4x faster in isolation
+at ~150 rows per expert, 7.5% faster per MoE layer in a 7.5k-token microbench) moved a real
+7.5k prefill by nothing (524 vs 542 tok/s, 13.2-14.3 s chunks either way). Shaving GPU time
+off the expert GEMMs does not shorten the chunk; it waits on staging and reads.
