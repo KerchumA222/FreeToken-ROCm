@@ -159,3 +159,38 @@ over 1,024 tokens).
 | plain, spin admission | 40.9 | 24.6 |
 | MTP adaptive, host nodes | 47.9 | 26.0 |
 | MTP adaptive, spin admission | 50.0 | 25.4 |
+
+## Prefill
+
+A 2k-token prefill forward (eager profile, `FT_PROFILE_PHASE=prefill`) was ~19 s of GPU
+time:
+
+| part | GPU s | share |
+|---|---:|---:|
+| dense IQ-type linears through MMVQ, 6 rows a launch (no MMQ kernel for IQ quants) | 6.7 | 35% |
+| routed experts through the per-(token, expert) `moe_vec_q` kernel | 5.1 | 27% |
+| expert staging copies host -> GPU | 4.5 | 23% |
+| QSA sparse attention | 1.5 | 8% |
+| GDN chunked recurrence | 0.9 | 5% |
+
+Fixes:
+
+- **Chunk size.** `--moe-cache-auto` never budgeted for the prefill chunk: on the
+  disk-tier service a ~2k-token prompt OOMed (8192-token chunk, ~0.2 GB headroom). The
+  engine now probes activation growth with dummy prefills and caps the chunk. With a disk
+  tier it also reserves VRAM for prefill (default 2 GB, at most 1/8 of the card). Every
+  chunk re-streams the experts it routes to, so the chunk size is the prefill speed.
+- **Dense IQ linears** with more than 64 rows dequantize once and run one GEMM.
+- **Routed experts** with at least 16 rows per routed expert run as grouped GEMMs: groups
+  of up to 8 experts of similar load are dequantized (IQ2_XS by the CUDA dequantizer,
+  Q2_0/Q2_0_SYM by a new Triton one) and batched with `torch.bmm`, and results accumulate
+  into an fp32 [T, H] buffer.
+
+| prefill tok/s | ~630 tokens | ~2.5k | ~7.5k |
+|---|---:|---:|---:|
+| before (384-token chunks at 0.96) | ~43 | OOM | OOM |
+| chunk fit + 2 GB reserve | ~50 | 107 | 134 |
+| + dequant GEMMs + grouped experts | 58 | 149 | 283 |
+
+Decode is unchanged (40.7 tok/s). Prefill numerics move from q8_1-activation GEMVs to fp16
+GEMMs. Against the previous path, first-generated-token logits drift: median 0, p99 3.8.

@@ -67,6 +67,9 @@ _DEQUANT = _MMVQ
 
 # Below this token count, the MMVQ GEMV kernel wins (matches vLLM's heuristic).
 _MMVQ_SAFE = 6
+# Above this many rows a type without MMQ dequantizes and runs one GEMM rather than
+# chunking through MMVQ (dequantizing a weight costs about a dozen GEMV launches).
+_DEQUANT_GEMM_ROWS = 64
 
 
 def _gemm_triton(x: torch.Tensor, qweight: torch.Tensor, qweight_type: int) -> torch.Tensor:
@@ -155,8 +158,16 @@ def fused_mul_mat_gguf(
         return ggml_mul_mat_vec_a8(qweight, x, qweight_type, out_features)
     if qweight_type in _MMQ:
         return ggml_mul_mat_a8(qweight, x, qweight_type, out_features)
+    if qweight_type in _MMVQ and x.shape[0] > _DEQUANT_GEMM_ROWS:
+        # No MMQ kernel for this type (the IQ quants): dequantize once and run one GEMM.
+        # Chunking a 2k-token prefill through the GEMV kernel, 6 rows at a time, was 35%
+        # of a Qwen3.8-Flash-Next prefill (~333 launches per linear).
+        block, type_size = BLOCK_SHAPE[qweight_type]
+        in_features = qweight.shape[1] // type_size * block
+        weight = ggml_dequantize(qweight, qweight_type, out_features, in_features, x.dtype)
+        return x @ weight.T
     if qweight_type in _MMVQ:
-        # no MMQ kernel for this type: chunk the batch through the GEMV kernel
+        # no MMQ kernel for this type and a small batch: chunk it through the GEMV kernel
         chunks = [
             ggml_mul_mat_vec_a8(qweight, x[i : i + _MMVQ_SAFE], qweight_type, out_features)
             for i in range(0, x.shape[0], _MMVQ_SAFE)
