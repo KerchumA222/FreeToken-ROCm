@@ -194,3 +194,25 @@ Fixes:
 
 Decode is unchanged (40.7 tok/s). Prefill numerics move from q8_1-activation GEMVs to fp16
 GEMMs. Against the previous path, first-generated-token logits drift: median 0, p99 3.8.
+
+Then:
+
+- The disk-tier prefill fill gathers experts the GPU slot cache already holds device to
+  device. Disk reads per 8k chunk fell from 4-9 GiB to 1.3 GiB.
+- The grouped gate_up GEMM runs as `W @ x^T`. On gfx1030, rocBLAS runs `bmm(x, W^T)` over
+  the dequantized row-major weight at ~4 TF/s and `bmm(W, x^T)` at ~9-12 TF/s; down, at
+  K = 640, is already fast as `x @ W^T`.
+
+| prefill tok/s | ~630 tokens | ~2.5k | ~7.5k |
+|---|---:|---:|---:|
+| + GPU-resident experts + flipped gate_up | 57-60 | 166-168 | 305 |
+
+Where a prefill spends its time now:
+
+- **~630 tokens:** ~11 s wall, 4.9 s of GPU. The chunk routes to ~95% of every layer's
+  experts, so it moves ~25 GB (disk / page cache -> pinned -> PCIe); GPU-side staging
+  copies alone are 2.0 s. Grouping experts at 4 rows each instead of 16 did not help
+  (56.5 vs 59.7 tok/s).
+- **~7.5k tokens:** ~20 s of GPU (eager). Grouped expert GEMMs are 32% (~115 GFLOP/s
+  before the flip), and QSA sparse attention is 25% (the per-row split-K decode kernel
+  runs for every prefill row, ~100 GFLOP/s).
