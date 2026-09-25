@@ -1830,32 +1830,41 @@ vec_dot_iq2_xxs_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict_
   return d * sumi;
 }
 
+// Byte masks for a sign nibble: bit j set -> byte j = 0xff.
+static __device__ const uint32_t ft_sign_mask4[16] = {0x00000000u, 0x000000ffu, 0x0000ff00u, 0x0000ffffu, 0x00ff0000u, 0x00ff00ffu, 0x00ffff00u, 0x00ffffffu, 0xff000000u, 0xff0000ffu, 0xff00ff00u, 0xff00ffffu, 0xffff0000u, 0xffff00ffu, 0xffffff00u, 0xffffffffu};
+
+// dp4a over 4-byte groups, with the signs applied as a byte-wise negate. The vendored
+// version multiplied byte by byte with a branch per weight (~150 GB/s on an RX 6800,
+// where Q4_K's MMVQ reaches ~380). ROCm has no packed-byte compare/subtract, so the
+// negate avoids them: iq2xs grid bytes are never 0, hence ~g + 1 never carries and
+// (g ^ s) + (s & 0x01010101) negates exactly the bytes s marks. Integer sums, and the
+// float scale combination below, are the vendored ones.
 static __device__ __forceinline__ float
 vec_dot_iq2_xs_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1, const int& iqs) {
   const block_iq2_xs* bq2 = (const block_iq2_xs*)vbq;
 
   const int ib32 = iqs;
   const uint16_t* q2 = bq2->qs + 4 * ib32;
-  const int8_t* q8 = bq8_1[ib32].qs;
+  const int* q8 = (const int*)bq8_1[ib32].qs;
   const uint8_t ls1 = bq2->scales[ib32] & 0xf;
   const uint8_t ls2 = bq2->scales[ib32] >> 4;
   int sumi1 = 0;
-  for (int l = 0; l < 2; ++l) {
-    const uint8_t* grid = (const uint8_t*)(iq2xs_grid + (q2[l] & 511));
-    const uint8_t signs = ksigns_iq2xs[q2[l] >> 9];
-    for (int j = 0; j < 8; ++j) {
-      sumi1 += q8[j] * grid[j] * (signs & kmask_iq2xs[j] ? -1 : 1);
-    }
-    q8 += 8;
-  }
   int sumi2 = 0;
-  for (int l = 2; l < 4; ++l) {
-    const uint8_t* grid = (const uint8_t*)(iq2xs_grid + (q2[l] & 511));
+#pragma unroll
+  for (int l = 0; l < 4; ++l) {
+    const uint2 grid = ((const uint2*)iq2xs_grid)[q2[l] & 511];
     const uint8_t signs = ksigns_iq2xs[q2[l] >> 9];
-    for (int j = 0; j < 8; ++j) {
-      sumi2 += q8[j] * grid[j] * (signs & kmask_iq2xs[j] ? -1 : 1);
+    const uint32_t s0 = ft_sign_mask4[signs & 0xf];
+    const uint32_t s1 = ft_sign_mask4[signs >> 4];
+    const int gl = (int)((grid.x ^ s0) + (s0 & 0x01010101u));
+    const int gh = (int)((grid.y ^ s1) + (s1 & 0x01010101u));
+    if (l < 2) {
+      sumi1 = __dp4a(gl, q8[2 * l + 0], sumi1);
+      sumi1 = __dp4a(gh, q8[2 * l + 1], sumi1);
+    } else {
+      sumi2 = __dp4a(gl, q8[2 * l + 0], sumi2);
+      sumi2 = __dp4a(gh, q8[2 * l + 1], sumi2);
     }
-    q8 += 8;
   }
   const float d = __half2float(bq2->d) * __half2float(bq8_1[ib32].ds.x) * 0.25f;
   return d * ((0.5f + ls1) * sumi1 + (0.5f + ls2) * sumi2);

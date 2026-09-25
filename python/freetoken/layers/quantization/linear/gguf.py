@@ -86,12 +86,16 @@ class MmvqGgufLinearKernel(LinearKernel):
     def apply(self, layer: Any, x: torch.Tensor) -> torch.Tensor:
         from freetoken.layers.gguf import fused_mul_mat_gguf
 
+        dense_linear = torch.nn.functional.linear
+        if torch.version.hip is not None and x.is_cuda:
+            from freetoken.kernel.triton.small_gemv import dense_linear
+
         # A fused module may mix packed and dense slots; the dense ones are tiny
         # (0.69% of the bytes in Qwen4-Exp) but must still be multiplied as dense.
         runs = getattr(layer, "_gguf_runs", None) or tuple(zip(layer.gguf_slots, layer.gguf_types))
         outs = [
             fused_mul_mat_gguf(x, getattr(layer, n), t) if _is_packed(t)
-            else torch.nn.functional.linear(x, getattr(layer, n))
+            else dense_linear(x, getattr(layer, n))
             for n, t in runs
         ]
         out = outs[0] if len(outs) == 1 else torch.cat(outs, dim=-1)

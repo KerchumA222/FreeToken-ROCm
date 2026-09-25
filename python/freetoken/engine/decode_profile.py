@@ -39,7 +39,8 @@ def step(batch):
         prof = _state["prof"]
         prof.__exit__(None, None, None)
         _state["done"] = True
-        table = prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=60,
+        sort = os.environ.get("FT_PROFILE_SORT", "self_cuda_time_total")
+        table = prof.key_averages().table(sort_by=sort, row_limit=int(os.environ.get("FT_PROFILE_ROWS", "60")),
                                           max_name_column_width=90)
         with open(path, "w") as f:
             f.write(f"forwards profiled: {count}\n{table}\n")

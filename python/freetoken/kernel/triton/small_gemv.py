@@ -52,4 +52,24 @@ def small_gemv(x: torch.Tensor, w: torch.Tensor, block_n: int = 4, block_k: int 
     return out
 
 
-__all__ = ["small_gemv", "MAX_ROWS"]
+# Bigger weights are left to rocBLAS: the lm_head class of GEMV is bandwidth-bound there too.
+_DENSE_MAX_ELEMS = 64 << 20
+
+
+def dense_linear(x: torch.Tensor, w: torch.Tensor, b: torch.Tensor | None = None) -> torch.Tensor:
+    """``F.linear`` for a dense weight, through :func:`small_gemv` at decode sizes on HIP.
+
+    rocBLAS runs an M<=4 fp16 GEMV as a large Tensile tile on RDNA: 85-540 us for weights
+    a few MB wide (Qwen3.8-Flash-Next's QSA indexer, a dense GDN out_proj). This reads
+    the weight once in a few us."""
+    rows = x.numel() // x.shape[-1] if x.dim() else 0
+    if (torch.version.hip is None or not x.is_cuda or rows == 0 or rows > MAX_ROWS
+            or w.dim() != 2 or w.dtype != x.dtype or w.stride(1) != 1
+            or w.numel() > _DENSE_MAX_ELEMS):
+        return torch.nn.functional.linear(x, w, b)
+    out = small_gemv(x.reshape(rows, -1).contiguous(), w, block_n=1, block_k=2048, num_warps=2)
+    out = out.reshape(*x.shape[:-1], w.shape[0])
+    return out + b.to(out.dtype) if b is not None else out
+
+
+__all__ = ["small_gemv", "dense_linear", "MAX_ROWS"]

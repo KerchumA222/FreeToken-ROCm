@@ -69,3 +69,30 @@ or lm_head), so a later draft still attends to every position. Long run 22.4 -> 
 tok/s (short 41.0). A depth-0 step inside the MTP configuration now costs 47.9 ms,
 against 52.5 before and 38 in a plain server. What remains is mostly cache churn from the
 verify rounds in between (10.8 ms of disk against ~6).
+
+## Second pass: small GEMVs, IQ2_XS dot product, launch floor
+
+Measured with `FT_PROFILE_DECODE` (`FT_PROFILE_SORT=count` for a table by call count) and
+a per-shape MMVQ microbenchmark (random packed weights, M=1, inside a CUDA graph).
+
+- **Every dense M<=4 linear on HIP now uses the Triton small GEMV**
+  (`kernel/triton/small_gemv.dense_linear`), not rocBLAS. This covers the QSA indexer's
+  BF16 `index_qk_proj`, at 85 us a call under rocBLAS.
+- **IQ2_XS dot product (`vec_dot_iq2_xs_q8_1`): dp4a with a carry-free sign negate.**
+  ROCm has no packed-byte compare or subtract, so the signs come from a 16-entry byte-mask
+  table and `(g ^ s) + (s & 0x01010101)`. That is exact because IQ2_XS grid bytes are
+  never 0. Outputs are bit-identical to the vendored scalar version:
+
+  | shape (M=1) | before | after |
+  |---|---:|---:|
+  | GDN in, 6240 x 2560 | 32.2 us | 20.8 us |
+  | ssm_out, 2560 x 6144 | 29.9 us | 19.2 us |
+  | attention q+k, 12800 x 2560 | 49.9 us | 37.9 us |
+  | shared expert gate/up, 1280 x 2560 | 11.1 us | 9.2 us |
+  | hyper-connection down, 320 x 10240 | 12.3 us | 10.4 us |
+
+  Plain decode, short prompt: 35.3 -> 36.7 tok/s.
+- Rows per MMVQ workgroup (`GGML_CUDA_MMV_Y` 1/2/4/8) made no difference.
+- **Launch floor.** A trivial kernel costs 2.8 us inside a HIP graph on the RX 6800, and a
+  Flash-Next decode token runs ~2,800 kernels. Of those, 531 are `quantize_q8_1`, one per
+  packed matmul, and ~900 are the hyper-connection mix/combine chain (twice a layer).
