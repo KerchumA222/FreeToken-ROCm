@@ -51,6 +51,8 @@ def step(batch):
                 f.write(prof.key_averages(group_by_input_shape=True).table(
                     sort_by="self_cuda_time_total", row_limit=25, max_name_column_width=40,
                     max_shapes_column_width=120))
+            if os.environ.get("FT_PROFILE_TRACE"):  # timeline, for GPU idle analysis
+                prof.export_chrome_trace(path + ".trace.json")
             if os.environ.get("FT_PROFILE_STACK"):
                 f.write(prof.key_averages(group_by_stack_n=6).table(
                     sort_by="self_cuda_time_total", row_limit=40, max_name_column_width=60))

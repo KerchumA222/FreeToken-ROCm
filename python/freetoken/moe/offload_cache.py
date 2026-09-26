@@ -34,6 +34,8 @@ _SMALL_BANK_FEAT_BYTES = 256 * 1024
 # units the GEMMs want). Above this many runs per bank the kernel's one launch wins.
 _TIER_DMA = os.getenv("FT_TIER_DMA", "1").strip().lower() in {"1", "true", "yes", "on"}
 _TIER_DMA_MAX_RUNS = 128
+# The look-ahead reader thread queues its layer's copies itself (FT_FILL_IN_READER).
+_FILL_IN_READER = os.getenv("FT_FILL_IN_READER", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 from freetoken.utils import init_logger
 
@@ -621,31 +623,35 @@ class OffloadMoeCache:
         idx = self._stage_idx[buffer_id]
         gpu_e, gpu_s, hit_e, hit_s, miss = (plan[k] for k in ("gpu_e", "gpu_s", "hit_e", "hit_s", "miss"))
         n_hit, n_miss = len(hit_e), len(miss)
-        if n_miss:
-            idx["miss_dst"][:n_miss].copy_(
-                torch.tensor(miss, dtype=torch.int32), non_blocking=False
-            )
-        if n_hit:
-            idx["hit_dst"][:n_hit].copy_(
-                torch.tensor(hit_e, dtype=torch.int32), non_blocking=False
-            )
-            idx["hit_src"][:n_hit].copy_(
-                torch.tensor(hit_s, dtype=torch.int32), non_blocking=False
-            )
-        idx["n_hit"].fill_(n_hit)
-        idx["n_miss"].fill_(n_miss)
-
-        n_gpu = len(gpu_e)
-        if n_gpu:
-            gpu_dst = torch.tensor(gpu_e, dtype=torch.int32).to(self.device, non_blocking=True)
-            gpu_src = torch.tensor(gpu_s, dtype=torch.int32).to(self.device, non_blocking=True)
-            gpu_n = torch.tensor([n_gpu], dtype=torch.int64).to(self.device, non_blocking=True)
         hit_runs = _row_runs(hit_e, hit_s) if _TIER_DMA and n_hit else None
         miss_runs = _row_runs(miss, range(n_miss)) if _TIER_DMA and n_miss else None
         if hit_runs is not None and len(hit_runs) > _TIER_DMA_MAX_RUNS:
             hit_runs = None
         if miss_runs is not None and len(miss_runs) > _TIER_DMA_MAX_RUNS:
             miss_runs = None
+        # Index tensors only for the halves the kernel copies. These copies are blocking
+        # and this is the copy stream, which waits on the previous layer's GEMMs: the
+        # host would stall behind them every layer.
+        if n_miss and miss_runs is None:
+            idx["miss_dst"][:n_miss].copy_(
+                torch.tensor(miss, dtype=torch.int32), non_blocking=False
+            )
+            idx["n_miss"].fill_(n_miss)
+        if n_hit and hit_runs is None:
+            idx["hit_dst"][:n_hit].copy_(
+                torch.tensor(hit_e, dtype=torch.int32), non_blocking=False
+            )
+            idx["hit_src"][:n_hit].copy_(
+                torch.tensor(hit_s, dtype=torch.int32), non_blocking=False
+            )
+            idx["n_hit"].fill_(n_hit)
+
+        n_gpu = len(gpu_e)
+        if n_gpu:
+            # Pinned, so the copies are truly async (pageable ones block the host here).
+            gpu_dst = torch.tensor(gpu_e, dtype=torch.int32).pin_memory().to(self.device, non_blocking=True)
+            gpu_src = torch.tensor(gpu_s, dtype=torch.int32).pin_memory().to(self.device, non_blocking=True)
+            gpu_n = torch.tensor([n_gpu], dtype=torch.int64).pin_memory().to(self.device, non_blocking=True)
         for name, buffer in zip(self.bank_schema, self.prefill_bank_buffers):
             dst = buffer[buffer_id]
             if n_gpu:
@@ -971,13 +977,14 @@ class OffloadMoeCache:
         if self.host_tier is not None:
             logger.info(
                 "disk tier prefill: %.1f%% of expert rows from the host pool, "
-                "%.2f GiB read from disk; %.2f s reading, %.2f s in the whole chunk; "
-                "%.1f%% of rows from the GPU cache",
+                "%.2f GiB read from disk; %.2f s reading (%.2f s waited on), %.2f s in the "
+                "whole chunk; %.1f%% of rows from the GPU cache",
                 hit * 100.0,
                 (self.prefill_total_rows - self.prefill_hit_rows)
                 * sum(self.disk_store.expert_bytes(b) for b in self.bank_schema)
                 / (1 << 30),
                 getattr(self, "prefill_read_seconds", 0.0),
+                getattr(self, "prefill_wait_seconds", 0.0),
                 time.perf_counter() - getattr(self, "_prefill_started", time.perf_counter()),
                 100.0 * getattr(self, "prefill_gpu_rows", 0) / self.prefill_total_rows,
             )
@@ -997,6 +1004,7 @@ class OffloadMoeCache:
         for b in list(getattr(self, "_pending_fill", {})):
             self._finish_tier_fill(b)
         self.prefill_read_seconds = 0.0
+        self.prefill_wait_seconds = 0.0
         self.prefill_gpu_rows = 0
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
@@ -1249,25 +1257,43 @@ class OffloadMoeCache:
         # The stage rows are rewritten; the previous fill's H2D out of them must be done.
         previous = self.prefill_ready_events[buffer_id] if self._prefill_buffer_has_release_event[buffer_id] else None
 
-        def read() -> None:
+        def read() -> bool:
             if previous is not None:
                 previous.synchronize()
             self._read_tier_fill(layer_id, buffer_id, plan)
+            if not _FILL_IN_READER:
+                return False
+            # Queue the copies as soon as the bytes are in: from wait_prefill_layer they
+            # started only when this layer's GEMMs needed them and ran with nothing to
+            # overlap (1.6 s of GPU idle over a 7.5k-token Flash-Next chunk). The release
+            # event waited on was recorded before this read was submitted. Inference mode
+            # is thread-local; the slot maps are inference tensors.
+            with torch.inference_mode():
+                self._queue_tier_fill(buffer_id, plan)
+            return True
 
         self._pending_fill[buffer_id] = (layer_id, plan, self._prefill_reader.submit(read))
 
-    def _finish_tier_fill(self, buffer_id: int) -> None:
-        pending = getattr(self, "_pending_fill", {}).pop(buffer_id, None)
-        if pending is None:
-            return
-        layer_id, plan, future = pending
-        future.result()
+    def _queue_tier_fill(self, buffer_id: int, plan: dict) -> None:
         with torch.cuda.stream(self.prefill_copy_stream):
             if self._prefill_buffer_has_release_event[buffer_id]:
                 self.prefill_copy_stream.wait_event(self.prefill_release_events[buffer_id])
             self._invalidate_prefill_buffer(buffer_id)
             self._enqueue_tier_fill(buffer_id, plan)
             self.prefill_ready_events[buffer_id].record(self.prefill_copy_stream)
+
+    def _finish_tier_fill(self, buffer_id: int) -> None:
+        pending = getattr(self, "_pending_fill", {}).pop(buffer_id, None)
+        if pending is None:
+            return
+        layer_id, plan, future = pending
+        t0 = time.perf_counter()
+        queued = future.result()
+        # Main-thread time blocked on the look-ahead read: the part of the reads the
+        # pipeline failed to hide.
+        self.prefill_wait_seconds = getattr(self, "prefill_wait_seconds", 0.0) + time.perf_counter() - t0
+        if not queued:
+            self._queue_tier_fill(buffer_id, plan)
 
     def wait_prefill_layer(self, layer_id: int) -> tuple[torch.Tensor, ...]:
         """Full-layer ``[num_experts, ...]`` bank views for ``layer_id``, one per

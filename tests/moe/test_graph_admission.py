@@ -25,13 +25,46 @@ needs_host_nodes = pytest.mark.skipif(
 )
 
 
+@pytest.fixture(autouse=True, scope="module", params=["0", "1"], ids=["host-node", "spin"])
+def _admission_path(request):
+    """Both capture paths: a host-function node per layer, and the spin kernel with its
+    host poller (the ROCm default). Module-scoped so each path's tests run together: a
+    process picks one path, and host-node replays after spin pollers have come and gone
+    hung in a full-suite run."""
+    import os
+
+    old = os.environ.get("FT_ADMIT_SPIN")
+    os.environ["FT_ADMIT_SPIN"] = request.param
+    yield
+    if old is None:
+        os.environ.pop("FT_ADMIT_SPIN", None)
+    else:
+        os.environ["FT_ADMIT_SPIN"] = old
+
+
+@pytest.fixture(autouse=True)
+def _close_pollers():
+    yield
+    for h in _HARNESSES:  # one poller per process: close each test's
+        spin = getattr(h, "_spin", None)
+        if spin is not None:
+            spin.close()
+    _HARNESSES.clear()
+
+
+_HARNESSES = []
+
+
 class _Tier:
     """Stands in for HostExpertCache.ensure: slot = expert + 1000."""
 
     def __init__(self):
         self.calls = []
+        self.fail = False
 
     def ensure(self, layer_id, experts):
+        if self.fail:
+            raise RuntimeError("disk is gone")
         self.calls.append((layer_id, list(experts)))
         return [e + 1000 for e in experts]
 
@@ -41,9 +74,12 @@ def _harness(width=8):
     obj.src_indices = torch.zeros(width, dtype=torch.int32, device="cuda")
     obj.num_indices = torch.zeros(1, dtype=torch.int64, device="cuda")
     obj.host_tier = _Tier()
+    obj.PREFETCH_MAX = OffloadMoeCache.PREFETCH_MAX
     for name in ("_admit_graph_bufs", "_admit_callback", "_admit_capture",
-                 "prepare_graph_admission", "raise_admission_error"):
+                 "prepare_graph_admission", "raise_admission_error", "_start_spin_admission",
+                 "_take_prefetch"):
         setattr(obj, name, getattr(OffloadMoeCache, name).__get__(obj))
+    _HARNESSES.append(obj)
     return obj
 
 
@@ -71,7 +107,8 @@ def test_a_replay_takes_the_slots_the_host_tier_chose():
     h.prepare_graph_admission(misses)
     g, seen = _capture(h, misses)
 
-    assert h._admit_order == [0, 1]
+    if getattr(h, "_spin", None) is None:  # host-node bookkeeping; the spin kernel has none
+        assert h._admit_order == [0, 1]
     assert h.host_tier.calls == [], "the host node must not fire during capture"
 
     g.replay()
@@ -117,11 +154,9 @@ def test_a_failing_host_surfaces_on_the_engine_thread_without_hanging():
     h.prepare_graph_admission({0: [2]})
     g, _ = _capture(h, {0: [2]})
 
-    class Boom(_Tier):
-        def ensure(self, layer_id, experts):
-            raise RuntimeError("disk is gone")
-
-    h.host_tier = Boom()
+    # fail the tier the admission path already holds (the spin poller keeps its own
+    # reference, so swapping h.host_tier would not reach it)
+    h.host_tier.fail = True
     g.replay()
     torch.cuda.synchronize()  # must return: the node swallowed the failure
     with pytest.raises(RuntimeError, match="expert admission failed"):

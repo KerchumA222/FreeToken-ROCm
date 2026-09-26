@@ -359,3 +359,24 @@ more than 128 runs per bank falls back to the kernel). tok/s at ~630 / ~2.5k / ~
 device. Every earlier number here was cold, because `max_tokens=1` requests never populate
 the cache; warm is what a second turn of a conversation sees and is 10-20% faster. The page
 cache cannot be prewarmed usefully on this VM: 32.2 GiB of experts against 30 GB of RAM.
+
+## Queue each layer's copies from the reader thread (2026-09-25)
+
+A timeline of a warm 7.5k-token chunk (`FT_PROFILE_TRACE=1` exports the torch profiler
+trace next to the table) showed the compute stream idle 5.7 of 16.5 s (stack profiling
+inflates the chunk). The largest share, 1.6 s in 68 gaps of 10 ms or more, sat behind the
+next layer's H2D copies: the look-ahead read finished on its worker thread, but its copies
+were only queued from `wait_prefill_layer` when the layer's GEMMs needed them, so ~20-30 ms
+of PCIe per layer ran with nothing to overlap. The reader thread now queues the copies
+itself as soon as its read lands (`FT_FILL_IN_READER`, default on; its work runs under
+`torch.inference_mode()`, which is thread-local).
+
+Two smaller fixes on the way: the fill no longer builds its index tensors with blocking
+copies when DMA does the copying, and the GPU-cache gather's indices are pinned. Neither
+moved the numbers alone. Queuing from `release_prefill_layer` instead helped only +3%: by
+then the next layer's read is rarely done, and blocking on it holds back the next layer.
+
+Warm GPU cache, tok/s at ~630 / ~2.5k / ~7.5k: 88-92 / 306-312 / 596-613 before, 89 / 328 /
+695 after (chunks ~12 -> 10.2-11.0 s). Greedy chat output on 7.5k / 2.8k-token prompts stays
+coherent and diverges from earlier runs no sooner than runs of the old path diverge from
+each other. The prefill log now also reports how long the main thread waited on reads.
