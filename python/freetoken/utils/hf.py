@@ -232,8 +232,9 @@ def _weight_allow_patterns(repo_id: str) -> list[str]:
             "no usable %s for %s (%s); falling back to *.safetensors",
             SAFE_WEIGHTS_INDEX_NAME, repo_id, e,
         )
-        return ["*.safetensors"]
-    return shards or ["*.safetensors"]
+        return ["*.safetensors", SAFE_WEIGHTS_INDEX_NAME]
+    # The index too: the loader reads it to map tensors to shards.
+    return (shards or ["*.safetensors"]) + [SAFE_WEIGHTS_INDEX_NAME]
 
 
 def download_hf_weight(model_path: str) -> str:
