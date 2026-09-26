@@ -25,6 +25,17 @@ from freetoken.models.qwen4_exp.ple import GpuResidentTable, PLELayer, PLEMetada
 from .common import EOS, hash_constants, requires_cuda, toy_hf_config
 
 
+
+def _as_batch(ns):
+    """Give a SimpleNamespace stand-in the Batch members the model forward reads."""
+    from freetoken.core import Batch
+
+    ns.__dict__.setdefault("logits_indices", None)
+    ns.__dict__.setdefault("capture_hidden", False)
+    ns.__dict__.setdefault("hidden_states", None)
+    ns.select_output_rows = lambda x: Batch.select_output_rows(ns, x)
+    return ns
+
 def _config(num_layers: int = 4) -> ModelConfig:
     return parse_config(toy_hf_config(num_layers))
 
@@ -473,12 +484,12 @@ def test_decoder_stack_prefill_and_decode(monkeypatch):
     last = torch.tensor(
         [sum(len(p) for p in prompts[: i + 1]) - 1 for i in range(len(prompts))], device=device
     )
-    batch = SimpleNamespace(
+    batch = _as_batch(SimpleNamespace(
         padded_reqs=reqs, reqs=reqs, size=len(reqs), is_prefill=True, is_decode=False,
         input_ids=torch.tensor(flat, dtype=torch.int64, device=device),
         positions=torch.cat([torch.arange(len(p)) for p in prompts]).to(device),
         attn_metadata=SimpleNamespace(get_last_indices=lambda bs: last[:bs]),
-    )
+    ))
     with ctx.forward_batch(batch):
         logits = model.forward()
     assert logits.shape == (len(prompts), config.vocab_size)
@@ -488,12 +499,12 @@ def test_decoder_stack_prefill_and_decode(monkeypatch):
         r.cached_len = len(p)
         r.extend_len = 1
         r.input_ids = torch.cat([r.input_ids, torch.tensor([14], dtype=torch.int64)])
-    decode = SimpleNamespace(
+    decode = _as_batch(SimpleNamespace(
         padded_reqs=reqs, reqs=reqs, size=len(reqs), is_prefill=False, is_decode=True,
         input_ids=torch.tensor([14] * len(reqs), dtype=torch.int64, device=device),
         positions=torch.tensor([len(p) for p in prompts], dtype=torch.int64, device=device),
         attn_metadata=None,
-    )
+    ))
     with ctx.forward_batch(decode):
         decode_logits = model.forward()
     assert decode_logits.shape == (len(prompts), config.vocab_size)

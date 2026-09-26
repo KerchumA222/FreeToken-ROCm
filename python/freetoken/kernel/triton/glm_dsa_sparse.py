@@ -24,12 +24,29 @@ global rows -> ``o[b, m, h, 512]``.
 
 from __future__ import annotations
 
+import functools
+
 import torch
 import triton
 import triton.language as tl
 
 BLOCK_H = 16
 BLOCK_T = 32
+
+
+@functools.lru_cache(maxsize=None)
+def _small_lds(index: int) -> bool:
+    """The sparse attention kernels' BLOCK_T=32 tiles, pipelined 2 deep, need ~72 KB of
+    LDS -- more than RDNA2's 64 KB. There they run with 16-token tiles, unpipelined."""
+    props = torch.cuda.get_device_properties(index)
+    smem = (getattr(props, "shared_memory_per_block_optin", 0)
+            or getattr(props, "shared_memory_per_block", 0) or 65536)
+    return smem < 96 * 1024
+
+
+def _tiles(device: torch.device) -> tuple[int, int]:
+    """``(BLOCK_T, num_stages)`` for the sparse attention kernels on ``device``."""
+    return (16, 1) if _small_lds(torch.device(device).index or 0) else (BLOCK_T, 2)
 MAX_SPLITS = 32
 MIN_TILES_PER_SPLIT = 4
 
@@ -380,6 +397,7 @@ def glm_dsa_sparse_attn(
         cnt, stride_nb, stride_nm = idx, 0, 0
 
     n_splits = _split_count(b, m, h, topk, q.device) if force_splits is None else force_splits
+    block_t, stages = _tiles(q.device)
     if n_splits:
         mid_o = q.new_empty(b, m, h, n_splits, d_v, dtype=torch.float32)
         mid_lse = q.new_empty(b, m, h, n_splits, dtype=torch.float32)
@@ -395,9 +413,9 @@ def glm_dsa_sparse_attn(
             idx.stride(0), 0 if broadcast_m else idx.stride(1), idx.stride(2),
             stride_nb, stride_nm,
             D_V=d_v, D_R=d_r,
-            BLOCK_H=BLOCK_H, BLOCK_T=BLOCK_T,
+            BLOCK_H=BLOCK_H, BLOCK_T=block_t,
             HAS_COUNTS=has_counts, HAS_ROPE=d_r > 0, NUM_SPLITS=n_splits,
-            num_warps=4, num_stages=2,
+            num_warps=4, num_stages=stages,
         )
         grid2 = (m, b, h)
         _glm_dsa_merge_kernel[grid2](
@@ -421,9 +439,9 @@ def glm_dsa_sparse_attn(
         idx.stride(0), 0 if broadcast_m else idx.stride(1), idx.stride(2),
         stride_nb, stride_nm,
         D_V=d_v, D_R=d_r,
-        BLOCK_H=BLOCK_H, BLOCK_T=BLOCK_T,
+        BLOCK_H=BLOCK_H, BLOCK_T=block_t,
         HAS_COUNTS=has_counts, HAS_ROPE=d_r > 0,
-        num_warps=4, num_stages=2,
+        num_warps=4, num_stages=stages,
     )
     return o
 

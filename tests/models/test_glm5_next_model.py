@@ -121,6 +121,17 @@ def rig(monkeypatch):
     return model, ctx
 
 
+def _as_batch(ns):
+    """Give a SimpleNamespace stand-in the Batch members the model forward reads."""
+    from freetoken.core import Batch
+
+    ns.__dict__.setdefault("logits_indices", None)
+    ns.__dict__.setdefault("capture_hidden", False)
+    ns.__dict__.setdefault("hidden_states", None)
+    ns.select_output_rows = lambda x: Batch.select_output_rows(ns, x)
+    return ns
+
+
 def _req(device_len, cached_len):
     return SimpleNamespace(
         table_idx=0, device_len=device_len, extend_len=device_len - cached_len,
@@ -152,6 +163,7 @@ def _batch(ctx, ids, t0, phase):
         ),
         mm_embeds=None,
     )
+    _as_batch(batch)
     ctx.batch = batch
     ctx.attn_backend.prepare_metadata(batch)
     return batch
