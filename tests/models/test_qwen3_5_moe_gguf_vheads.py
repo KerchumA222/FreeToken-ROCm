@@ -69,3 +69,16 @@ def test_untile_is_the_documented_permutation():
 def test_untile_rejects_a_mismatched_axis():
     with pytest.raises(AssertionError):
         _untile_v_heads(torch.randn(NUM_V_HEADS + 1, 8), 0, NUM_K_HEADS, V_PER_K, 1)
+
+
+def test_the_loaders_row_permutation_is_the_same_untiling():
+    """iter_gguf_weights applies the fix as row indices (_v_head_permutation); it has to be
+    this same un-tiling, head for head, or the two descriptions of the layout disagree."""
+    from freetoken.models.qwen3_5_moe.gguf import _permute_head_rows, _v_head_permutation
+
+    perm = _v_head_permutation(NUM_V_HEADS, NUM_K_HEADS)
+    gguf = torch.randn(NUM_V_HEADS * HEAD_V_DIM, 3)
+    assert torch.equal(
+        _permute_head_rows(gguf, perm, HEAD_V_DIM),
+        _untile_v_heads(gguf, 0, NUM_K_HEADS, V_PER_K, HEAD_V_DIM),
+    )
