@@ -118,39 +118,56 @@ def _fused_experts_grouped(x, gate_up_q, down_q, topk_weights, topk_ids, act_fn,
     similar load dequantize their weights and run two padded batched GEMMs. Each group
     gathers its own rows from ``x`` and adds its weighted outputs into one fp32 [T, H]
     accumulator, so nothing is sized tokens x top_k x hidden."""
+    import numpy as np
+
     t, k = topk_ids.shape
     h = x.shape[1]
     flat = topk_ids.reshape(-1).long()
     order = torch.argsort(flat, stable=True)
-    experts, counts = torch.unique_consecutive(flat.index_select(0, order), return_counts=True)
-    starts = torch.cumsum(counts, 0) - counts
-    # Busiest first, so each group pads to a similar count.
-    by_load = torch.argsort(counts, descending=True)
-    experts, counts, starts = experts[by_load], counts[by_load], starts[by_load]
-    counts_host = counts.tolist()
-    tok_sorted = order // k
-    w_sorted = topk_weights.reshape(-1).index_select(0, order).float()
+    # One host sync per layer: the per-expert counts. bincount has a fixed output size;
+    # unique_consecutive synced once more for its own. The groups' padded row layout is
+    # then planned on the host in one pass and gathered once, so each group launches
+    # only its GEMM work -- per-group index math was ~0.6 s of GPU idle over a
+    # 7.5k-token Flash-Next chunk, the host falling behind small groups.
+    c = np.asarray(torch.bincount(flat, minlength=gate_up_q.shape[0]).tolist())
+    s = np.cumsum(c) - c
+    ex = np.nonzero(c)[0]
+    ex = ex[np.argsort(-c[ex], kind="stable")]  # busiest first: similar padding per group
+    groups, pos_parts, valid_parts = [], [], []
+    g = row = 0
+    while g < len(ex):
+        maxc = int(c[ex[g]])  # the busiest of the group
+        n = max(1, min(_GROUP, _GROUP_ROWS // maxc, len(ex) - g))
+        e = ex[g : g + n]
+        span = np.arange(maxc)
+        valid = span[None, :] < c[e][:, None]
+        pos_parts.append(np.where(valid, s[e][:, None] + span[None, :], 0).ravel())  # pad -> row 0
+        valid_parts.append(valid.ravel())
+        groups.append((g, n, row, maxc))
+        g += n
+        row += n * maxc
+
+    def dev(a, dtype):
+        return torch.from_numpy(np.ascontiguousarray(a)).to(dtype).pin_memory().to(x.device, non_blocking=True)
+
+    ids_all = dev(ex, torch.int64)
+    pos_all = dev(np.concatenate(pos_parts), torch.int64)
+    valid_all = dev(np.concatenate(valid_parts), torch.float32)
+    tok_all = (order // k).index_select(0, pos_all)
+    w_all = topk_weights.reshape(-1).index_select(0, order).float().index_select(0, pos_all) * valid_all
     out = torch.zeros(t, h, dtype=torch.float32, device=x.device)
-    g = 0
-    while g < len(counts_host):
-        maxc = counts_host[g]  # the busiest of the group
-        n = max(1, min(_GROUP, _GROUP_ROWS // maxc, len(counts_host) - g))
-        ids = experts[g : g + n]
-        span = torch.arange(maxc, device=x.device)
-        pos = starts[g : g + n, None] + span[None, :]
-        valid = span[None, :] < counts[g : g + n, None]
-        pos = torch.where(valid, pos, torch.zeros_like(pos))  # padding rows compute on row 0
-        tok = tok_sorted.index_select(0, pos.reshape(-1))
+    for g, n, row, maxc in groups:
+        ids = ids_all[g : g + n]
+        tok = tok_all[row : row + n * maxc]
+        weight = w_all[row : row + n * maxc]
         # gate_up as W [n, 2I, H] @ x^T: rocBLAS on gfx1030 runs this batched shape ~2.4x
-        # faster than x @ W^T over the dequantized (row = output) layout. down keeps
-        # x @ W^T, which is already fast at K = I.
+        # faster than x @ W^T over the dequantized (row = output) layout.
         # The two transposes run in Triton (kernel/triton/moe_prefill.py): torch's strided
         # copies of them were 21% of a long prefill.
         xt = gather_transposed(x, tok.view(n, maxc))
         w_gu = _dequant_rows(gate_up_q.index_select(0, ids), gu_type, x.dtype)
         gu = torch.bmm(w_gu, xt)                                   # [n, 2I, maxc]
         del xt, w_gu
-        weight = w_sorted.index_select(0, pos.reshape(-1)) * valid.reshape(-1)
         w_dn = _dequant_rows(down_q.index_select(0, ids), dn_type, x.dtype)
         if act_fn is silu_and_mul and maxc < _DOWN_FLIP_ROWS:
             # Below ~256 columns W [n, H, I] @ a [n, I, c] is ~1.4x faster than a @ W^T;
@@ -169,7 +186,6 @@ def _fused_experts_grouped(x, gate_up_q, down_q, topk_weights, topk_ids, act_fn,
             y = torch.bmm(inter.view(n, maxc, -1), w_dn.transpose(1, 2)).view(n * maxc, h)
             del inter, w_dn
             out.index_add_(0, tok, y.float() * weight[:, None])
-        g += n
     return out.to(x.dtype)
 
 

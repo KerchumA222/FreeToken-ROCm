@@ -380,3 +380,18 @@ Warm GPU cache, tok/s at ~630 / ~2.5k / ~7.5k: 88-92 / 306-312 / 596-613 before,
 695 after (chunks ~12 -> 10.2-11.0 s). Greedy chat output on 7.5k / 2.8k-token prompts stays
 coherent and diverges from earlier runs no sooner than runs of the old path diverge from
 each other. The prefill log now also reports how long the main thread waited on reads.
+
+## What idle is left in a warm long chunk (2026-09-26)
+
+Stack-free timeline, warm 7.5k chunk: compute stream busy 9.28 of 11.23 s. Idle 1.95 s:
+0.48 s in ~100k sub-10 us launch gaps (only fewer kernels shrinks this), ~0.3 s behind
+expert copies whose reads finish late (a third look-ahead buffer would hide it), ~0.15 s in
+the grouped MoE's host syncs, and ~0.6-0.9 s of Python host time spread over thousands of
+30 us-1 ms gaps.
+
+The grouped MoE now syncs once per layer (a fixed-size `bincount` instead of
+`unique_consecutive`, which synced for its own output size) and plans every group's padded
+rows on the host in one pass, gathering tokens and routing weights once per layer; each
+group launches ~9 ops instead of ~17. Interleaved A/B (2 x 5 runs each): 2.5k prompts
+308/325 -> 332/339 tok/s (smaller groups, where host overhead showed), 7.5k 685/666 ->
+678/653 (GPU-bound, within noise).
