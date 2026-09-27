@@ -215,6 +215,7 @@ def parse_args(
         if (
             "qwen3_5" in marker
             or "qwen3.5" in marker
+            or "qwen35" in marker  # GGUF arch / model_type: qwen35moe
             or ("qwen3" in marker and "coder" in marker)
         ):
             return "qwen3_coder"

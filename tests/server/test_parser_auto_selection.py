@@ -88,6 +88,8 @@ def test_qwen3_5_is_not_shadowed_by_the_generic_qwen_branch():
     ``"qwen" -> qwen25`` reached earlier would swallow every later Qwen and lose its tool format."""
     assert _inferred("Qwen3_5MoeForConditionalGeneration")[0] == "qwen3_coder"
     assert _inferred("Qwen3_5ForConditionalGeneration")[0] == "qwen3_coder"
+    # the GGUF spelling (arch / model_type "qwen35moe") has no underscore
+    assert _inferred("Qwen35MoeGGUFForCausalLM")[0] == "qwen3_coder"
     assert _inferred("Qwen3MoeForCausalLM")[0] == "qwen25"
 
 
