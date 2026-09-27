@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from freetoken.layers.q8_act import attach, wants_q8
+from freetoken.moe import route_bias
 from freetoken.layers import (
     BaseOP,
     LinearColParallelMerged,
@@ -108,6 +109,7 @@ class Qwen3_5MoE(BaseOP):
             shared_gate = self.shared_expert_gate.forward(hidden_states)
         else:
             router_logits, shared_gate = fused
+        router_logits = route_bias.apply(self.experts, router_logits)
         shared = self.shared_expert.forward(hidden_states)
         shared = shared * torch.sigmoid(shared_gate)
         routed = self.experts.forward(hidden_states=hidden_states, router_logits=router_logits)
