@@ -32,3 +32,19 @@ def test_zero_margin_keeps_the_router_choice(monkeypatch):
     ref_ids, ref_w = _weights(logits, 8)
     assert torch.equal(ids, ref_ids)
     torch.testing.assert_close(w, ref_w)
+
+
+def test_prefill_batches_use_the_prefill_bias(monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(moe, "_ROUTE_BIAS", 1.0)
+    monkeypatch.setattr(moe, "_PREFILL_BIAS", 0.0)
+    resident = torch.tensor([[-1, -1, 0, 1]], dtype=torch.int32)  # experts 2, 3 cached
+    experts = SimpleNamespace(top_k=2, layer_id=0, offload_cache=SimpleNamespace(slot_for_id=resident))
+    decode = torch.tensor([[4.0, 3.0, 2.5, 1.0]])
+    prefill = decode.expand(9, 4)  # more rows than a decode / verify batch
+
+    assert sorted(_weights(moe.apply(experts, decode), 2)[0][0].tolist()) == [0, 2]
+    assert sorted(_weights(moe.apply(experts, prefill), 2)[0][0].tolist()) == [0, 1]  # unbiased
+    monkeypatch.setattr(moe, "_PREFILL_BIAS", 1.0)
+    assert sorted(_weights(moe.apply(experts, prefill), 2)[0][0].tolist()) == [0, 2]
