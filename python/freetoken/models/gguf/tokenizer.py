@@ -44,20 +44,30 @@ def load_gguf_tokenizer(model_path: str):
     # the vocab but the converted encoder does not pattern-match them, so a chat
     # template's markers (<|im_start|>, harmony <|channel|>/<|message|>, ...) would
     # tokenize as raw bytes -- the model then sees (and mimics) byte-framing, and
-    # downstream channel/stop parsing breaks.
+    # downstream channel/stop parsing breaks. User-defined tokens (token_type == 4:
+    # Qwen's <think>, </think>, <tool_call>, ...) need the same matching, but stay
+    # non-special so decoding keeps them in the text the reasoning and tool-call
+    # parsers read -- the HF tokenizer.json's added_tokens with special=false.
     token_types = tok_dict.get("token_type")
     if token_types is not None:
         from tokenizers import AddedToken
 
-        specials = []
+        specials, user_defined = [], []
         for t, ty in zip(tokens, token_types):
-            if int(ty) != 3:  # gguf TokenType.CONTROL
+            ty = int(ty)
+            if ty not in (3, 4):  # gguf TokenType.CONTROL, USER_DEFINED
                 continue
             if isinstance(t, bytes):
                 t = t.decode("utf-8", errors="replace")
-            specials.append(AddedToken(t, special=True, normalized=False))
+            if ty == 3:
+                specials.append(AddedToken(t, special=True, normalized=False))
+            else:
+                user_defined.append(AddedToken(t, special=False, normalized=False))
+        # existing vocab entries keep their ids
         if specials:
-            fast.add_special_tokens(specials)  # existing vocab entries keep their ids
+            fast.add_special_tokens(specials)
+        if user_defined:
+            fast.add_tokens(user_defined)
 
     # The converted rust tokenizer has no BOS post-processor, so encode(...,
     # add_special_tokens=True) silently drops the BOS that GGUF's
