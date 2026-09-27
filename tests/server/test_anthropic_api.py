@@ -228,27 +228,69 @@ def test_convert_thinking_replay_in_tool_loop():
     assert spec.messages[2]["role"] == "tool"
 
 
-def test_convert_hoists_and_merges_system_messages():
-    # Claude Code interleaves system messages mid-array; strict chat templates
-    # (e.g. Qwen3.5: "System message must be at the beginning") require ONE system
-    # message at the front. Merge top-level system + in-array system, hoist to front.
+def test_convert_merges_leading_system_messages():
+    # Strict chat templates (e.g. Qwen3.5: "System message must be at the beginning")
+    # require ONE system message at the front: top-level system and system messages
+    # before the conversation starts merge into it.
     req = AnthropicMessagesRequest.model_validate(
         {
             "model": "claude-x",
             "max_tokens": 64,
             "system": "top-level sys",
             "messages": [
+                {"role": "system", "content": "leading sys"},
                 {"role": "user", "content": "hello"},
-                {"role": "system", "content": "mid-stream sys"},
-                {"role": "assistant", "content": "hi"},
             ],
         }
     )
     spec = A.convert_anthropic_to_genspec(req, {})
-    assert [m["role"] for m in spec.messages] == ["system", "user", "assistant"]
-    assert sum(1 for m in spec.messages if m["role"] == "system") == 1
-    assert "top-level sys" in spec.messages[0]["content"]
-    assert "mid-stream sys" in spec.messages[0]["content"]
+    assert [m["role"] for m in spec.messages] == ["system", "user"]
+    assert spec.messages[0]["content"] == "top-level sys\n\nleading sys"
+
+
+def test_convert_keeps_mid_conversation_system_messages_in_place():
+    # Claude Code appends a system reminder every turn. Hoisting it to the front would
+    # rewrite the start of the prompt each turn, so a hybrid prefix cache (which only
+    # resumes a prompt that extends the previous one) would never hit. Fold each one
+    # into the message it follows instead, leaving the front system message unchanged.
+    def messages(n_turns):
+        msgs = [{"role": "user", "content": "list files"}]
+        for i in range(n_turns):
+            msgs += [
+                {"role": "assistant", "content": [{"type": "tool_use", "id": f"t{i}", "name": "ls", "input": {}}]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": f"t{i}", "content": f"out{i}"}]},
+                {"role": "system", "content": f"<total_tokens>{900 - i}</total_tokens>"},
+            ]
+        return msgs
+
+    def convert(n_turns):
+        req = AnthropicMessagesRequest.model_validate(
+            {"model": "claude-x", "max_tokens": 64, "system": "sys", "messages": messages(n_turns)}
+        )
+        return A.convert_anthropic_to_genspec(req, {}).messages
+
+    one, two = convert(1), convert(2)
+    assert [m["role"] for m in two] == ["system", "user", "assistant", "tool", "assistant", "tool"]
+    assert two[0]["content"] == "sys"
+    assert two[3]["content"] == "out0\n\n<total_tokens>900</total_tokens>"
+    assert two[: len(one)] == one  # the longer conversation extends the shorter one
+
+
+def test_convert_system_message_after_assistant_becomes_user_turn():
+    req = AnthropicMessagesRequest.model_validate(
+        {
+            "model": "claude-x",
+            "max_tokens": 64,
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "hi"},
+                {"role": "system", "content": "reminder"},
+            ],
+        }
+    )
+    spec = A.convert_anthropic_to_genspec(req, {})
+    assert [m["role"] for m in spec.messages] == ["user", "assistant", "user"]
+    assert spec.messages[2]["content"] == "reminder"
 
 
 # --------------------------------------------------------------------------- #

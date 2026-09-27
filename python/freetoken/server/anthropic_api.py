@@ -182,9 +182,13 @@ def convert_anthropic_prompt(
     """(messages, template_tools, parser_tools, chat_template_kwargs) — the prompt
     side of the conversion, shared by /v1/messages and /v1/messages/count_tokens so
     a counted prompt is exactly the prompt a generation would tokenize."""
-    # Collect all system content (top-level `system` + any system-role messages
-    # Claude Code interleaves in the array) and emit ONE system message at the
-    # front: strict chat templates (e.g. Qwen3.5) require system at the beginning.
+    # Collect the leading system content (top-level `system` + system-role messages
+    # before the conversation starts) and emit ONE system message at the front:
+    # strict chat templates (e.g. Qwen3.5) require system at the beginning. System
+    # messages Claude Code interleaves later (per-turn reminders) stay where they
+    # are, folded into the message they follow: hoisting them rewrites the front
+    # of the prompt every turn, and a hybrid (GDN/SWA) prefix cache can only resume
+    # a prompt that extends the previous one.
     system_texts: list[str] = []
     if req.system:
         if isinstance(req.system, str):
@@ -197,7 +201,10 @@ def convert_anthropic_prompt(
     other: list[dict[str, Any]] = []
     for msg in req.messages:
         if msg.role == "system":
-            system_texts.append(_content_text(msg.content))
+            if other:
+                _fold_system_text(other, _content_text(msg.content))
+            else:
+                system_texts.append(_content_text(msg.content))
             continue
 
         if isinstance(msg.content, str):
@@ -322,6 +329,20 @@ def convert_anthropic_to_genspec(
         template_tools=template_tools,
         parser_tools=parser_tools,
     )
+
+
+def _fold_system_text(messages: list[dict[str, Any]], text: str) -> None:
+    """Attach a mid-conversation system message to the user/tool message it follows,
+    or add it as a user message after an assistant turn."""
+    if not text:
+        return
+    last = messages[-1]
+    if last["role"] == "assistant":
+        messages.append({"role": "user", "content": text})
+    elif isinstance(last.get("content"), list):
+        last["content"].append({"type": "text", "text": text})
+    else:
+        last["content"] = f"{last.get('content') or ''}\n\n{text}"
 
 
 def _content_text(content) -> str:
