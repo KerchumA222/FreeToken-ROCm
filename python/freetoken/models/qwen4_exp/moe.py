@@ -15,6 +15,41 @@ if TYPE_CHECKING:
 _ROUTE_TRACE = os.environ.get("FT_ROUTE_TRACE", "")
 _route_rows: list = []
 
+# FT_ROUTE_BIAS=<logits>: at decode sizes, prefer experts already in the GPU cache. A
+# resident expert wins a top-k slot over a non-resident one whose router logit is within
+# this margin. Selection only: the chosen experts keep their own router weights.
+# Experimental -- it routes tokens to experts the router ranked lower.
+_ROUTE_BIAS = float(os.environ.get("FT_ROUTE_BIAS", "0") or 0)
+_ROUTE_BIAS_MAX_ROWS = 8
+
+
+def _bias_to_resident(logits: torch.Tensor, resident: torch.Tensor, top_k: int) -> torch.Tensor:
+    """Router logits whose top-k is the top-k of ``logits + bias * resident``, with every
+    other expert pushed far down, so the downstream softmax/top-k/renormalize weights the
+    chosen experts by their original logits. Device-only (graph-safe)."""
+    biased = logits + resident.to(logits.dtype) * _ROUTE_BIAS
+    chosen = biased.topk(top_k, dim=-1).indices
+    out = torch.full_like(logits, -1e4)
+    return out.scatter_(-1, chosen, logits.gather(-1, chosen))
+
+
+# FT_ROUTE_BIAS_TRACE=<path.pt>: per decode step and layer, the router's own top-k and the
+# experts actually used (after FT_ROUTE_BIAS), as int16 [rows, 2, k]. Eager only; it syncs.
+_BIAS_TRACE = os.environ.get("FT_ROUTE_BIAS_TRACE", "")
+_bias_rows: list = []
+
+
+def _record_bias_route(moe, raw: torch.Tensor, used: torch.Tensor) -> None:
+    from freetoken.core import get_global_ctx
+
+    if not get_global_ctx().batch.is_decode or torch.cuda.is_current_stream_capturing():
+        return
+    k = moe.experts.top_k
+    ids = torch.stack([raw.topk(k, dim=-1).indices, used.topk(k, dim=-1).indices], dim=1)
+    _bias_rows.append((moe.experts.layer_id, ids.to("cpu", torch.int16)))
+    if len(_bias_rows) % 4800 == 0:
+        torch.save(_bias_rows, _BIAS_TRACE)
+
 
 def _record_route(moe, x: torch.Tensor, logits: torch.Tensor) -> None:
     """FT_ROUTE_TRACE=<path.pt>: record each decode step's router input and routed ids per
@@ -83,6 +118,14 @@ class Qwen4ExpMoE(Qwen3_5MoE):
             _record_route(self, hidden_states, router_logits)
         if self._lookahead is not None:
             self._stage_lookahead(hidden_states)
+        raw_logits = router_logits
+        if _ROUTE_BIAS and num_tokens <= _ROUTE_BIAS_MAX_ROWS:
+            cache = getattr(self.experts, "offload_cache", None)
+            if cache is not None:
+                resident = cache.slot_for_id[self.experts.layer_id] >= 0
+                router_logits = _bias_to_resident(router_logits, resident, self.experts.top_k)
+        if _BIAS_TRACE:
+            _record_bias_route(self, raw_logits, router_logits)
         shared = self.shared_expert.forward(hidden_states)
         gate = shared_gate_sigmoid(hidden_states, self.shared_expert_gate.weight.view(-1))
         routed = self.experts.forward(hidden_states=hidden_states, router_logits=router_logits)
