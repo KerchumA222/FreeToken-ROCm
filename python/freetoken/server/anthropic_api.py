@@ -291,17 +291,19 @@ def convert_anthropic_prompt(
         selected = req.tool_choice.name if (req.tool_choice and req.tool_choice.type == "tool") else None
         template_tools, parser_tools = split_tool_lists(raw_tools, selected)
 
-    # Native extended-thinking toggle -> template kwargs, broadcast in every
+    # Native extended-thinking toggle and effort -> template kwargs, broadcast in every
     # spelling the ecosystem's templates read (a bare enable_thinking bool is
     # inert for templates that read a different knob, e.g. M3's thinking_mode).
-    from .model_meta import thinking_toggle_kwargs
+    # An explicit chat_template_kwargs thinking key wins over both.
+    from .model_meta import effort_toggle_kwargs
 
-    ctk: dict[str, Any] = {}
-    if req.thinking:
-        if req.thinking.get("type") == "enabled":
-            ctk = thinking_toggle_kwargs(True)
-        elif req.thinking.get("type") == "disabled":
-            ctk = thinking_toggle_kwargs(False)
+    thinking_type = (req.thinking or {}).get("type")
+    if thinking_type not in ("enabled", "disabled"):
+        thinking_type = None
+    effort = (req.output_config or {}).get("effort")
+    ctk: dict[str, Any] = dict(req.chat_template_kwargs or {})
+    if thinking_type or effort:
+        ctk = effort_toggle_kwargs(effort, req.chat_template_kwargs, thinking_type)
 
     return render_messages(messages), template_tools, parser_tools, ctk
 

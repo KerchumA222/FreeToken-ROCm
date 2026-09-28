@@ -276,6 +276,33 @@ def test_convert_keeps_mid_conversation_system_messages_in_place():
     assert two[: len(one)] == one  # the longer conversation extends the shorter one
 
 
+def _ctk(extra):
+    req = AnthropicMessagesRequest.model_validate(
+        {"model": "claude-x", "max_tokens": 64, "messages": [{"role": "user", "content": "hi"}], **extra}
+    )
+    return A.convert_anthropic_to_genspec(req, {}).chat_template_kwargs
+
+
+def test_output_config_effort_reaches_the_template():
+    ctk = _ctk({"thinking": {"type": "enabled"}, "output_config": {"effort": "medium"}})
+    assert ctk["reasoning_effort"] == "medium"
+    assert ctk["enable_thinking"] is True
+
+
+def test_chat_template_kwargs_effort_wins_over_output_config():
+    ctk = _ctk({
+        "thinking": {"type": "enabled"},
+        "output_config": {"effort": "high"},
+        "chat_template_kwargs": {"reasoning_effort": "medium"},
+    })
+    assert ctk == {"reasoning_effort": "medium"}
+
+
+def test_no_thinking_fields_leave_the_template_kwargs_alone():
+    assert _ctk({}) == {}
+    assert _ctk({"chat_template_kwargs": {"foo": 1}}) == {"foo": 1}
+
+
 def test_convert_system_message_after_assistant_becomes_user_turn():
     req = AnthropicMessagesRequest.model_validate(
         {
