@@ -254,6 +254,14 @@ _GLOBAL_PLUS_ONE = {
 _PLE_TABLE = "per_layer_token_embd.weight"
 
 
+def _served_type(stored: int, bank: int) -> int:
+    """The type a layer's experts are served in: their own when the expert kernel
+    implements it (per-layer types), else the bank's promotion type."""
+    from freetoken.models.qwen3_5_moe.gguf import _MOE_VEC_TYPES
+
+    return stored if stored in _MOE_VEC_TYPES else bank
+
+
 def _pad_rows(n: int, align: int) -> int:
     return (-n) % align
 
@@ -275,7 +283,7 @@ def gguf_module_types(
         _v_head_permutation,
     )
 
-    _per_layer, bank_types = _expert_types(model_path)
+    per_layer_types, bank_types = _expert_types(model_path)
     globals_: dict[str, int] = {}
     by_layer: dict[int, dict[str, int]] = {}
     for t in iter_gguf_tensors(model_path):
@@ -340,7 +348,10 @@ def gguf_module_types(
         # the only carrier that survives the engine's dataclasses.replace) agrees with
         # the loader on a checkpoint whose layers disagree and get promoted.
         if all(s in types for s in _EXPERT_SUFFIXES):
-            out[stem + "mlp.experts"] = (name(bank_types["gate_up"]), name(bank_types["down"]))
+            out[stem + "mlp.experts"] = (
+                name(_served_type(per_layer_types["ffn_gate_exps.weight"][layer], bank_types["gate_up"])),
+                name(_served_type(per_layer_types["ffn_down_exps.weight"][layer], bank_types["down"])),
+            )
         for module, (parts, _align) in _ROW_CONCAT.items():
             got = [types.get(p) for p in parts]
             # One buffer, so one block layout: the parts must agree on a packable type
@@ -354,15 +365,17 @@ def gguf_module_types(
         # written as model.layers.<n>.* -- nothing would look them up. Only the routed
         # bank: the head's dense tensors are delivered dequantized by
         # iter_gguf_mtp_weights, and claiming them packed would build modules that expect
-        # block bytes and then be handed bf16. The bank types stay the trunk's, which is
-        # what the loader requantizes the draft block's tensors to.
+        # block bytes and then be handed bf16. The head's experts are served in their own
+        # types when the expert kernel implements them (as every trunk layer is), else in
+        # the trunk bank's promotion type, which is what the loaders then requantize to.
         draft_types: dict[str, int] = {}
         for t in iter_gguf_tensors(draft_path):
             if t.name.startswith("blk.") and "_exps." in t.name:
                 draft_types[t.name.split(".", 2)[2]] = t.ggml_type
         if all(sfx in draft_types for sfx in _EXPERT_SUFFIXES):
             out["mtp.layer.mlp.experts"] = (
-                name(bank_types["gate_up"]), name(bank_types["down"])
+                name(_served_type(draft_types["ffn_gate_exps.weight"], bank_types["gate_up"])),
+                name(_served_type(draft_types["ffn_down_exps.weight"], bank_types["down"])),
             )
     return out
 
@@ -431,6 +444,7 @@ def iter_gguf_weights(
     from freetoken.models.gguf.reader import iter_gguf_tensors, load_gguf_metadata
     from freetoken.models.qwen3_5_moe.gguf import (
         _is_full_attention,
+        _is_packable,
         _permute_head_rows,
         _require_tp1,
         _v_head_permutation,
@@ -587,7 +601,11 @@ def iter_gguf_weights(
                 continue
             i = slots.index(suffix)
             is_packed = stem + module in packed
-            val = t.packed() if is_packed else _to_bf16(t)
+            # A packed (mixed) fusion keeps each slot in its own form: an unpackable slot
+            # (e.g. Unsloth's F32 ssm_beta beside Q6_K siblings) is delivered dense, not
+            # as raw bytes.
+            slot_packed = is_packed and _is_packable(t.ggml_type)
+            val = t.packed() if slot_packed else _to_bf16(t)
             # Above the packed/dense split, not inside the dense arm: every one of
             # these is a permutation of whole ROWS, and a block-quantized row is
             # self-contained, so it applies to the packed bytes unchanged. Keeping it

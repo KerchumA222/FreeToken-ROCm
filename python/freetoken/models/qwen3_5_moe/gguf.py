@@ -189,11 +189,16 @@ def _head_count(value, what: str) -> int:
 
 def _expert_types(model_path: str) -> tuple[dict[str, dict[int, int]], dict[str, int]]:
     """Per-layer ggml types of the routed expert tensors, and the resolved bank
-    type per bank (uniform type, else Q8_0 promotion)."""
+    type per bank: the uniform type; else, when every layer's type has an expert
+    kernel, the first layer's (each layer is then served in its own type); else Q5_1
+    promotion."""
     per: dict[str, dict[int, int]] = {s: {} for s in _EXPERT_SUFFIXES}
+    cols: dict[str, int] = {}
     for t in iter_gguf_tensors(model_path):
         if t.name.startswith("blk.") and t.name.split(".", 2)[2] in per:
-            per[t.name.split(".", 2)[2]][int(t.name.split(".")[1])] = t.ggml_type
+            suffix = t.name.split(".", 2)[2]
+            per[suffix][int(t.name.split(".")[1])] = t.ggml_type
+            cols[suffix] = int(t.shape[-1])
 
     # Mixed-type banks are requantized to one type at load; gguf-py can only
     # quantize the classic types, so Q5_1 (6 bpw) is the default promotion target
@@ -207,6 +212,10 @@ def _expert_types(model_path: str) -> tuple[dict[str, dict[int, int]], dict[str,
     def resolve(types: set[int], what: str) -> int:
         if len(types) == 1:
             return next(iter(types))
+        if types <= _MOE_VEC_TYPES:
+            # Every layer's type has an expert kernel: serve each layer in its own type
+            # (the dialect carries it per layer) from banks sized for the widest one.
+            return -1
         names = sorted(GGML_NAME.get(t, str(t)) for t in types)
         logger.warning(
             "qwen35moe GGUF: %s experts mix %s across layers -> requantizing the "
@@ -221,7 +230,40 @@ def _expert_types(model_path: str) -> tuple[dict[str, dict[int, int]], dict[str,
         "gate_up": resolve(gate_types | up_types, "gate/up"),
         "down": resolve(set(per["ffn_down_exps.weight"].values()), "down"),
     }
+    if -1 in bank.values():
+        mixed = [layer for layer in per["ffn_gate_exps.weight"]
+                 if per["ffn_gate_exps.weight"][layer] != per["ffn_up_exps.weight"][layer]]
+        assert not mixed, f"gate and up experts differ in type in layers {mixed}"
+        first = min(per["ffn_gate_exps.weight"])
+        from freetoken.layers.quantization.moe.gguf import set_bank_row_bytes
+
+        set_bank_row_bytes(
+            max(row_bytes(cols["ffn_gate_exps.weight"], t) for t in gate_types | up_types),
+            max(row_bytes(cols["ffn_down_exps.weight"], t)
+                for t in per["ffn_down_exps.weight"].values()),
+        )
+        logger.info(
+            "GGUF experts: per-layer types (gate/up %s, down %s), banks sized for the widest",
+            sorted(GGML_NAME[t] for t in gate_types | up_types),
+            sorted(GGML_NAME[t] for t in set(per["ffn_down_exps.weight"].values())),
+        )
+        # the bank's nominal type: the first layer's (what readers of layer 0 see)
+        bank = {
+            "gate_up": per["ffn_gate_exps.weight"][first] if bank["gate_up"] == -1 else bank["gate_up"],
+            "down": per["ffn_down_exps.weight"][first] if bank["down"] == -1 else bank["down"],
+        }
     return per, bank
+
+
+# ggml types the MoE vector kernel (ggml_moe_a8_vec) implements.
+_MOE_VEC_TYPES = frozenset({42, 10042, 2, 3, 6, 7, 8, 10, 11, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22, 23, 29})
+
+
+def expert_layer_types(model_path: str) -> dict[int, tuple[int, int]]:
+    """layer -> (gate_up, down) ggml types as stored."""
+    per, _ = _expert_types(model_path)
+    return {layer: (per["ffn_gate_exps.weight"][layer], per["ffn_down_exps.weight"][layer])
+            for layer in per["ffn_gate_exps.weight"]}
 
 
 def parse_gguf_config(shim: "GgufConfigShim") -> "ModelConfig":
@@ -670,13 +712,30 @@ def _bank_types(config: "ModelConfig") -> dict[str, int]:
 
 
 def _expert_specs(config: "ModelConfig") -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
+    from freetoken.layers.quantization.moe.gguf import _ROW_BYTES_MAX
+
     E = config.num_experts
     H, I = config.hidden_size, config.moe_intermediate_size
     types = _bank_types(config)
     return {
-        "gate_up": ((E, 2 * I, row_bytes(H, types["gate_up"])), torch.uint8),
-        "down": ((E, H, row_bytes(I, types["down"])), torch.uint8),
+        "gate_up": ((E, 2 * I, max(row_bytes(H, types["gate_up"]), _ROW_BYTES_MAX.get("gate_up", 0))), torch.uint8),
+        "down": ((E, H, max(row_bytes(I, types["down"]), _ROW_BYTES_MAX.get("down", 0))), torch.uint8),
     }
+
+
+def _served(t: GgufTensor, bank_type: int) -> torch.Tensor:
+    """``t``'s packed bytes in the type its layer is served in: its own when the expert
+    kernel implements it (per-layer types), else the bank type (requantized)."""
+    return _packed_as(t, t.ggml_type if t.ggml_type in _MOE_VEC_TYPES else bank_type)
+
+
+def _put_flat(dst: torch.Tensor, src: torch.Tensor, offset: int = 0) -> None:
+    """Write ``src`` ([E, ...] bytes) into each expert of ``dst`` ([E, rows, width]) as
+    one contiguous run starting ``offset`` bytes into the expert. With ``src`` rows of
+    the bank's own width this is the same bytes as a row copy; a narrower layer's
+    expert simply occupies the start of its slot."""
+    n = src[0].numel()
+    dst.view(dst.shape[0], -1)[:, offset:offset + n].copy_(src.reshape(src.shape[0], -1))
 
 
 def _packed_as(t: GgufTensor, target_type: int) -> torch.Tensor:
@@ -715,8 +774,6 @@ def load_q4_0_expert_sources(
     L, E = (config.num_addressable_layers if num_layers is None else num_layers), config.num_experts
     H, I = config.hidden_size, config.moe_intermediate_size
     types = _bank_types(config)
-    gu_bytes = row_bytes(H, types["gate_up"])
-    dn_bytes = row_bytes(I, types["down"])
     hb = alloc_layer_banks(_expert_specs(config), L)  # lazy anon mmaps (unpinned)
     banks = {name: [b.tensor for b in hb[name]] for name in hb}
     seen: dict[str, set[int]] = {s: set() for s in _EXPERT_SUFFIXES}
@@ -738,17 +795,12 @@ def load_q4_0_expert_sources(
             if layer >= L:
                 continue
             if suffix == "ffn_gate_exps.weight":
-                banks["gate_up"][layer][:, :I].copy_(
-                    _packed_as(t, types["gate_up"]).reshape(E, I, gu_bytes)
-                )
+                _put_flat(banks["gate_up"][layer], _served(t, types["gate_up"]).reshape(E, -1))
             elif suffix == "ffn_up_exps.weight":
-                banks["gate_up"][layer][:, I:].copy_(
-                    _packed_as(t, types["gate_up"]).reshape(E, I, gu_bytes)
-                )
+                half = _served(t, types["gate_up"]).reshape(E, -1)
+                _put_flat(banks["gate_up"][layer], half, offset=half.shape[1])
             else:
-                banks["down"][layer].copy_(
-                    _packed_as(t, types["down"]).reshape(E, H, dn_bytes)
-                )
+                _put_flat(banks["down"][layer], _served(t, types["down"]).reshape(E, -1))
             seen[suffix].add(layer)
             releaser.note(t.rows * t.row_bytes)
             if tracker is not None:
@@ -882,8 +934,6 @@ def iter_gguf_expert_pieces(model_path: str, config, *, parallel: bool = False,
     L, E = config.num_addressable_layers, config.num_experts
     H, I = config.hidden_size, config.moe_intermediate_size
     types = _bank_types(config)
-    gu_bytes = row_bytes(H, types["gate_up"])
-    dn_bytes = row_bytes(I, types["down"])
 
     pending: dict[int, dict[str, torch.Tensor]] = {}
     for t in _iter_expert_tensors(model_path, config):
@@ -897,9 +947,9 @@ def iter_gguf_expert_pieces(model_path: str, config, *, parallel: bool = False,
             continue
         buf = pending.setdefault(layer, {})
         if suffix == "ffn_down_exps.weight":
-            buf["down"] = _packed_as(t, types["down"]).reshape(E, H, dn_bytes)
+            buf["down"] = _served(t, types["down"]).reshape(E, H, -1)
         else:
-            half = _packed_as(t, types["gate_up"]).reshape(E, I, gu_bytes)
+            half = _served(t, types["gate_up"]).reshape(E, I, -1)
             buf["gate" if suffix == "ffn_gate_exps.weight" else "up"] = half
         if len(buf) == 3:
             del pending[layer]

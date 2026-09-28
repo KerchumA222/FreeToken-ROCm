@@ -157,18 +157,26 @@ class GgufExpertStore:
         ``gate_up`` stacks its two parts (gate rows then up rows) into a single row
         axis, which is the layout ``silu_and_mul`` expects.
         """
-        layer = self.layers(bank)[0]
-        parts = [self._part(s, layer) for s in _BANK_PARTS[bank]]
-        row_bytes = {p.row_bytes for p in parts}
-        if len(row_bytes) != 1:
-            raise ValueError(f"bank {bank!r} parts disagree on row_bytes: {row_bytes}")
-        return sum(p.rows_per_expert for p in parts), next(iter(row_bytes))
+        widest = 0
+        for layer in self.layers(bank):
+            parts = [self._part(s, layer) for s in _BANK_PARTS[bank]]
+            row_bytes = {p.row_bytes for p in parts}
+            if len(row_bytes) != 1:
+                raise ValueError(f"bank {bank!r} layer {layer} parts disagree on row_bytes: {row_bytes}")
+            rows = sum(p.rows_per_expert for p in parts)
+            # Layers may differ in type (per-layer expert types); a slot is sized for
+            # the widest and a narrower expert is one contiguous run at its start.
+            widest = max(widest, next(iter(row_bytes)))
+        return rows, widest
 
-    def expert_bytes(self, bank: str) -> int:
-        return sum(
-            p.rows_per_expert * p.row_bytes
-            for p in (self._part(s, self.layers(bank)[0]) for s in _BANK_PARTS[bank])
-        )
+    def expert_bytes(self, bank: str, layer: int | None = None) -> int:
+        """Bytes of one expert of ``layer`` as stored, or of a bank slot (the widest
+        layer's) when ``layer`` is None."""
+        if layer is None:
+            rows, row_bytes = self.row_shape(bank)
+            return rows * row_bytes
+        return sum(p.rows_per_expert * p.row_bytes
+                   for p in (self._part(s, layer) for s in _BANK_PARTS[bank]))
 
     def requantized_layers(self) -> dict[str, tuple[int, ...]]:
         """(bank -> layers) whose on-disk type differs from the resolved bank type.
@@ -182,12 +190,14 @@ class GgufExpertStore:
             want = self._bank_types.get(bank)
             if want is None:
                 continue
+            # one type for the bank, or {layer: type} when layers are served per type
+            want_of = want.get if isinstance(want, dict) else (lambda _layer, w=want: w)
             bad = sorted(
                 {
                     layer
                     for suffix in parts
                     for (s, layer), p in self._parts.items()
-                    if s == suffix and p.ggml_type != want
+                    if s == suffix and want_of(layer) not in (None, p.ggml_type)
                 }
             )
             if bad:
@@ -250,7 +260,8 @@ class GgufExpertStore:
         mv = memoryview(dst).cast("B")
         ext = self.extents(bank, layer, expert)
         total = sum(e.nbytes for e in ext)
-        if len(mv) != total:
+        # A slot sized for a wider layer holds this expert at its start.
+        if len(mv) < total:
             raise ValueError(f"destination is {len(mv)} bytes, expert needs {total}")
         for e in ext:
             got = os.preadv(self._fd(e.path), [mv[e.dst_offset : e.dst_offset + e.nbytes]], e.offset)
@@ -280,16 +291,17 @@ class GgufExpertStore:
             raise ValueError(
                 f"destination {arr.shape} != ({self.num_experts}, {rows}, {row_bytes})"
             )
-        reads, row0 = 0, 0
+        reads, off = 0, 0
+        flat = arr.reshape(self.num_experts, -1)
         for suffix in _BANK_PARTS[bank]:
             p = self._part(suffix, layer)
             part_rows = p.rows_per_expert
+            span = part_rows * p.row_bytes
             # One iovec per expert: the file range is contiguous across experts, the
-            # destination is not.
-            iov = [
-                memoryview(arr[e, row0 : row0 + part_rows]).cast("B")
-                for e in range(self.num_experts)
-            ]
+            # destination is not. Each expert is one run of this layer's own row width
+            # from the start of its slot (the same bytes as a row slice when the layer
+            # is the widest).
+            iov = [memoryview(flat[e, off : off + span]).cast("B") for e in range(self.num_experts)]
             want = self.num_experts * part_rows * p.row_bytes
             got = os.preadv(self._fd(p.path), iov, p.data_offset)
             if got != want:
@@ -297,7 +309,7 @@ class GgufExpertStore:
                     f"short read: {got} of {want} at {p.data_offset} in {p.path}"
                 )
             reads += 1
-            row0 += part_rows
+            off += span
         return reads
 
     def layer_bytes(self, bank: str) -> int:

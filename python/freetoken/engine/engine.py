@@ -665,13 +665,34 @@ class Engine:
         from freetoken.models.gguf.dequant import GGML_NAME
 
         _by_name = {name: t for t, name in GGML_NAME.items()}
-        _names = scheme.weight.elem.split("+")
-        _gu, _dn = (_names * 2)[:2] if len(_names) == 1 else _names[:2]
-        bank_types = {"gate_up": _by_name[_gu], "down": _by_name[_dn]}
+
+        def _served(key: str) -> tuple[int, int] | None:
+            s = mc.quant.scheme_for(key)
+            if s is None or s.kind is not QuantKind.GGUF:
+                return None
+            names = s.weight.elem.split("+")
+            gu, dn = (names * 2)[:2] if len(names) == 1 else names[:2]
+            return _by_name[gu], _by_name[dn]
+
+        # The type each layer's experts are served in, per the dialect -- its own type
+        # when layers differ (per-layer expert types). A layer the store holds that the
+        # dialect does not name (none today) is not checked.
+        per_layer: dict[str, dict[int, int]] = {"gate_up": {}, "down": {}}
+        for layer in range(mc.num_addressable_layers):
+            key = (f"model.layers.{layer}.mlp.experts" if layer < mc.num_moe_layers
+                   else "mtp.layer.mlp.experts")
+            served = _served(key)
+            if served is not None:
+                per_layer["gate_up"][layer], per_layer["down"][layer] = served
         store = GgufExpertStore(
-            config.model_path, mc.num_experts, bank_types, mc.num_addressable_layers,
+            config.model_path, mc.num_experts, per_layer, mc.num_addressable_layers,
             draft_path=mc.speculative_draft_path,
         )
+        # Banks, slots and the kernel layout are sized for the widest layer (the draft
+        # head's included); see freetoken.layers.quantization.moe.gguf._ROW_BYTES_MAX.
+        from freetoken.layers.quantization.moe.gguf import set_bank_row_bytes
+
+        set_bank_row_bytes(store.row_shape("gate_up")[1], store.row_shape("down")[1])
         requantized = store.requantized_layers()
         if requantized:
             raise ValueError(
