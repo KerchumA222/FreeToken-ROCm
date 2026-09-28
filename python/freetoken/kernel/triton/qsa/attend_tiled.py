@@ -259,6 +259,8 @@ def _masked_softmax_kernel(s_ptr, mask_ptr, p_ptr, length, kvh_tq_group, tq_grou
 # Rows per tile of the GEMM formulation, and tiles per batched GEMM.
 _GEMM_TQ = 32
 _GEMM_GROUP = 8
+# Cap on one batched GEMM's scores + probabilities + gathered K/V.
+_GEMM_BYTES = 128 << 20
 
 
 def qsa_gemm_attention(
@@ -289,23 +291,39 @@ def qsa_gemm_attention(
         pages = block_table.index_select(0, reqs).gather(1, union.long()).long().view(-1)
         length = u_max * BLOCK_TOKENS
         heads = torch.arange(group, device=q.device)
-        for h in range(kvh):
-            # Gathers land in GEMM layout directly: permuting a gathered [page, token,
-            # head, dim] block ran at ~26 GB/s and cost more than the GEMMs.
-            kg = k_cache[:, :, h, :].index_select(0, pages).view(g, length, dim)
-            vg = v_cache[:, :, h, :].index_select(0, pages).view(g, length, dim)
-            flat = (row_ids[:, :, None] * hq + h * group + heads[None, None, :]).view(-1)
-            qg = q.view(t * hq, dim).index_select(0, flat).view(g, tq * group, dim)
-            s = torch.bmm(qg, kg.transpose(1, 2))                    # [G, TQ*GROUP, L]
-            p = torch.empty_like(s)
-            _masked_softmax_kernel[(s.numel() // length,)](
-                s, mask, p, length, tq * group, tq * group, group, tq, scale,
-                BLOCK=triton.next_power_of_2(length), num_warps=8,
-            )
-            del s
-            o = torch.bmm(p, vg)                                     # [G, TQ*GROUP, D]
-            out.view(t * hq, dim).index_copy_(0, flat, o.view(-1, dim))
+        # The union spans up to the whole context, so a tile's scores, probabilities and
+        # gathered K/V grow with it; run as many tiles per GEMM as fit the byte budget
+        # (an 8-tile group OOMed a 16 GB card at ~69k context).
+        tile_bytes = (2 * tq * group + 2 * dim) * length * q.element_size()
+        per = max(1, min(g, _GEMM_BYTES // tile_bytes))
+        pages = pages.view(g, u_max)
+        for s0 in range(0, g, per):
+            s1 = min(g, s0 + per)
+            _gemm_tiles(q, k_cache, v_cache, out, pages[s0:s1].reshape(-1), mask[s0:s1],
+                        row_ids[s0:s1], heads, kvh, group, tq, length, dim, scale)
     return out
+
+
+def _gemm_tiles(q, k_cache, v_cache, out, pages, mask, row_ids, heads, kvh, group, tq,
+                length, dim, scale):
+    t, hq, _ = q.shape
+    g = row_ids.shape[0]
+    for h in range(kvh):
+        # Gathers land in GEMM layout directly: permuting a gathered [page, token,
+        # head, dim] block ran at ~26 GB/s and cost more than the GEMMs.
+        kg = k_cache[:, :, h, :].index_select(0, pages).view(g, length, dim)
+        vg = v_cache[:, :, h, :].index_select(0, pages).view(g, length, dim)
+        flat = (row_ids[:, :, None] * hq + h * group + heads[None, None, :]).view(-1)
+        qg = q.view(t * hq, dim).index_select(0, flat).view(g, tq * group, dim)
+        s = torch.bmm(qg, kg.transpose(1, 2))                    # [G, TQ*GROUP, L]
+        p = torch.empty_like(s)
+        _masked_softmax_kernel[(s.numel() // length,)](
+            s, mask, p, length, tq * group, tq * group, group, tq, scale,
+            BLOCK=triton.next_power_of_2(length), num_warps=8,
+        )
+        del s
+        o = torch.bmm(p, vg)                                     # [G, TQ*GROUP, D]
+        out.view(t * hq, dim).index_copy_(0, flat, o.view(-1, dim))
 
 
 __all__ += ["qsa_gemm_attention"]
