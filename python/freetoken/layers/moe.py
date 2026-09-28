@@ -140,7 +140,7 @@ class MoELayer(BaseOP):
             renormalize=self.renormalize,
         )
         if expert_remap.enabled():
-            topk_ids = expert_remap.apply(self.layer_id, topk_ids)
+            topk_weights, topk_ids = expert_remap.apply(self.layer_id, topk_weights, topk_ids)
         return self._maybe_all_reduce(self._resident_gemm(hidden_states, topk_weights, topk_ids))
 
 
@@ -264,7 +264,7 @@ class OffloadMoELayer(MoELayer):
             renormalize=self.renormalize,
         )
         if expert_remap.enabled():
-            topk_ids = expert_remap.apply(self.layer_id, topk_ids)
+            topk_weights, topk_ids = expert_remap.apply(self.layer_id, topk_weights, topk_ids)
         return self._decode_routed(hidden_states, topk_weights, topk_ids)
 
     def prefill_forward(
@@ -279,7 +279,7 @@ class OffloadMoELayer(MoELayer):
             renormalize=self.renormalize,
         )
         if expert_remap.enabled():
-            topk_ids = expert_remap.apply(self.layer_id, topk_ids)
+            topk_weights, topk_ids = expert_remap.apply(self.layer_id, topk_weights, topk_ids)
         return self._prefill_routed(hidden_states, topk_weights, topk_ids)
 
     # ------------------------------------------------------------------
