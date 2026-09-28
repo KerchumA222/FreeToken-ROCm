@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING, Tuple
 import torch
 from freetoken.core import get_global_ctx
 from freetoken.distributed import DistributedCommunicator, get_tp_info
-from freetoken.moe import decode_trace, is_offload_moe_strategy
+from freetoken.moe import decode_trace, expert_remap, is_offload_moe_strategy
 from freetoken.moe.fused import fused_topk
 from freetoken.moe.offload_cache import OffloadMoeCache
 
@@ -139,6 +139,8 @@ class MoELayer(BaseOP):
             topk=self.top_k,
             renormalize=self.renormalize,
         )
+        if expert_remap.enabled():
+            topk_ids = expert_remap.apply(self.layer_id, topk_ids)
         return self._maybe_all_reduce(self._resident_gemm(hidden_states, topk_weights, topk_ids))
 
 
@@ -261,6 +263,8 @@ class OffloadMoELayer(MoELayer):
             topk=self.top_k,
             renormalize=self.renormalize,
         )
+        if expert_remap.enabled():
+            topk_ids = expert_remap.apply(self.layer_id, topk_ids)
         return self._decode_routed(hidden_states, topk_weights, topk_ids)
 
     def prefill_forward(
@@ -274,6 +278,8 @@ class OffloadMoELayer(MoELayer):
             topk=self.top_k,
             renormalize=self.renormalize,
         )
+        if expert_remap.enabled():
+            topk_ids = expert_remap.apply(self.layer_id, topk_ids)
         return self._prefill_routed(hidden_states, topk_weights, topk_ids)
 
     # ------------------------------------------------------------------
