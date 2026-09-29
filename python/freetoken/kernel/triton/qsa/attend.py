@@ -373,12 +373,16 @@ def qsa_sparse_paged_attention(
     else:
         block_n, target_splits, partial_warps = 64, 1, 2
 
+    if turboquant and base_programs <= small_profile_limit:
+        arch = getattr(torch.cuda.get_device_properties(q.device.index), "gcnArchName", "")
+        if arch.startswith("gfx1030"):
+            target_splits = 32
+
     # Those profiles were tuned on GB300, which has 228 KB of shared memory per SM.
     # The kernel stages q and the k/v tiles, roughly (block_m + 2 * block_n) *
     # head_dim * 2 bytes, so the 64-wide tile over this model's head_dim of 256 asks
     # for 66 KB -- past RDNA's 64 KB of LDS, and the launch fails outright rather than
-    # spilling. Narrow the tile until it fits; the split count is a scheduling choice
-    # and is left alone.
+    # spilling. Narrow the tile until it fits.
     budget = _smem_budget(q.device.index) * 0.8  # headroom for scores/acc/scratch
     if budget:
         while (
