@@ -2014,6 +2014,58 @@ def _adjust_config(config: EngineConfig):
     # comma part must serve every required type, with packages/arch available.
     required_attn_types = _required_attn_types(model_config)
     _dtype = getattr(config, "dtype", None)  # duck-typed test configs omit it
+    kv_cache_dtype = getattr(config, "kv_cache_dtype", "model")
+    if kv_cache_dtype not in ("model", "q8_0", "turboquant_4bit_nc"):
+        raise ValueError(
+            f"--kv-cache-dtype must be 'model', 'q8_0', or 'turboquant_4bit_nc', got {kv_cache_dtype!r}."
+        )
+    if kv_cache_dtype in ("q8_0", "turboquant_4bit_nc"):
+        quant_name = "TurboQuant 4-bit" if kv_cache_dtype == "turboquant_4bit_nc" else "Q8_0"
+        if _dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError(f"{quant_name} KV cache requires float16 or bfloat16 model compute.")
+        if kv_cache_dtype == "q8_0" and required_attn_types != frozenset({AttnType.FULL}):
+            raise ValueError(
+                "Q8_0 KV cache currently supports full-attention MHA/GQA models only; "
+                "SWA, sparse, and latent KV groups are unsupported."
+            )
+        qsa_turboquant = (
+            kv_cache_dtype == "turboquant_4bit_nc"
+            and AttnType.QSA in required_attn_types
+        )
+        if kv_cache_dtype == "turboquant_4bit_nc" and (
+            not required_attn_types <= {AttnType.FULL, AttnType.SWA, AttnType.QSA}
+            or (not qsa_turboquant and AttnType.FULL not in required_attn_types)
+            or (qsa_turboquant and required_attn_types != frozenset({AttnType.QSA}))
+        ):
+            raise ValueError(
+                "TurboQuant 4-bit supports full-attention MHA/GQA models, mixed FULL/SWA "
+                "models, and QSA models; SWA layers retain the model-dtype cache. Other "
+                "sparse and latent KV groups are unsupported."
+            )
+        bad_dims = sorted({
+            spec.head_dim for spec in model_config.kv_cache_group_specs()
+            if spec.num_layers and (
+                (kv_cache_dtype == "q8_0" and spec.head_dim % 32)
+                or (kv_cache_dtype == "turboquant_4bit_nc" and not spec.is_swa and (
+                    spec.head_dim % 2 or spec.head_dim & (spec.head_dim - 1)
+                ))
+            )
+        })
+        if bad_dims:
+            constraint = "divisible by 32" if kv_cache_dtype == "q8_0" else "a power of two"
+            raise ValueError(f"{quant_name} KV cache requires every full-attention head_dim {constraint}, got {bad_dims}.")
+        if kv_cache_dtype == "turboquant_4bit_nc" and AttnType.QSA in required_attn_types:
+            if config.attention_backend != "auto" and any(
+                part.strip() != "qsa_sparse" for part in config.attention_backend.split(",")
+            ):
+                raise ValueError("TurboQuant 4-bit QSA requires --attention-backend qsa_sparse.")
+        elif config.attention_backend == "auto":
+            override("attention_backend", "triton")
+            logger.info_rank0(f"{quant_name} KV cache selected the Triton attention backend")
+        elif any(part.strip() != "triton" for part in config.attention_backend.split(",")):
+            raise ValueError(
+                f"{quant_name} KV cache requires --attention-backend triton for both prefill and decode."
+            )
     if (
         required_attn_types & {AttnType.BSA, AttnType.QSA}
         and _dtype is not None

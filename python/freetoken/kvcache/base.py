@@ -25,11 +25,21 @@ def spec_kv_bytes_per_token(spec, config) -> int:
 
     ``index_ratio`` > 1 (QSA) stores one index key per token group, not per token; that slab's
     ring and scratch rows are fixed-size and priced in QSAKVCache.kv_cost instead."""
+    if getattr(config, "kv_cache_dtype", "model") == "q8_0":
+        # Q8_0 stores 32 int8 values plus one fp16 scale per block.
+        bytes_per_head_dim = spec.head_dim + (spec.head_dim // 32) * 2
+    elif (
+        getattr(config, "kv_cache_dtype", "model") == "turboquant_4bit_nc"
+        and not spec.is_swa
+    ):
+        # Two packed 4-bit vectors plus FP16 key norm and value scale/zero.
+        bytes_per_head_dim = spec.head_dim + 6
+    else:
+        bytes_per_head_dim = spec.head_dim * config.dtype.itemsize
     per_token = (
         (1 if spec.mla else 2)  # MLA latent groups store one slab (V aliases K)
-        * spec.head_dim
+        * bytes_per_head_dim
         * div_even(spec.num_kv_heads, config.tp_info.size, allow_replicate=True)
-        * config.dtype.itemsize
         * spec.num_layers
     )
     return per_token + spec.index_head_dim * spec.num_index_layers * 2 // spec.index_ratio

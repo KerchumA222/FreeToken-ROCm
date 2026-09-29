@@ -32,6 +32,7 @@ class MHAKVCache(BaseKVCachePool):
         dtype: torch.dtype,
         device: torch.device,
         layer_ids: Sequence[int] | None = None,
+        kv_cache_dtype: str = "model",
     ) -> None:
         tp_info = get_tp_info()
         local_kv_heads = div_even(num_kv_heads, tp_info.size, allow_replicate=True)
@@ -47,13 +48,58 @@ class MHAKVCache(BaseKVCachePool):
                     raise ValueError(f"KV layer id {global_id} outside [0, {num_layers})")
                 layer_map[global_id] = dense
             self._layer_map = layer_map
-        self._kv_buffer = torch.empty(
-            (2, num_storage_layers, num_pages, page_size, local_kv_heads, head_dim),
-            device=device,
-            dtype=dtype,
-        )
-        self._k_buffer = self._kv_buffer[0]
-        self._v_buffer = self._kv_buffer[1]
+        if kv_cache_dtype not in ("model", "q8_0", "turboquant_4bit_nc"):
+            raise ValueError(f"unsupported KV cache dtype {kv_cache_dtype!r}")
+        if kv_cache_dtype == "q8_0" and dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError("Q8_0 KV cache requires float16 or bfloat16 model compute")
+        if kv_cache_dtype == "q8_0" and head_dim % 32:
+            raise ValueError(f"Q8_0 KV cache requires head_dim divisible by 32, got {head_dim}")
+        if kv_cache_dtype == "turboquant_4bit_nc" and (head_dim % 2 or head_dim & (head_dim - 1)):
+            raise ValueError(f"TurboQuant 4-bit requires a power-of-two head_dim, got {head_dim}")
+        self.kv_cache_dtype = kv_cache_dtype
+        self._compute_dtype = dtype
+        self._num_storage_layers = num_storage_layers
+        self._page_size = page_size
+        self._local_kv_heads = local_kv_heads
+        self._head_dim = head_dim
+        self._num_pages = num_pages
+        self._kv_buffer = None
+        self._k_scale = None
+        self._v_scale = None
+        self._k_norm = None
+        self._v_zero = None
+        self._rotation = None
+        self._centroids = None
+        self._midpoints = None
+        if kv_cache_dtype == "model":
+            self._kv_buffer = torch.empty(
+                (2, num_storage_layers, num_pages, page_size, local_kv_heads, head_dim),
+                device=device,
+                dtype=dtype,
+            )
+            self._k_buffer = self._kv_buffer[0]
+            self._v_buffer = self._kv_buffer[1]
+        elif kv_cache_dtype == "q8_0":
+            shape = (num_storage_layers, num_pages, page_size, local_kv_heads, head_dim)
+            scale_shape = (*shape[:-1], head_dim // 32)
+            self._k_buffer = torch.empty(shape, device=device, dtype=torch.int8)
+            self._v_buffer = torch.empty_like(self._k_buffer)
+            self._k_scale = torch.empty(scale_shape, device=device, dtype=torch.float16)
+            self._v_scale = torch.empty_like(self._k_scale)
+        else:
+            shape = (num_storage_layers, num_pages, page_size, local_kv_heads, head_dim // 2)
+            meta_shape = shape[:-1]
+            self._k_buffer = torch.empty(shape, device=device, dtype=torch.uint8)
+            self._v_buffer = torch.empty_like(self._k_buffer)
+            self._k_norm = torch.empty(meta_shape, device=device, dtype=torch.float16)
+            self._v_scale = torch.empty_like(self._k_norm)
+            self._v_zero = torch.empty_like(self._k_norm)
+            from freetoken.kernel.triton.turboquant import gaussian_centroids, hadamard_rotation
+
+            centroids, midpoints = gaussian_centroids(head_dim)
+            self._rotation = hadamard_rotation(head_dim, device)
+            self._centroids = centroids.to(device=device)
+            self._midpoints = midpoints.to(device=device)
         self._device = device
         self._storage_shape = (num_pages * page_size, local_kv_heads, head_dim)
 
@@ -64,22 +110,45 @@ class MHAKVCache(BaseKVCachePool):
         existing buffer; only the page count changes. Views and ``_storage_shape`` are
         refreshed. Object identity is preserved so cached backend references stay valid.
         """
-        _, num_storage_layers, _old_pages, page_size, local_kv_heads, head_dim = self._kv_buffer.shape
-        dtype = self._kv_buffer.dtype
+        num_storage_layers = self._num_storage_layers
+        page_size = self._page_size
+        local_kv_heads = self._local_kv_heads
+        head_dim = self._head_dim
         device = self._device
         self._k_buffer = None
         self._v_buffer = None
         self._kv_buffer = None
+        self._k_scale = None
+        self._v_scale = None
+        self._k_norm = None
+        self._v_zero = None
         if device.type == "cuda":
             torch.cuda.synchronize(device)
             torch.cuda.empty_cache()
-        self._kv_buffer = torch.empty(
-            (2, num_storage_layers, num_pages, page_size, local_kv_heads, head_dim),
-            device=device,
-            dtype=dtype,
-        )
-        self._k_buffer = self._kv_buffer[0]
-        self._v_buffer = self._kv_buffer[1]
+        self._num_pages = num_pages
+        if self.kv_cache_dtype == "model":
+            self._kv_buffer = torch.empty(
+                (2, num_storage_layers, num_pages, page_size, local_kv_heads, head_dim),
+                device=device,
+                dtype=self._compute_dtype,
+            )
+            self._k_buffer = self._kv_buffer[0]
+            self._v_buffer = self._kv_buffer[1]
+        elif self.kv_cache_dtype == "q8_0":
+            shape = (num_storage_layers, num_pages, page_size, local_kv_heads, head_dim)
+            scale_shape = (*shape[:-1], head_dim // 32)
+            self._k_buffer = torch.empty(shape, device=device, dtype=torch.int8)
+            self._v_buffer = torch.empty_like(self._k_buffer)
+            self._k_scale = torch.empty(scale_shape, device=device, dtype=torch.float16)
+            self._v_scale = torch.empty_like(self._k_scale)
+        else:
+            shape = (num_storage_layers, num_pages, page_size, local_kv_heads, head_dim // 2)
+            meta_shape = shape[:-1]
+            self._k_buffer = torch.empty(shape, device=device, dtype=torch.uint8)
+            self._v_buffer = torch.empty_like(self._k_buffer)
+            self._k_norm = torch.empty(meta_shape, device=device, dtype=torch.float16)
+            self._v_scale = torch.empty_like(self._k_norm)
+            self._v_zero = torch.empty_like(self._k_norm)
         self._storage_shape = (num_pages * page_size, local_kv_heads, head_dim)
 
     @classmethod
@@ -99,9 +168,21 @@ class MHAKVCache(BaseKVCachePool):
         self.rebuild(num_pages + 1)  # +1 for the dummy page (matches create_kvcache_pool)
 
     def unit_bytes(self) -> tuple[int, int]:
-        buf = self._kv_buffer
-        tokens = int(buf.shape[2]) * int(buf.shape[3])
-        return int(buf.numel() * buf.element_size()) // tokens, 0
+        tokens = self._num_pages * self._page_size
+        if self.kv_cache_dtype == "q8_0":
+            total = (
+                self._k_buffer.numel() + self._v_buffer.numel()
+                + self._k_scale.numel() * self._k_scale.element_size()
+                + self._v_scale.numel() * self._v_scale.element_size()
+            )
+        elif self.kv_cache_dtype == "turboquant_4bit_nc":
+            total = (
+                self._k_buffer.numel() + self._v_buffer.numel()
+                + (self._k_norm.numel() + self._v_scale.numel() + self._v_zero.numel()) * 2
+            )
+        else:
+            total = self._kv_buffer.numel() * self._kv_buffer.element_size()
+        return int(total) // tokens, 0
 
     def _dense(self, layer_id: int) -> int:
         if self._layer_map is None:
@@ -117,6 +198,26 @@ class MHAKVCache(BaseKVCachePool):
     def v_cache(self, index: int) -> torch.Tensor:
         return self._v_buffer[self._dense(index)]
 
+    def k_scale_cache(self, index: int) -> torch.Tensor | None:
+        return None if self._k_scale is None else self._k_scale[self._dense(index)]
+
+    def v_scale_cache(self, index: int) -> torch.Tensor | None:
+        return None if self._v_scale is None else self._v_scale[self._dense(index)]
+
+    def k_norm_cache(self, index: int) -> torch.Tensor | None:
+        return None if self._k_norm is None else self._k_norm[self._dense(index)]
+
+    def v_zero_cache(self, index: int) -> torch.Tensor | None:
+        return None if self._v_zero is None else self._v_zero[self._dense(index)]
+
+    @property
+    def turboquant_rotation(self) -> torch.Tensor | None:
+        return self._rotation
+
+    @property
+    def turboquant_centroids(self) -> torch.Tensor | None:
+        return self._centroids
+
     def store_kv(
         self,
         k: torch.Tensor,
@@ -124,9 +225,44 @@ class MHAKVCache(BaseKVCachePool):
         out_loc: torch.Tensor,
         layer_id: int,
     ) -> None:
+        dense = self._dense(layer_id)
+        if self.kv_cache_dtype == "q8_0":
+            from freetoken.kernel.triton.kv_cache import store_q8_0_cache
+
+            shape = self._storage_shape
+            store_q8_0_cache(
+                k_cache=self._k_buffer[dense].view(shape),
+                v_cache=self._v_buffer[dense].view(shape),
+                k_scale=self._k_scale[dense].view(-1, self._local_kv_heads, self._head_dim // 32),
+                v_scale=self._v_scale[dense].view(-1, self._local_kv_heads, self._head_dim // 32),
+                indices=out_loc,
+                k=k,
+                v=v,
+            )
+            return
+        if self.kv_cache_dtype == "turboquant_4bit_nc":
+            from freetoken.kernel.triton.turboquant import store_turboquant_4bit_nc_cache
+
+            slots = self._num_pages * self._page_size
+            shape = (slots, self._local_kv_heads, self._head_dim // 2)
+            meta_shape = (slots, self._local_kv_heads)
+            store_turboquant_4bit_nc_cache(
+                k_cache=self._k_buffer[dense].view(shape),
+                v_cache=self._v_buffer[dense].view(shape),
+                k_norms=self._k_norm[dense].view(meta_shape),
+                v_scales=self._v_scale[dense].view(meta_shape),
+                v_zeros=self._v_zero[dense].view(meta_shape),
+                indices=out_loc,
+                k=k.view(k.shape[0], self._local_kv_heads, self._head_dim),
+                v=v.view(v.shape[0], self._local_kv_heads, self._head_dim),
+                rotation=self._rotation,
+                centroids=self._centroids,
+                midpoints=self._midpoints,
+            )
+            return
+
         from freetoken.kernel import store_cache
 
-        dense = self._dense(layer_id)
         store_cache(
             k_cache=self._k_buffer[dense].view(self._storage_shape),
             v_cache=self._v_buffer[dense].view(self._storage_shape),
@@ -141,7 +277,9 @@ class MHAKVCache(BaseKVCachePool):
 
     @property
     def dtype(self) -> torch.dtype:
-        return self._kv_buffer.dtype
+        if self.kv_cache_dtype == "model":
+            return self._compute_dtype
+        return torch.int8 if self.kv_cache_dtype == "q8_0" else torch.uint8
 
     @property
     def num_layers(self) -> int:

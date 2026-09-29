@@ -151,18 +151,64 @@ class TritonAttentionBackend(BaseAttnBackend):
         metadata = batch.attn_metadata
         assert isinstance(metadata, TritonMetadata)
         self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
-
-        k_raw = self.kvcache.k_cache(layer_id)
-        v_raw = self.kvcache.v_cache(layer_id)
-        kv_heads, head_dim = k_raw.shape[-2], k_raw.shape[-1]
-        assert head_dim == q.shape[-1]
-        k_cache = k_raw.view(-1, kv_heads, head_dim)
-        v_cache = v_raw.view(-1, kv_heads, head_dim)
-
         spec = attn_spec or AttentionSpec()
         indices = metadata.indices
         if spec.sliding_window is not None and metadata.swa_indices is not None:
             indices = metadata.swa_indices
+
+        k_raw = self.kvcache.k_cache(layer_id)
+        v_raw = self.kvcache.v_cache(layer_id)
+        is_turboquant = getattr(self.kvcache, "kv_cache_dtype", "model") == "turboquant_4bit_nc"
+        is_turboquant_layer = (
+            not callable(getattr(self.kvcache, "is_full_layer", None))
+            or self.kvcache.is_full_layer(layer_id)
+        )
+        if is_turboquant and is_turboquant_layer:
+            from freetoken.kernel.triton.turboquant import turboquant_4bit_nc_attention
+
+            slots = k_raw.shape[0] * k_raw.shape[1]
+            kv_heads = k_raw.shape[2]
+            head_dim = self.kvcache._head_dim if hasattr(self.kvcache, "_head_dim") else self.kvcache.full_kv_pool.head_dim
+            k_cache = k_raw.view(slots, kv_heads, head_dim // 2)
+            v_cache = v_raw.view(slots, kv_heads, head_dim // 2)
+            metadata_shape = (slots, kv_heads)
+            k_norm_cache = self.kvcache.k_norm_cache(layer_id)
+            v_scale_cache = self.kvcache.v_scale_cache(layer_id)
+            v_zero_cache = self.kvcache.v_zero_cache(layer_id)
+            rotation = self.kvcache.turboquant_rotation
+            centroids = self.kvcache.turboquant_centroids
+            assert k_norm_cache is not None
+            assert v_scale_cache is not None
+            assert v_zero_cache is not None
+            assert rotation is not None
+            assert centroids is not None
+            return turboquant_4bit_nc_attention(
+                q=q,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                k_norms=k_norm_cache.view(metadata_shape),
+                v_scales=v_scale_cache.view(metadata_shape),
+                v_zeros=v_zero_cache.view(metadata_shape),
+                centroids=centroids,
+                indptr=metadata.indptr,
+                indices=indices,
+                q_to_req=metadata.q_to_req,
+                q_positions=metadata.q_positions,
+                sm_scale=spec.sm_scale if spec.sm_scale is not None else q.shape[-1] ** -0.5,
+                rotation=rotation,
+                sliding_window=spec.sliding_window,
+                sinks=spec.sinks,
+            )
+        k_scale = getattr(self.kvcache, "k_scale_cache", lambda _: None)(layer_id)
+        v_scale = getattr(self.kvcache, "v_scale_cache", lambda _: None)(layer_id)
+        kv_heads, head_dim = k_raw.shape[-2], k_raw.shape[-1]
+        assert head_dim == q.shape[-1]
+        k_cache = k_raw.view(-1, kv_heads, head_dim)
+        v_cache = v_raw.view(-1, kv_heads, head_dim)
+        if k_scale is not None:
+            k_scale = k_scale.view(-1, kv_heads, head_dim // 32)
+            v_scale = v_scale.view(-1, kv_heads, head_dim // 32)
+
         scale = spec.sm_scale if spec.sm_scale is not None else q.shape[-1] ** -0.5
         if (metadata.is_decode or metadata.rows_as_decode) and q.dtype in (torch.float16, torch.bfloat16):
             bs = metadata.indptr.numel() - 1
@@ -184,6 +230,8 @@ class TritonAttentionBackend(BaseAttnBackend):
                 sm_scale=scale,
                 sliding_window=spec.sliding_window,
                 sinks=spec.sinks,
+                k_scale_cache=k_scale,
+                v_scale_cache=v_scale,
             )
         if (
             (not metadata.is_decode)
@@ -204,6 +252,8 @@ class TritonAttentionBackend(BaseAttnBackend):
                 sinks=spec.sinks,
                 k_extend=k.view(q.shape[0], kv_heads, head_dim),
                 v_extend=v.view(q.shape[0], kv_heads, head_dim),
+                k_scale_cache=k_scale,
+                v_scale_cache=v_scale,
             )
         return paged_attention(
             q=q,
@@ -216,6 +266,8 @@ class TritonAttentionBackend(BaseAttnBackend):
             sm_scale=scale,
             sliding_window=spec.sliding_window,
             sinks=spec.sinks,
+            k_scale_cache=k_scale,
+            v_scale_cache=v_scale,
         )
 
     def prepare_metadata(self, batch: Batch) -> None:

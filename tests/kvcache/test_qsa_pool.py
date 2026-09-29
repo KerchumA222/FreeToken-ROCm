@@ -37,7 +37,10 @@ def _tp(monkeypatch):
     )
 
 
-def _pool(num_pages=4, page_size=64, index_ratio=4, num_req_slots=4, ring_capacity=None):
+def _pool(
+    num_pages=4, page_size=64, index_ratio=4, num_req_slots=4, ring_capacity=None,
+    kv_cache_dtype="model",
+):
     return QSAKVCache(
         num_kv_heads=2,
         num_layers=8,
@@ -52,6 +55,7 @@ def _pool(num_pages=4, page_size=64, index_ratio=4, num_req_slots=4, ring_capaci
         num_req_slots=num_req_slots,
         ring_capacity=ring_capacity,
         layer_ids=(1, 3, 5, 7),
+        kv_cache_dtype=kv_cache_dtype,
     )
 
 
@@ -103,6 +107,35 @@ def test_kv_slabs_cover_sparse_layers_only():
     pool.k_cache(7)
     with pytest.raises(KeyError):
         pool.k_cache(0)
+
+
+def test_turboquant_keeps_qsa_index_tiers_and_packs_only_kv():
+    pool = _pool(kv_cache_dtype="turboquant_4bit_nc")
+    assert pool._kv_buffer is None
+    assert pool.k_cache(1).shape == (4, 64, 2, 32)
+    assert pool.k_cache(1).dtype == torch.uint8
+    assert pool.k_norm_cache(1).shape == (4, 64, 2)
+    assert pool.v_scale_cache(1).shape == (4, 64, 2)
+    assert pool.v_zero_cache(1).shape == (4, 64, 2)
+    assert pool.cmp_k_cache(0).shape == (64 + 4, 32)
+    assert pool.pending_ring(0).shape == (4, QSAKVCache.ring_capacity_for(4), 32)
+
+    pool.rebuild(8)
+    assert pool.k_cache(1).shape == (8, 64, 2, 32)
+    assert pool.k_norm_cache(1).shape == (8, 64, 2)
+    assert pool.cmp_k_cache(0).shape == (128 + 4, 32)
+
+
+def test_turboquant_qsa_cost_prices_packed_kv_and_fp16_index_slab():
+    spec = _spec()
+    config = _config(spec)
+    config.kv_cache_dtype = "turboquant_4bit_nc"
+    per_page, fixed, page_tokens, reserve = QSAKVCache.kv_cost(config)
+    kv_and_index_per_token = 2 * (64 + 6) * 2 * 4 + 32 * 4 * 2 // 4
+    expected_fixed = 4 * 32 * 4 * 2 * (QSAKVCache.ring_capacity_for(4) + 1)
+    assert (per_page, fixed, page_tokens, reserve) == (
+        kv_and_index_per_token * 64, expected_fixed, 64, 0
+    )
 
 
 def test_ring_capacity_and_ratio_are_parameters():

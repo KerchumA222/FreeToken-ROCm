@@ -24,12 +24,13 @@ from freetoken.models.config import (
 )
 
 
-def _spec(name, attn_type, *, mla=False, sliding_window=None, index_head_dim=0, index_ratio=1):
+def _spec(name, attn_type, *, mla=False, sliding_window=None, index_head_dim=0, index_ratio=1,
+          head_dim=64):
     return KVCacheGroupSpec(
         name=name,
         layer_ids=(0, 1),
         num_kv_heads=1,
-        head_dim=64,
+        head_dim=head_dim,
         sliding_window=sliding_window,
         mla=mla,
         index_head_dim=index_head_dim,
@@ -125,6 +126,96 @@ def test_auto_resolves_per_type(monkeypatch, kind, expected):
     config = _config(kind, attention_backend="auto")
     _adjust_config(config)
     assert config.attention_backend == expected
+
+
+@pytest.mark.parametrize("kind", ["full", "linear_hybrid"])
+def test_q8_cache_auto_selects_triton(monkeypatch, kind):
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_env(monkeypatch)
+    config = _config(kind, attention_backend="auto", kv_cache_dtype="q8_0")
+    _adjust_config(config)
+    assert config.attention_backend == "triton"
+
+
+@pytest.mark.parametrize("backend", ["fi", "fa", "triton,fi"])
+def test_q8_cache_rejects_non_triton_backend(monkeypatch, backend):
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_env(monkeypatch)
+    config = _config("full", attention_backend=backend, kv_cache_dtype="q8_0")
+    with pytest.raises(ValueError, match="requires --attention-backend triton"):
+        _adjust_config(config)
+
+
+@pytest.mark.parametrize("kind", ["swa", "mla", "dsa", "dsv4", "bsa", "qsa"])
+def test_q8_cache_rejects_specialized_cache_families(monkeypatch, kind):
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_env(monkeypatch)
+    config = _config(kind, attention_backend="auto", kv_cache_dtype="q8_0")
+    with pytest.raises(ValueError, match="full-attention MHA/GQA"):
+        _adjust_config(config)
+
+
+def test_q8_cache_requires_16_bit_compute(monkeypatch):
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_env(monkeypatch)
+    config = _config("full", attention_backend="auto", kv_cache_dtype="q8_0")
+    object.__setattr__(config, "dtype", torch.float32)
+    with pytest.raises(ValueError, match="requires float16 or bfloat16"):
+        _adjust_config(config)
+
+
+def test_q8_cache_requires_block_aligned_head_dim(monkeypatch):
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_env(monkeypatch)
+    config = _config("full", attention_backend="auto", kv_cache_dtype="q8_0")
+    specs = (_spec("full", AttnType.FULL, head_dim=48),)
+    object.__setattr__(config.model_config, "kv_cache_group_specs", lambda: specs)
+    with pytest.raises(ValueError, match="head_dim divisible by 32"):
+        _adjust_config(config)
+
+
+def test_turboquant_cache_auto_selects_triton(monkeypatch):
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_env(monkeypatch)
+    config = _config("full", attention_backend="auto", kv_cache_dtype="turboquant_4bit_nc")
+    _adjust_config(config)
+    assert config.attention_backend == "triton"
+
+
+@pytest.mark.parametrize("head_dim", [48, 96])
+def test_turboquant_cache_rejects_non_power_of_two_head_dims(monkeypatch, head_dim):
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_env(monkeypatch)
+    config = _config("full", attention_backend="auto", kv_cache_dtype="turboquant_4bit_nc")
+    specs = (_spec("full", AttnType.FULL, head_dim=head_dim),)
+    object.__setattr__(config.model_config, "kv_cache_group_specs", lambda: specs)
+    with pytest.raises(ValueError, match="head_dim a power of two"):
+        _adjust_config(config)
+
+
+def test_turboquant_qsa_auto_keeps_qsa_backend(monkeypatch):
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_env(monkeypatch)
+    config = _config("qsa", attention_backend="auto", kv_cache_dtype="turboquant_4bit_nc")
+    _adjust_config(config)
+    assert config.attention_backend == "qsa_sparse"
+
+
+def test_turboquant_qsa_rejects_non_qsa_backend(monkeypatch):
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_env(monkeypatch)
+    config = _config("qsa", attention_backend="triton", kv_cache_dtype="turboquant_4bit_nc")
+    with pytest.raises(ValueError, match="QSA requires --attention-backend qsa_sparse"):
+        _adjust_config(config)
 
 
 def test_auto_bsa_sets_block_page_size(monkeypatch):

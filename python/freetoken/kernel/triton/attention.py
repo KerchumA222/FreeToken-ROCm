@@ -47,6 +47,8 @@ def _paged_attention_kernel(
     q_ptr,
     k_ptr,
     v_ptr,
+    k_scale_ptr,
+    v_scale_ptr,
     o_ptr,
     indptr_ptr,
     indices_ptr,
@@ -60,6 +62,10 @@ def _paged_attention_kernel(
     stride_kh,
     stride_vs,
     stride_vh,
+    stride_kss,
+    stride_ksh,
+    stride_vss,
+    stride_vsh,
     stride_ot,
     stride_oh,
     GROUP: tl.constexpr,
@@ -68,6 +74,7 @@ def _paged_attention_kernel(
     BLOCK_N: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr,
     HAS_SINKS: tl.constexpr,
+    QUANTIZED: tl.constexpr,
 ):
     q_tok = tl.program_id(0)
     q_head = tl.program_id(1)
@@ -115,6 +122,14 @@ def _paged_attention_kernel(
                 mask=(offs_n[:, None] < kv_len) & mask_d[None, :],
                 other=0.0,
             ).to(tl.float32)
+            if QUANTIZED:
+                scale = tl.load(
+                    k_scale_ptr + slots[:, None] * stride_kss
+                    + kv_head * stride_ksh + offs_d[None, :] // 32,
+                    mask=(offs_n[:, None] < kv_len) & mask_d[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+                k = (k * scale).to(q.dtype)
             scores = tl.sum(q[None, :] * k, axis=1) * sm_scale
             scores = tl.where(mask_n, scores, -float("inf"))
 
@@ -132,6 +147,14 @@ def _paged_attention_kernel(
                 mask=(offs_n[:, None] < kv_len) & mask_d[None, :],
                 other=0.0,
             ).to(tl.float32)
+            if QUANTIZED:
+                scale = tl.load(
+                    v_scale_ptr + slots[:, None] * stride_vss
+                    + kv_head * stride_vsh + offs_d[None, :] // 32,
+                    mask=(offs_n[:, None] < kv_len) & mask_d[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+                v = (v * scale).to(q.dtype)
             acc = acc * alpha + tl.sum(p[:, None] * v, axis=0)
             l_i = l_i * alpha + tl.sum(p, axis=0)
             m_i = m_new
@@ -149,6 +172,8 @@ def _decode_grouped_stage1_kernel(
     q_ptr,
     k_ptr,
     v_ptr,
+    k_scale_ptr,
+    v_scale_ptr,
     sm_scale,
     indptr_ptr,
     indices_ptr,
@@ -162,6 +187,10 @@ def _decode_grouped_stage1_kernel(
     stride_kh,
     stride_vs,
     stride_vh,
+    stride_kss,
+    stride_ksh,
+    stride_vss,
+    stride_vsh,
     stride_mid_ob,
     stride_mid_oh,
     stride_mid_os,
@@ -179,6 +208,7 @@ def _decode_grouped_stage1_kernel(
     D: tl.constexpr,
     DV: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr,
+    QUANTIZED: tl.constexpr,
 ):
     batch_id = tl.program_id(0)
     head_block_id = tl.program_id(1)
@@ -224,7 +254,10 @@ def _decode_grouped_stage1_kernel(
 
     if split_end > split_start:
         q = tl.load(q_ptr + q_offsets, mask=mask_h[:, None] & mask_d[None, :], other=0.0)
-        q = q.to(k_ptr.dtype.element_ty)
+        if QUANTIZED:
+            q = q.to(q_ptr.dtype.element_ty)
+        else:
+            q = q.to(k_ptr.dtype.element_ty)
 
         for rel_start in tl.range(split_start, split_end, BLOCK_N):
             rel_offs = rel_start + tl.arange(0, BLOCK_N)
@@ -237,6 +270,14 @@ def _decode_grouped_stage1_kernel(
                 mask=mask_n[None, :] & mask_d[:, None],
                 other=0.0,
             )
+            if QUANTIZED:
+                scale = tl.load(
+                    k_scale_ptr + slots[None, :] * stride_kss
+                    + kv_head * stride_ksh + offs_d[:, None] // 32,
+                    mask=mask_n[None, :] & mask_d[:, None],
+                    other=0.0,
+                ).to(tl.float32)
+                k = (k.to(tl.float32) * scale).to(q.dtype)
             scores = tl.dot(q, k) * sm_scale
             scores = tl.where(mask_h[:, None] & mask_n[None, :], scores, -float("inf"))
 
@@ -245,6 +286,14 @@ def _decode_grouped_stage1_kernel(
                 mask=mask_n[:, None] & mask_dv[None, :],
                 other=0.0,
             )
+            if QUANTIZED:
+                scale = tl.load(
+                    v_scale_ptr + slots[:, None] * stride_vss
+                    + kv_head * stride_vsh + offs_dv[None, :] // 32,
+                    mask=mask_n[:, None] & mask_dv[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+                v = (v.to(tl.float32) * scale).to(q.dtype)
 
             m_new = tl.maximum(tl.max(scores, axis=1), m_i)
             alpha = tl.exp(m_i - m_new)
@@ -364,6 +413,8 @@ def decode_paged_attention(
     sliding_window: int | None = None,
     sinks: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
+    k_scale_cache: torch.Tensor | None = None,
+    v_scale_cache: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """SGLang-style split-k grouped decode attention for one query per request."""
 
@@ -387,6 +438,11 @@ def decode_paged_attention(
         assert sinks.dim() == 1
         assert sinks.numel() >= num_q_heads
         sinks = sinks.contiguous()
+    quantized = k_scale_cache is not None or v_scale_cache is not None
+    if quantized and (k_scale_cache is None or v_scale_cache is None):
+        raise ValueError("Q8_0 attention requires both K and V scale tensors")
+    k_scale_arg = k_scale_cache if k_scale_cache is not None else k_cache
+    v_scale_arg = v_scale_cache if v_scale_cache is not None else v_cache
 
     o = out if out is not None else torch.empty_like(q)
     sinks_arg = sinks if sinks is not None else q
@@ -405,6 +461,8 @@ def decode_paged_attention(
         q,
         k_cache,
         v_cache,
+        k_scale_arg,
+        v_scale_arg,
         sm_scale,
         indptr,
         indices,
@@ -418,6 +476,10 @@ def decode_paged_attention(
         k_cache.stride(1),
         v_cache.stride(0),
         v_cache.stride(1),
+        k_scale_arg.stride(0),
+        k_scale_arg.stride(1),
+        v_scale_arg.stride(0),
+        v_scale_arg.stride(1),
         attn_logits.stride(0),
         attn_logits.stride(1),
         attn_logits.stride(2),
@@ -435,6 +497,7 @@ def decode_paged_attention(
         D=head_dim,
         DV=head_dim,
         SLIDING_WINDOW=sliding_window or 0,
+        QUANTIZED=quantized,
         num_warps=4,
         num_stages=2,
     )
@@ -471,6 +534,8 @@ def _extend_attention_kernel(
     q_ptr,
     k_ptr,
     v_ptr,
+    k_scale_ptr,
+    v_scale_ptr,
     o_ptr,
     qo_indptr_ptr,
     kv_indptr_ptr,
@@ -484,6 +549,10 @@ def _extend_attention_kernel(
     stride_kh,
     stride_vs,
     stride_vh,
+    stride_kss,
+    stride_ksh,
+    stride_vss,
+    stride_vsh,
     stride_ot,
     stride_oh,
     GROUP: tl.constexpr,
@@ -494,6 +563,7 @@ def _extend_attention_kernel(
     BLOCK_N: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr,
     HAS_SINKS: tl.constexpr,
+    QUANTIZED: tl.constexpr,
 ):
     seq_id = tl.program_id(0)
     q_head = tl.program_id(1)
@@ -553,6 +623,14 @@ def _extend_attention_kernel(
                 mask=mask_n[None, :] & mask_d[:, None],
                 other=0.0,
             )
+            if QUANTIZED:
+                scale = tl.load(
+                    k_scale_ptr + slots[None, :] * stride_kss
+                    + kv_head * stride_ksh + offs_d[:, None] // 32,
+                    mask=mask_n[None, :] & mask_d[:, None],
+                    other=0.0,
+                ).to(tl.float32)
+                k = (k.to(tl.float32) * scale).to(q.dtype)
             scores = tl.dot(q.to(k.dtype), k) * sm_scale
             scores = tl.where(final_mask, scores, -float("inf"))
 
@@ -570,6 +648,14 @@ def _extend_attention_kernel(
                 mask=mask_n[:, None] & mask_dv[None, :],
                 other=0.0,
             )
+            if QUANTIZED:
+                scale = tl.load(
+                    v_scale_ptr + slots[:, None] * stride_vss
+                    + kv_head * stride_vsh + offs_dv[None, :] // 32,
+                    mask=mask_n[:, None] & mask_dv[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+                v = (v.to(tl.float32) * scale).to(q.dtype)
             acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
             l_i = l_i * alpha + tl.sum(p, axis=1)
             m_i = m_new
@@ -592,6 +678,8 @@ def _extend_attention_split_kernel(
     v_extend_ptr,
     k_cache_ptr,
     v_cache_ptr,
+    k_scale_ptr,
+    v_scale_ptr,
     o_ptr,
     qo_indptr_ptr,
     kv_indptr_ptr,
@@ -609,6 +697,10 @@ def _extend_attention_split_kernel(
     stride_kch,
     stride_vcs,
     stride_vch,
+    stride_kss,
+    stride_ksh,
+    stride_vss,
+    stride_vsh,
     stride_ot,
     stride_oh,
     GROUP: tl.constexpr,
@@ -619,6 +711,7 @@ def _extend_attention_split_kernel(
     BLOCK_N: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr,
     HAS_SINKS: tl.constexpr,
+    QUANTIZED: tl.constexpr,
 ):
     seq_id = tl.program_id(0)
     q_head = tl.program_id(1)
@@ -680,6 +773,14 @@ def _extend_attention_split_kernel(
                 mask=mask_n[None, :] & mask_d[:, None],
                 other=0.0,
             )
+            if QUANTIZED:
+                scale = tl.load(
+                    k_scale_ptr + slots[None, :] * stride_kss
+                    + kv_head * stride_ksh + offs_d[:, None] // 32,
+                    mask=mask_n[None, :] & mask_d[:, None],
+                    other=0.0,
+                ).to(tl.float32)
+                k = (k.to(tl.float32) * scale).to(q.dtype)
             scores = tl.dot(q.to(k.dtype), k) * sm_scale
             scores = tl.where(final_mask, scores, -float("inf"))
 
@@ -697,6 +798,14 @@ def _extend_attention_split_kernel(
                 mask=mask_n[:, None] & mask_dv[None, :],
                 other=0.0,
             )
+            if QUANTIZED:
+                scale = tl.load(
+                    v_scale_ptr + slots[:, None] * stride_vss
+                    + kv_head * stride_vsh + offs_dv[None, :] // 32,
+                    mask=mask_n[:, None] & mask_dv[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+                v = (v.to(tl.float32) * scale).to(q.dtype)
             acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
             l_i = l_i * alpha + tl.sum(p, axis=1)
             m_i = m_new
@@ -773,6 +882,8 @@ def extend_paged_attention(
     out: torch.Tensor | None = None,
     k_extend: torch.Tensor | None = None,
     v_extend: torch.Tensor | None = None,
+    k_scale_cache: torch.Tensor | None = None,
+    v_scale_cache: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Block-tiled causal prefill/extend attention over paged KV cache."""
 
@@ -790,6 +901,11 @@ def extend_paged_attention(
         assert sinks.dim() == 1
         assert sinks.numel() >= num_q_heads
         sinks = sinks.contiguous()
+    quantized = k_scale_cache is not None or v_scale_cache is not None
+    if quantized and (k_scale_cache is None or v_scale_cache is None):
+        raise ValueError("Q8_0 attention requires both K and V scale tensors")
+    k_scale_arg = k_scale_cache if k_scale_cache is not None else k_cache
+    v_scale_arg = v_scale_cache if v_scale_cache is not None else v_cache
 
     o = out if out is not None else torch.empty_like(q)
     sinks_arg = sinks if sinks is not None else q
@@ -815,6 +931,8 @@ def extend_paged_attention(
             v_extend,
             k_cache,
             v_cache,
+            k_scale_arg,
+            v_scale_arg,
             o,
             qo_indptr,
             kv_indptr,
@@ -832,6 +950,10 @@ def extend_paged_attention(
             k_cache.stride(1),
             v_cache.stride(0),
             v_cache.stride(1),
+            k_scale_arg.stride(0),
+            k_scale_arg.stride(1),
+            v_scale_arg.stride(0),
+            v_scale_arg.stride(1),
             o.stride(0),
             o.stride(1),
             GROUP=num_q_heads // num_kv_heads,
@@ -842,6 +964,7 @@ def extend_paged_attention(
             BLOCK_N=block_n,
             SLIDING_WINDOW=sliding_window or 0,
             HAS_SINKS=sinks is not None,
+            QUANTIZED=quantized,
             num_warps=8,
             num_stages=1,
         )
@@ -851,6 +974,8 @@ def extend_paged_attention(
         q,
         k_cache,
         v_cache,
+        k_scale_arg,
+        v_scale_arg,
         o,
         qo_indptr,
         kv_indptr,
@@ -864,6 +989,10 @@ def extend_paged_attention(
         k_cache.stride(1),
         v_cache.stride(0),
         v_cache.stride(1),
+        k_scale_arg.stride(0),
+        k_scale_arg.stride(1),
+        v_scale_arg.stride(0),
+        v_scale_arg.stride(1),
         o.stride(0),
         o.stride(1),
         GROUP=num_q_heads // num_kv_heads,
@@ -874,6 +1003,7 @@ def extend_paged_attention(
         BLOCK_N=block_n,
         SLIDING_WINDOW=sliding_window or 0,
         HAS_SINKS=sinks is not None,
+        QUANTIZED=quantized,
         num_warps=8,
         num_stages=1,
     )
@@ -893,6 +1023,8 @@ def paged_attention(
     sinks: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
     block_n: int = 32,
+    k_scale_cache: torch.Tensor | None = None,
+    v_scale_cache: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Paged causal attention for one layer.
 
@@ -913,6 +1045,11 @@ def paged_attention(
         assert sinks.dim() == 1
         assert sinks.numel() >= num_q_heads
         sinks = sinks.contiguous()
+    quantized = k_scale_cache is not None or v_scale_cache is not None
+    if quantized and (k_scale_cache is None or v_scale_cache is None):
+        raise ValueError("Q8_0 attention requires both K and V scale tensors")
+    k_scale_arg = k_scale_cache if k_scale_cache is not None else k_cache
+    v_scale_arg = v_scale_cache if v_scale_cache is not None else v_cache
 
     o = out if out is not None else torch.empty_like(q)
     sinks_arg = sinks if sinks is not None else q
@@ -922,6 +1059,8 @@ def paged_attention(
         q,
         k_cache,
         v_cache,
+        k_scale_arg,
+        v_scale_arg,
         o,
         indptr,
         indices,
@@ -935,6 +1074,10 @@ def paged_attention(
         k_cache.stride(1),
         v_cache.stride(0),
         v_cache.stride(1),
+        k_scale_arg.stride(0),
+        k_scale_arg.stride(1),
+        v_scale_arg.stride(0),
+        v_scale_arg.stride(1),
         o.stride(0),
         o.stride(1),
         GROUP=num_q_heads // num_kv_heads,
@@ -943,6 +1086,7 @@ def paged_attention(
         BLOCK_N=block_n,
         SLIDING_WINDOW=sliding_window or 0,
         HAS_SINKS=sinks is not None,
+        QUANTIZED=quantized,
         num_warps=8 if head_dim >= 256 else 4,
         num_stages=2,
     )

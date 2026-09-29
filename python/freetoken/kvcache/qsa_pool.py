@@ -63,6 +63,7 @@ class QSAKVCache(MHAKVCache):
         num_req_slots: int,
         ring_capacity: int | None = None,
         layer_ids: Sequence[int] | None = None,
+        kv_cache_dtype: str = "model",
     ) -> None:
         if index_ratio < 1 or page_size % index_ratio != 0:
             # slot // index_ratio only names one group when a group never straddles a page.
@@ -98,6 +99,7 @@ class QSAKVCache(MHAKVCache):
             dtype=dtype,
             device=device,
             layer_ids=layer_ids,
+            kv_cache_dtype=kv_cache_dtype,
         )
         self._zero_kv_slabs()
         self._alloc_index_tiers(num_pages)
@@ -106,7 +108,8 @@ class QSAKVCache(MHAKVCache):
         # Defense-in-depth: the attend kernels pos-mask every K/V load (the real fix for
         # torch.empty's recycled NaN/Inf bit patterns), but a zeroed slab keeps any future
         # unmasked read finite instead of model-poisoning. One memset per (re)allocation.
-        self._kv_buffer.zero_()
+        if self._kv_buffer is not None:
+            self._kv_buffer.zero_()
 
     def _alloc_index_tiers(self, num_pages: int) -> None:
         # ZERO-initialized: the score kernel reads whole rows of blocks unmasked and relies on

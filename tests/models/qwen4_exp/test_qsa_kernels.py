@@ -487,3 +487,72 @@ def test_capture_graph_provisions_the_block_topk_scratch():
     assert backend._scratch("topk_scratch", 2, width, dtype=torch.int32).data_ptr() == (
         static.data_ptr()
     )
+
+
+@requires_cuda
+def test_turboquant_qsa_sparse_attention_matches_decoded_reference():
+    from freetoken.kernel.triton.qsa.attend import qsa_sparse_paged_attention
+    from freetoken.kernel.triton.turboquant import (
+        gaussian_centroids,
+        hadamard_rotation,
+        store_turboquant_4bit_nc_cache,
+    )
+
+    device = torch.device("cuda")
+    head_dim = 64
+    centroids_cpu, midpoints_cpu = gaussian_centroids(head_dim)
+    rotation = hadamard_rotation(head_dim, device)
+    centroids = centroids_cpu.to(device)
+    k = torch.randn((3, 1, head_dim), device=device, dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    k_codes = torch.empty((1, 64, 1, head_dim // 2), device=device, dtype=torch.uint8)
+    v_codes = torch.empty_like(k_codes)
+    k_norms = torch.empty((1, 64, 1), device=device, dtype=torch.float16)
+    v_scales = torch.empty_like(k_norms)
+    v_zeros = torch.empty_like(k_norms)
+    slots = torch.tensor([0, 2, 63], dtype=torch.int32, device=device)
+    store_turboquant_4bit_nc_cache(
+        k_cache=k_codes.view(64, 1, head_dim // 2),
+        v_cache=v_codes.view(64, 1, head_dim // 2),
+        k_norms=k_norms.view(64, 1),
+        v_scales=v_scales.view(64, 1),
+        v_zeros=v_zeros.view(64, 1),
+        indices=slots,
+        k=k,
+        v=v,
+        rotation=rotation,
+        centroids=centroids,
+        midpoints=midpoints_cpu.to(device),
+    )
+    d = torch.arange(head_dim, device=device)
+    shifts = (d % 2) * 4
+    selected_codes = k_codes[0, slots.long(), 0].repeat_interleave(2, dim=-1).int()
+    decoded_k_codes = (selected_codes >> shifts) & 15
+    decoded_k_rot = centroids[decoded_k_codes]
+    decoded_k_rot = decoded_k_rot / decoded_k_rot.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+    decoded_k = decoded_k_rot * k_norms[0, slots.long(), 0][:, None]
+    decoded_k = decoded_k @ rotation
+    selected_v = v_codes[0, slots.long(), 0].repeat_interleave(2, dim=-1).int()
+    decoded_v_codes = ((selected_v >> shifts) & 15).float()
+    decoded_v = (
+        decoded_v_codes * v_scales[0, slots.long(), 0][:, None]
+        + v_zeros[0, slots.long(), 0][:, None]
+    )
+    q = torch.randn((1, 2, head_dim), device=device, dtype=torch.bfloat16)
+    scores = torch.einsum("hd,td->ht", q[0].float(), decoded_k.float()) / head_dim**0.5
+    expected = (scores.softmax(-1) @ decoded_v.float()).unsqueeze(0)
+
+    actual = qsa_sparse_paged_attention(
+        q=q,
+        k_cache=k_codes,
+        v_cache=v_codes,
+        logical_indices=torch.tensor([[0, 2, 63]], dtype=torch.int32, device=device),
+        block_table=torch.tensor([[0]], dtype=torch.int32, device=device),
+        token_to_req=torch.tensor([0], dtype=torch.int32, device=device),
+        k_norms=k_norms,
+        v_scales=v_scales,
+        v_zeros=v_zeros,
+        centroids=centroids,
+        rotation=rotation,
+    )
+    torch.testing.assert_close(actual.float(), expected, atol=4e-2, rtol=4e-2)

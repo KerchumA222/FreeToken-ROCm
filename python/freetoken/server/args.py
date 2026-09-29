@@ -450,6 +450,17 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--kv-cache-dtype",
+        choices=("model", "q8_0", "turboquant_4bit_nc"),
+        default=ServerArgs.kv_cache_dtype,
+        help=(
+            "KV cache storage format; q8_0 uses blockwise INT8 with FP16 scales, "
+            "turboquant_4bit_nc uses 4-bit norm-corrected TurboQuant "
+            "(Triton MHA/GQA only)."
+        ),
+    )
+
+    parser.add_argument(
         "--attention-backend",
         "--attn",
         type=validate_attn_backend,

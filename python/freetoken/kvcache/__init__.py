@@ -132,6 +132,7 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
         device=device,
         dtype=dtype,
         num_req_slots=config.max_running_req + 1,  # + 1 for the dummy request row
+        kv_cache_dtype=getattr(config, "kv_cache_dtype", "model"),
     )
 
 
@@ -143,6 +144,7 @@ def create_kvcache_pool(
     device: torch.device,
     num_swa_tokens: int | None = None,
     num_req_slots: int | None = None,
+    kv_cache_dtype: str = "model",
 ) -> BaseKVCachePool:
     if model_config.has_swa_attention:
         from .hybrid_swa_pool import HybridSWAKVCache
@@ -155,6 +157,7 @@ def create_kvcache_pool(
             num_swa_tokens=num_swa_tokens,
             device=device,
             dtype=dtype,
+            kv_cache_dtype=kv_cache_dtype,
         )
 
     from .mha_pool import MHAKVCache
@@ -219,6 +222,7 @@ def create_kvcache_pool(
             index_ratio=spec.index_ratio,
             num_req_slots=num_req_slots,
             layer_ids=spec.layer_ids,
+            kv_cache_dtype=kv_cache_dtype,
         )
 
     if len(kv_specs) == 1 and kv_specs[0].mla:
@@ -270,6 +274,7 @@ def create_kvcache_pool(
         device=device,
         dtype=dtype,
         layer_ids=layer_ids,
+        kv_cache_dtype=kv_cache_dtype,
     )
 
 

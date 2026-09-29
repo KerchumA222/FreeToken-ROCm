@@ -73,6 +73,7 @@ ft serve --model ... --gpu GPU-9e8d7c6b  # the same card by UUID (a unique prefi
 | `--num-pages` / `--num-tokens` | auto | KV capacity override in pages / tokens (mutually exclusive; auto sizes from VRAM left after weights and MoE cache) |
 | `--page-size` | 1 | KV page size; DSV4 forces 128, the TRTLLM backend needs 16/32/64, SWA models require 1 |
 | `--cache-type` | radix | `radix` (prefix reuse; SWA/GDN-aware variants picked automatically) or `naive` |
+| `--kv-cache-dtype` | model | KV storage format: `model` uses the model dtype; `q8_0` uses per-32-value INT8 blocks with FP16 scales (~47% less KV storage than 16-bit); `turboquant_4bit_nc` uses 4-bit norm-corrected K and 4-bit affine V (~74% less than 16-bit for 128-dim heads). Quantized formats require Triton full-attention MHA/GQA with 16-bit compute; Q8_0 needs head dimensions divisible by 32, TurboQuant needs power-of-two dimensions |
 | `--attention-backend`, `--attn` | auto | `trtllm`/`fi`/`fa`/`triton`/`dsv4_sparse`/`dsa`; `prefill,decode` pair allowed; auto picks per model + GPU |
 
 ### MoE offload

@@ -132,7 +132,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
             f"qsa_sparse backend needs a QSA pool, got {type(self.kvcache).__name__}"
         )
         self.device = self.kvcache.device
-        self.dtype = self.kvcache.dtype
+        self.dtype = getattr(self.kvcache, "_compute_dtype", self.kvcache.dtype)
         self.index_head_dim = self.kvcache.index_head_dim
         self.ratio = self.kvcache.index_ratio
         self.ring_capacity = self.kvcache.ring_capacity
@@ -310,13 +310,29 @@ class QSASparseAttnBackend(BaseAttnBackend):
         self._update_index_cache(index, md, slot)
         indices = self._select(index, md, slot)
         _maybe_dump_selection(indices, md, slot)
-        if (_GEMM_PREFILL and not md.is_decode and not md.rows_as_decode
+        turboquant = getattr(self.kvcache, "kv_cache_dtype", "model") == "turboquant_4bit_nc"
+        if (_GEMM_PREFILL and not turboquant and not md.is_decode and not md.rows_as_decode
                 and q.shape[0] >= _GEMM_MIN_ROWS and not torch.cuda.is_current_stream_capturing()):
             from freetoken.kernel.triton.qsa.attend_tiled import qsa_gemm_attention
 
             return qsa_gemm_attention(
                 q, self.kvcache.k_cache(layer_id), self.kvcache.v_cache(layer_id), indices,
                 md.block_table, md.qo_indptr_cpu.tolist(), torch.empty_like(q),
+            )
+        if turboquant:
+            return qsa_sparse_paged_attention(
+                q,
+                self.kvcache.k_cache(layer_id),
+                self.kvcache.v_cache(layer_id),
+                indices,
+                md.block_table,
+                md.token_to_req,
+                torch.empty_like(q),
+                k_norms=self.kvcache.k_norm_cache(layer_id),
+                v_scales=self.kvcache.v_scale_cache(layer_id),
+                v_zeros=self.kvcache.v_zero_cache(layer_id),
+                centroids=self.kvcache.turboquant_centroids,
+                rotation=self.kvcache.turboquant_rotation,
             )
         return qsa_sparse_paged_attention(
             q,

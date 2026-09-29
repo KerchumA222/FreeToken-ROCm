@@ -46,6 +46,325 @@ def _reference_paged_attention(
     return torch.stack(outs, dim=0)
 
 
+def _dequant_q8_0(cache: torch.Tensor, scales: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    return (
+        cache.float() * scales.repeat_interleave(32, dim=-1).float()
+    ).to(dtype)
+
+
+def _quantize_q8_0_reference(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    blocks = x.detach().cpu().float().reshape(*x.shape[:-1], -1, 32)
+    scale = blocks.abs().amax(dim=-1) / 127.0
+    inverse = torch.where(scale > 0, 1.0 / scale, 0.0)
+    codes = torch.sign(blocks * inverse.unsqueeze(-1)) * torch.floor(
+        (blocks * inverse.unsqueeze(-1)).abs() + 0.5
+    )
+    return codes.to(torch.int8).reshape(*x.shape[:-1], x.shape[-1]), scale.to(torch.float16)
+
+
+def _q8_attention_reference(q, k_codes, k_scales, v_codes, v_scales):
+    k = k_codes.float().squeeze(1) * k_scales.float().repeat_interleave(32, -1).squeeze(1)
+    v = v_codes.float().squeeze(1) * v_scales.float().repeat_interleave(32, -1).squeeze(1)
+    scores = (k * q.float().reshape(1, -1)).sum(-1) / (q.shape[-1] ** 0.5)
+    return (torch.softmax(scores, -1)[:, None] * v).sum(0).reshape_as(q.cpu())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton attention needs CUDA")
+def test_q8_0_paged_attention_dequantizes_in_kernel():
+    from freetoken.kernel.triton.attention import paged_attention
+
+    device = torch.device("cuda")
+    q_cpu = torch.linspace(-0.5, 0.5, 32, dtype=torch.float32).view(1, 1, 32)
+    k_cpu = torch.stack((torch.linspace(-1, 1, 32), torch.linspace(1, -1, 32)))
+    v_cpu = torch.stack((torch.linspace(-0.8, 0.8, 32), torch.linspace(0.6, -0.6, 32)))
+    k_scales_cpu = torch.tensor([[[0.01]], [[0.02]]], dtype=torch.float16)
+    v_scales_cpu = torch.tensor([[[0.03]], [[0.015]]], dtype=torch.float16)
+    k_codes_cpu = (k_cpu * 100).round().to(torch.int8).view(2, 1, 32)
+    v_codes_cpu = (v_cpu * 100).round().to(torch.int8).view(2, 1, 32)
+    q = q_cpu.to(device=device, dtype=torch.bfloat16)
+    k_codes = k_codes_cpu.to(device)
+    v_codes = v_codes_cpu.to(device)
+    k_scales = k_scales_cpu.to(device)
+    v_scales = v_scales_cpu.to(device)
+    indptr = torch.tensor([0, 2], dtype=torch.int32, device=device)
+    indices = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    q_to_req = torch.tensor([0], dtype=torch.int32, device=device)
+    q_positions = torch.tensor([1], dtype=torch.int64, device=device)
+
+    k_scale_values = k_scales_cpu.float().repeat_interleave(32, -1).view(2, 32)
+    v_scale_values = v_scales_cpu.float().repeat_interleave(32, -1).view(2, 32)
+    k_dequant = k_codes_cpu.float().view(2, 32) * k_scale_values
+    v_dequant = v_codes_cpu.float().view(2, 32) * v_scale_values
+    scores = (q_cpu[0, 0] * k_dequant).sum(-1) / (32**0.5)
+    expected = (torch.softmax(scores, -1)[:, None] * v_dequant).sum(0).view(1, 1, 32)
+
+    actual = paged_attention(
+        q, k_codes, v_codes, indptr, indices, q_to_req, q_positions, 32**-0.5,
+        k_scale_cache=k_scales, v_scale_cache=v_scales,
+    )
+    torch.testing.assert_close(actual.float().cpu(), expected, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton attention needs CUDA")
+def test_q8_0_store_kernel_matches_reference():
+    from freetoken.kernel.triton.kv_cache import store_q8_0_cache
+
+    device = torch.device("cuda")
+    x = torch.zeros((1, 1, 32), device=device, dtype=torch.bfloat16)
+    x[0, 0, :4] = torch.tensor([-1.0, -0.5, 0.5, 1.0], device=device, dtype=torch.bfloat16)
+    codes = torch.zeros((4, 1, 32), device=device, dtype=torch.int8)
+    values = torch.empty_like(codes)
+    scales = torch.zeros((4, 1, 1), device=device, dtype=torch.float16)
+    value_scales = torch.empty_like(scales)
+    store_q8_0_cache(
+        k_cache=codes,
+        v_cache=values,
+        k_scale=scales,
+        v_scale=value_scales,
+        indices=torch.tensor([2], dtype=torch.int32, device=device),
+        k=x,
+        v=x,
+    )
+    ref_codes, ref_scales = _quantize_q8_0_reference(x)
+    torch.testing.assert_close(codes[2].cpu(), ref_codes[0])
+    torch.testing.assert_close(scales[2].cpu(), ref_scales[0])
+    torch.testing.assert_close(codes[[0, 1, 3]], torch.zeros_like(codes[[0, 1, 3]]))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton attention needs CUDA")
+def test_q8_0_decode_attention_dequantizes_in_kernel():
+    from freetoken.kernel.triton.attention import decode_paged_attention
+
+    device = torch.device("cuda")
+    q_cpu = torch.linspace(-0.5, 0.5, 32).view(1, 1, 32)
+    k_codes_cpu = torch.stack((torch.arange(-16, 16), torch.arange(16, -16, -1))).to(torch.int8).view(2, 1, 32)
+    v_codes_cpu = torch.stack((torch.arange(32), torch.arange(31, -1, -1))).to(torch.int8).view(2, 1, 32)
+    k_scales_cpu = torch.tensor([[[0.02]], [[0.015]]], dtype=torch.float16)
+    v_scales_cpu = torch.tensor([[[0.01]], [[0.02]]], dtype=torch.float16)
+    q = q_cpu.to(device=device, dtype=torch.bfloat16)
+    k_codes, v_codes = k_codes_cpu.to(device), v_codes_cpu.to(device)
+    k_scales, v_scales = k_scales_cpu.to(device), v_scales_cpu.to(device)
+    indptr = torch.tensor([0, 2], dtype=torch.int32, device=device)
+    indices = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    positions = torch.tensor([1], dtype=torch.int64, device=device)
+    logits = torch.empty(1, 1, 8, 32, dtype=torch.float32, device=device)
+    lse = torch.empty(1, 1, 8, dtype=torch.float32, device=device)
+    splits = torch.full((1,), 8, dtype=torch.int32, device=device)
+    expected = _q8_attention_reference(
+        q_cpu, k_codes_cpu, k_scales_cpu, v_codes_cpu, v_scales_cpu
+    )
+    actual = decode_paged_attention(
+        q, k_codes, v_codes, indptr, indices, positions, logits, lse, splits,
+        8, 32**-0.5, k_scale_cache=k_scales, v_scale_cache=v_scales,
+    )
+    torch.testing.assert_close(actual.float().cpu(), expected, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton attention needs CUDA")
+def test_turboquant_4bit_nc_store_and_attention_match_decoded_reference():
+    from freetoken.kernel.triton.turboquant import (
+        gaussian_centroids,
+        hadamard_rotation,
+        store_turboquant_4bit_nc_cache,
+        turboquant_4bit_nc_attention,
+    )
+
+    device = torch.device("cuda")
+    head_dim = 64
+    centroids_cpu, midpoints_cpu = gaussian_centroids(head_dim)
+    rotation = hadamard_rotation(head_dim, device)
+    centroids = centroids_cpu.to(device)
+    midpoints = midpoints_cpu.to(device)
+    k = torch.randn((2, 1, head_dim), device=device, dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    k_codes = torch.empty((2, 1, head_dim // 2), device=device, dtype=torch.uint8)
+    v_codes = torch.empty_like(k_codes)
+    k_norms = torch.empty((2, 1), device=device, dtype=torch.float16)
+    v_scales = torch.empty_like(k_norms)
+    v_zeros = torch.empty_like(k_norms)
+    store_turboquant_4bit_nc_cache(
+        k_cache=k_codes,
+        v_cache=v_codes,
+        k_norms=k_norms,
+        v_scales=v_scales,
+        v_zeros=v_zeros,
+        indices=torch.tensor([0, 1], dtype=torch.int32, device=device),
+        k=k,
+        v=v,
+        rotation=rotation,
+        centroids=centroids,
+        midpoints=midpoints,
+    )
+
+    d = torch.arange(head_dim, device=device)
+    shifts = (d % 2) * 4
+    decoded_k_idx = ((k_codes.repeat_interleave(2, dim=-1).to(torch.int32) >> shifts) & 15)
+    decoded_k_rot = centroids[decoded_k_idx]
+    decoded_k_rot = decoded_k_rot / decoded_k_rot.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+    decoded_k = (decoded_k_rot * k_norms[..., None]) @ rotation
+    decoded_v_idx = ((v_codes.repeat_interleave(2, dim=-1).to(torch.int32) >> shifts) & 15).float()
+    decoded_v = decoded_v_idx * v_scales[..., None] + v_zeros[..., None]
+    q = torch.randn((1, 1, head_dim), device=device, dtype=torch.bfloat16)
+    scores = torch.einsum("bhd,thd->bht", q.float(), decoded_k.float()) / (head_dim**0.5)
+    expected = torch.einsum("bht,thd->bhd", scores.softmax(-1), decoded_v.float())
+
+    actual = turboquant_4bit_nc_attention(
+        q=q,
+        k_cache=k_codes,
+        v_cache=v_codes,
+        k_norms=k_norms,
+        v_scales=v_scales,
+        v_zeros=v_zeros,
+        centroids=centroids,
+        indptr=torch.tensor([0, 2], dtype=torch.int32, device=device),
+        indices=torch.tensor([0, 1], dtype=torch.int32, device=device),
+        q_to_req=torch.tensor([0], dtype=torch.int32, device=device),
+        q_positions=torch.tensor([1], dtype=torch.int64, device=device),
+        sm_scale=head_dim**-0.5,
+        rotation=rotation,
+    )
+    torch.testing.assert_close(actual.float(), expected, atol=3e-2, rtol=3e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton attention needs CUDA")
+def test_q8_0_extend_attention_dequantizes_prefix_in_kernel():
+    from freetoken.kernel.triton.attention import extend_paged_attention
+
+    device = torch.device("cuda")
+    q_cpu = torch.linspace(-0.5, 0.5, 32).view(1, 1, 32)
+    k_codes_cpu = torch.arange(-16, 16).to(torch.int8).view(1, 1, 32)
+    v_codes_cpu = torch.arange(32).to(torch.int8).view(1, 1, 32)
+    k_scales_cpu = torch.tensor([[[0.02]]], dtype=torch.float16)
+    v_scales_cpu = torch.tensor([[[0.01]]], dtype=torch.float16)
+    q = q_cpu.to(device=device, dtype=torch.bfloat16)
+    k_codes, v_codes = k_codes_cpu.to(device), v_codes_cpu.to(device)
+    k_scales, v_scales = k_scales_cpu.to(device), v_scales_cpu.to(device)
+    k_extend = torch.full((1, 1, 32), 0.25, dtype=torch.bfloat16, device=device)
+    v_extend = torch.linspace(-0.5, 0.5, 32, dtype=torch.bfloat16, device=device).view(1, 1, 32)
+    k_prefix = _dequant_q8_0(k_codes_cpu, k_scales_cpu, torch.float32).view(32)
+    v_prefix = _dequant_q8_0(v_codes_cpu, v_scales_cpu, torch.float32).view(32)
+    k_all = torch.stack((k_prefix, k_extend.cpu().float().view(32)))
+    v_all = torch.stack((v_prefix, v_extend.cpu().float().view(32)))
+    scores = (k_all * q_cpu.view(32)).sum(-1) / (32**0.5)
+    expected = (torch.softmax(scores, -1)[:, None] * v_all).sum(0).view(1, 1, 32)
+    actual = extend_paged_attention(
+        q,
+        k_codes,
+        v_codes,
+        torch.tensor([0, 1], dtype=torch.int32, device=device),
+        torch.tensor([0, 2], dtype=torch.int32, device=device),
+        torch.tensor([0, 1], dtype=torch.int32, device=device),
+        torch.tensor([1], dtype=torch.int32, device=device),
+        1,
+        32**-0.5,
+        k_extend=k_extend,
+        v_extend=v_extend,
+        k_scale_cache=k_scales,
+        v_scale_cache=v_scales,
+    )
+    torch.testing.assert_close(actual.float().cpu(), expected, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton attention needs CUDA")
+def test_q8_0_store_and_attention_paths_match_dequantized_reference():
+    from freetoken.kernel.triton.attention import (
+        decode_paged_attention,
+        extend_paged_attention,
+        paged_attention,
+    )
+    from freetoken.kernel.triton.kv_cache import store_q8_0_cache
+
+    torch.manual_seed(17)
+    device = torch.device("cuda")
+    head_dim, num_kv_heads, num_q_heads = 64, 2, 4
+    num_slots = 8
+    k_input = torch.randn(6, num_kv_heads, head_dim, device=device, dtype=torch.bfloat16)[::2]
+    v_input = torch.randn_like(k_input)
+    k_codes = torch.empty(num_slots, num_kv_heads, head_dim, device=device, dtype=torch.int8)
+    v_codes = torch.empty_like(k_codes)
+    k_scales = torch.empty(
+        num_slots, num_kv_heads, head_dim // 32, device=device, dtype=torch.float16
+    )
+    v_scales = torch.empty_like(k_scales)
+    k_codes.zero_()
+    v_codes.zero_()
+    k_scales.zero_()
+    v_scales.zero_()
+    out_loc = torch.tensor([0, 3, 6], dtype=torch.int32, device=device)
+    store_q8_0_cache(
+        k_cache=k_codes, v_cache=v_codes, k_scale=k_scales, v_scale=v_scales,
+        indices=out_loc, k=k_input.view(3, -1), v=v_input.view(3, -1),
+    )
+    ref_codes, ref_scales = _quantize_q8_0_reference(k_input)
+    torch.testing.assert_close(k_codes[out_loc.long()].cpu(), ref_codes)
+    torch.testing.assert_close(k_scales[out_loc.long()].cpu(), ref_scales)
+    k_ref = _dequant_q8_0(k_codes, k_scales, torch.bfloat16)
+    v_ref = _dequant_q8_0(v_codes, v_scales, torch.bfloat16)
+    assert torch.equal(k_codes[[1, 2, 4, 5, 7]], torch.zeros_like(k_codes[[1, 2, 4, 5, 7]]))
+
+    # Non-contiguous page order exercises scale lookup through the same logical slot map.
+    indptr = torch.tensor([0, 3], dtype=torch.int32, device=device)
+    indices = torch.tensor([6, 0, 3], dtype=torch.int32, device=device)
+    q_to_req = torch.tensor([0, 0, 0], dtype=torch.int32, device=device)
+    q_positions = torch.tensor([0, 1, 2], dtype=torch.int64, device=device)
+    q = torch.randn(3, num_q_heads, head_dim, device=device, dtype=torch.bfloat16)
+    expected = _reference_paged_attention(
+        q, k_ref, v_ref, indptr, indices, q_to_req, q_positions,
+        head_dim**-0.5, None,
+    )
+    actual = paged_attention(
+        q, k_codes, v_codes, indptr, indices, q_to_req, q_positions,
+        head_dim**-0.5, k_scale_cache=k_scales, v_scale_cache=v_scales,
+    )
+    torch.testing.assert_close(actual.float(), expected.float(), atol=2e-2, rtol=2e-2)
+
+    q_decode = q[:1]
+    decode_indptr = torch.tensor([0, 3], dtype=torch.int32, device=device)
+    decode_indices = indices
+    decode_pos = torch.tensor([2], dtype=torch.int64, device=device)
+    logits = torch.empty(1, num_q_heads, 8, head_dim, device=device, dtype=torch.float32)
+    lse = torch.empty(1, num_q_heads, 8, device=device, dtype=torch.float32)
+    splits = torch.full((1,), 8, dtype=torch.int32, device=device)
+    decode_expected = _reference_paged_attention(
+        q_decode, k_ref, v_ref, decode_indptr, decode_indices,
+        torch.tensor([0], dtype=torch.int32, device=device), decode_pos,
+        head_dim**-0.5, None,
+    )
+    decode_actual = decode_paged_attention(
+        q_decode, k_codes, v_codes, decode_indptr, decode_indices, decode_pos,
+        logits, lse, splits, 8, head_dim**-0.5,
+        k_scale_cache=k_scales, v_scale_cache=v_scales,
+    )
+    torch.testing.assert_close(decode_actual.float(), decode_expected.float(), atol=2e-2, rtol=2e-2)
+
+    # Extend attention consumes compressed cached prefix rows and full precision new rows.
+    q_ext = q[1:]
+    k_ext = torch.randn(2, num_kv_heads, head_dim, device=device, dtype=torch.bfloat16)
+    v_ext = torch.randn_like(k_ext)
+    ext_indptr = torch.tensor([0, 3], dtype=torch.int32, device=device)
+    ext_indices = torch.tensor([6, 7, 1], dtype=torch.int32, device=device)
+    prefix = torch.tensor([1], dtype=torch.int32, device=device)
+    qo_indptr = torch.tensor([0, 2], dtype=torch.int32, device=device)
+    ext_q_to_req = torch.tensor([0, 0], dtype=torch.int32, device=device)
+    ext_positions = torch.tensor([1, 2], dtype=torch.int64, device=device)
+    k_all = k_ref.clone()
+    v_all = v_ref.clone()
+    k_all[7] = k_ext[0]
+    k_all[1] = k_ext[1]
+    v_all[7] = v_ext[0]
+    v_all[1] = v_ext[1]
+    ext_expected = _reference_paged_attention(
+        q_ext, k_all, v_all, ext_indptr, ext_indices, ext_q_to_req,
+        ext_positions, head_dim**-0.5, None,
+    )
+    ext_actual = extend_paged_attention(
+        q_ext, k_codes, v_codes, qo_indptr, ext_indptr, ext_indices, prefix,
+        2, head_dim**-0.5, k_extend=k_ext, v_extend=v_ext,
+        k_scale_cache=k_scales, v_scale_cache=v_scales,
+    )
+    torch.testing.assert_close(ext_actual.float(), ext_expected.float(), atol=2e-2, rtol=2e-2)
+
+
 def test_triton_backend_passes_attention_sinks_to_paged_kernel(monkeypatch):
     from freetoken.attention import AttentionSpec
     from freetoken.attention.triton import TritonAttentionBackend, TritonMetadata
