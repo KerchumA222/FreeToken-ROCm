@@ -1884,10 +1884,11 @@ vec_dot_iq2_s_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ 
   for (int l = 0; l < 2; ++l) {
     const uint32_t* grid =
         (const uint32_t*)(iq2s_grid + (bq2->qs[4 * ib32 + l] | ((bq2->qh[ib32] << (8 - 2 * l)) & 0x300)));
-    const uint32_t signs0 = __vcmpeq4(((signs[l] & 0xf) * 0x01010101) & 0x08040201, 0x08040201);
-    const uint32_t signs1 = __vcmpeq4(((signs[l] >> 4) * 0x01010101) & 0x08040201, 0x08040201);
-    const int grid_l = __vsub4(grid[0] ^ signs0, signs0);
-    const int grid_h = __vsub4(grid[1] ^ signs1, signs1);
+    const uint32_t signs0 = ft_sign_mask4[signs[l] & 0xf];
+    const uint32_t signs1 = ft_sign_mask4[signs[l] >> 4];
+    // IQ2_S grid bytes are nonzero, so negation cannot carry between bytes.
+    const int grid_l = (int)((grid[0] ^ signs0) + (signs0 & 0x01010101u));
+    const int grid_h = (int)((grid[1] ^ signs1) + (signs1 & 0x01010101u));
     sumi1 = __dp4a(grid_l, *((const int*)q8 + 0), sumi1);
     sumi1 = __dp4a(grid_h, *((const int*)q8 + 1), sumi1);
     q8 += 8;
@@ -1896,10 +1897,10 @@ vec_dot_iq2_s_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ 
   for (int l = 2; l < 4; ++l) {
     const uint32_t* grid =
         (const uint32_t*)(iq2s_grid + (bq2->qs[4 * ib32 + l] | ((bq2->qh[ib32] << (8 - 2 * l)) & 0x300)));
-    const uint32_t signs0 = __vcmpeq4(((signs[l] & 0xf) * 0x01010101) & 0x08040201, 0x08040201);
-    const uint32_t signs1 = __vcmpeq4(((signs[l] >> 4) * 0x01010101) & 0x08040201, 0x08040201);
-    const int grid_l = __vsub4(grid[0] ^ signs0, signs0);
-    const int grid_h = __vsub4(grid[1] ^ signs1, signs1);
+    const uint32_t signs0 = ft_sign_mask4[signs[l] & 0xf];
+    const uint32_t signs1 = ft_sign_mask4[signs[l] >> 4];
+    const int grid_l = (int)((grid[0] ^ signs0) + (signs0 & 0x01010101u));
+    const int grid_h = (int)((grid[1] ^ signs1) + (signs1 & 0x01010101u));
     sumi2 = __dp4a(grid_l, *((const int*)q8 + 0), sumi2);
     sumi2 = __dp4a(grid_h, *((const int*)q8 + 1), sumi2);
     q8 += 8;

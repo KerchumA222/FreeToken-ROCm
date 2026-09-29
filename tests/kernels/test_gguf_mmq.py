@@ -10,7 +10,7 @@ from __future__ import annotations
 import ctypes
 import pytest
 import torch
-from freetoken.kernel.gguf import ggml_dequantize, ggml_mul_mat_a8
+from freetoken.kernel.gguf import ggml_dequantize, ggml_moe_a8_vec, ggml_mul_mat_a8
 
 PAGE_SIZE = 4096
 IN_FEATURES = 640
@@ -141,3 +141,23 @@ def test_q5_0_mmq_parity():
         rel_err = diff / (out_ref.abs() + 1e-5)
         assert torch.isfinite(out_mmq).all()
         assert rel_err.mean().item() < 0.05
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA/HIP")
+def test_iq2_s_moe_vec_parity():
+    torch.manual_seed(17)
+    experts, out_features, in_features = 2, 128, 256
+    packed = torch.randint(0, 256, (experts, out_features, 82), dtype=torch.uint8, device="cuda")
+    scale_half = torch.tensor([0.02], dtype=torch.float16).view(torch.uint8).to("cuda")
+    packed[..., 0] = scale_half[0]
+    packed[..., 1] = scale_half[1]
+    x = torch.randn(1, in_features, dtype=torch.float16, device="cuda")
+    ids = torch.arange(experts, dtype=torch.int32, device="cuda").view(1, experts)
+
+    out = ggml_moe_a8_vec(x, packed, ids, experts, 22, out_features, 1)
+    ref = torch.cat([
+        x @ ggml_dequantize(packed[expert], 22, out_features, in_features, torch.float16).T
+        for expert in range(experts)
+    ], dim=0)
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out, ref, rtol=0.05, atol=0.25)
