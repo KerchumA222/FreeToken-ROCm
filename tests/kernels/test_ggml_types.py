@@ -256,10 +256,10 @@ def _at_guard(raw: np.ndarray, k: int) -> torch.Tensor:
     return storage[:rows]
 
 
-@pytest.mark.parametrize(("ggml_type", "k"), [pytest.param(t, k, id=f"{type_name(t)}-K{k}") for t in (Q.Q4_0, Q.Q4_1, Q.Q5_0, Q.Q5_1, Q.Q8_0, Q.IQ4_NL, Q2_0_SYM) for k in (640, 320, 192, 160) if k % _block(t)[0] == 0])
-def test_tail_reads_stay_in_pad_rows(ggml_type, k):
-    """The 32-wide types tile K in steps that do not divide these K: MMQ, MMVQ and the MoE kernels must read no further than the pad rows
-    the loaders add (the old GGUF kernels read past the row on a partial K tile and faulted when that crossed into an unmapped page)."""
+_GUARD_CASES = [(int(t), k) for t in (Q.Q4_0, Q.Q4_1, Q.Q5_0, Q.Q5_1, Q.Q8_0, Q.IQ4_NL, Q2_0_SYM) for k in (640, 320, 192, 160) if k % _block(t)[0] == 0]
+
+
+def _guarded_case(ggml_type: int, k: int) -> None:
     from freetoken.kernel import ggml
 
     experts, n = 4, 64
@@ -277,3 +277,22 @@ def test_tail_reads_stay_in_pad_rows(ggml_type, k):
         expected = torch.einsum("tk,tjnk->tjn", x, ref.view(experts, n, k)[ids.long()])
         _close(ggml.mul_mat_id(banks, ggml_type, x.cuda(), ids.cuda()), expected, 2e-4, f"guarded mul_mat_id T={t}")
     torch.cuda.synchronize()
+
+
+def test_tail_reads_stay_in_pad_rows():
+    """The 32-wide types tile K in steps that do not divide these K: MMQ, MMVQ and the MoE kernels must read no further than the pad rows
+    the loaders add (the old GGUF kernels read past the row on a partial K tile and faulted when that crossed into an unmapped page).
+
+    Runs in a fresh process: the HIP VMM guard mapping is unreliable in a process that has already allocated a lot (and a fault there
+    would take the rest of the session down)."""
+    import subprocess
+    import sys
+
+    if getattr(torch.version, "hip", None) is None:
+        pytest.skip("the guard page uses the HIP VMM API")
+    script = f"import sys; sys.path.insert(0, {os.path.dirname(__file__)!r}); import test_ggml_types as T\n" + "".join(
+        f"T._guarded_case({t}, {k}); print('ok {type_name(t)} K={k}', flush=True)\n" for t, k in _GUARD_CASES
+    )
+    result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=600)
+    assert result.returncode == 0, result.stdout[-2000:] + result.stderr[-4000:]
+    assert result.stdout.count("ok ") == len(_GUARD_CASES)
