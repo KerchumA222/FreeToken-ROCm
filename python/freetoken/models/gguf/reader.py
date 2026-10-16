@@ -159,11 +159,18 @@ class GgufTensorInfo:
 @functools.cache
 def gguf_tensor_index(model_path: str) -> dict[str, GgufTensorInfo]:
     """Every tensor of every split, by name."""
+    from freetoken.layers.quantization.ggml_types import Q2_0_CODEBOOK_KV, Q2_0_SYM, Q2_0_SYMMETRIC_ODD
+
+    paths = gguf_split_paths(model_path)
+    q2_0_sym = _field_value(_reader(paths[0]), Q2_0_CODEBOOK_KV) == Q2_0_SYMMETRIC_ODD
     index: dict[str, GgufTensorInfo] = {}
-    for path in gguf_split_paths(model_path):
+    for path in paths:
         for t in _reader(path).tensors:
+            ggml_type = int(t.tensor_type)
+            if q2_0_sym and ggml_type == 42:  # GGMLQuantizationType.Q2_0
+                ggml_type = Q2_0_SYM
             index[t.name] = GgufTensorInfo(
-                t.name, path, int(t.data_offset), int(t.n_bytes), int(t.tensor_type), tuple(int(x) for x in t.shape), model_path
+                t.name, path, int(t.data_offset), int(t.n_bytes), ggml_type, tuple(int(x) for x in t.shape), model_path
             )
     return index
 

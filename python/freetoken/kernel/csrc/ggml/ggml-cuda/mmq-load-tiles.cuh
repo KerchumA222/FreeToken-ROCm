@@ -120,6 +120,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     const int txi  = threadIdx.x % threads_per_row;
     const int kbx  = txi / QI2_0;
     const int kqsx = txi % QI2_0;
+    constexpr int lut = type == GGML_TYPE_Q2_0_SYM ? Q2_0_SYM_LUT : Q2_0_LUT;
 
 #pragma unroll
     for (int i0 = 0; i0 < I; i0 += nrows*nwarps) {
@@ -142,12 +143,12 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
             const uint32_t qx_indices = (q & 0x03) | ((q & 0x0C) << 6) | ((q & 0x30) << 12) | ((q & 0xC0) << 18);
             const uint32_t qy_bits    = q >> 8;
             const uint32_t qy_indices = (qy_bits & 0x03) | ((qy_bits & 0x0C) << 6) | ((qy_bits & 0x30) << 12) | ((qy_bits & 0xC0) << 18);
-            const int qx = __builtin_amdgcn_perm(0x020100FF, 0x020100FF, qx_indices);
-            const int qy = __builtin_amdgcn_perm(0x020100FF, 0x020100FF, qy_indices);
+            const int qx = __builtin_amdgcn_perm(lut, lut, qx_indices);
+            const int qy = __builtin_amdgcn_perm(lut, lut, qy_indices);
 #else
             // unpack even and odd crumbs into byte values
-            const int qe = __byte_perm(0x020100FF, 0x020100FF, q >> 0);
-            const int qo = __byte_perm(0x020100FF, 0x020100FF, q >> 2);
+            const int qe = __byte_perm(lut, lut, q >> 0);
+            const int qo = __byte_perm(lut, lut, q >> 2);
             // unshuffle values
             const int qx = __byte_perm(qe, qo, 0x5140);
             const int qy = __byte_perm(qe, qo, 0x7362);
