@@ -857,6 +857,22 @@ def parse_args(
             "--moe-cache-size > 2 * num_experts."
         ),
     )
+    parser.add_argument(
+        "--moe-disk-tier",
+        action="store_true",
+        default=ServerArgs.moe_disk_tier,
+        help=(
+            "GGUF only, --moe-strategy offload: keep the routed experts in the GGUF files and read them on demand into a bounded "
+            "pinned host cache (--moe-host-cache-mem) instead of loading every expert into host RAM, for models bigger than RAM. "
+            "Decode runs without CUDA graphs and prefill without overlap."
+        ),
+    )
+    parser.add_argument(
+        "--moe-host-cache-mem",
+        type=_parse_mem_size,
+        default=ServerArgs.moe_host_cache_mem,
+        help="Pinned host RAM for the --moe-disk-tier expert cache, e.g. 8GiB (default: a quarter of the available RAM).",
+    )
 
     parser.add_argument(
         "--shell-mode",

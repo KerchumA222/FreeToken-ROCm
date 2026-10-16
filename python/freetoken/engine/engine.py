@@ -673,7 +673,8 @@ class Engine:
         method = shared_offload_method(self.model)
         num_moe_layers = config.model_config.num_moe_layers
         cpu_layer_ids = _resolve_cpu_layers(config, num_moe_layers, reserved=self._host_tables_bytes, method=method)
-        _check_pin_budget(config, reserved=self._host_tables_bytes, method=method)
+        if not config.moe_disk_tier:
+            _check_pin_budget(config, reserved=self._host_tables_bytes, method=method)
         # the kernels were picked for model_config.decode_target; --moe-cpu-layers auto may still find that every bank fits the pin budget
         decode_target = config.model_config.decode_target
         if decode_target == "cpu" and not cpu_layer_ids:
@@ -737,6 +738,7 @@ class Engine:
                     dummy=config.use_dummy_weight,
                     parallel=expert_parallel,
                     layer_residency=requested_residency,
+                    on_disk=config.moe_disk_tier,
                 )
         except PinFailed as exc:
             raise RuntimeError(f"{exc}; {_pin_hint(self._host_tables_bytes)}") from exc
@@ -828,6 +830,8 @@ class Engine:
         )
         # before set_bank_sources: the residency validation and the copy plan's skip of non-pinned layers key on the CPU-layer set
         cache.cpu_layer_ids = cpu_layer_ids
+        if banks.on_disk:
+            self._attach_disk_tier(config, cache)
         cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency, layer_tags=banks.layer_tags, row_tail_bytes=banks.row_tail_bytes)
         cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
         if decode_target == "hybrid":
@@ -842,6 +846,17 @@ class Engine:
         self.ctx.moe_offload_cache = cache
         self.moe_offload_cache = cache
         return cache
+
+    def _attach_disk_tier(self, config: EngineConfig, cache: OffloadMoeCache) -> None:
+        from freetoken.moe.disk_tier import GgufExpertStore
+
+        mc = config.model_config
+        host_bytes = config.moe_host_cache_mem
+        if host_bytes is None:
+            host_bytes = _mem_available_bytes() // 4
+            logger.info_rank0(f"--moe-disk-tier: host expert cache of {host_bytes / 2**30:.1f} GiB (a quarter of the available RAM; --moe-host-cache-mem sets it)")
+        min_slots = min(mc.num_experts, mc.num_experts_per_tok * config.max_running_req)
+        cache.attach_disk_tier(GgufExpertStore(config.model_path, mc.num_moe_layers), host_bytes, min_slots)
 
     def _moe_pool_bytes(self, pool_sizes: list[int]) -> int:
         return sum(s * self._moe_layer_slot_bytes[g[0]] for g, s in zip(self._moe_pool_groups, pool_sizes))
@@ -1462,6 +1477,17 @@ def _cpu_moe_executor_viable(model_config) -> bool:
     return fmt == "mxfp4" or fmt in _cpu_moe.weight_formats()
 
 
+def _mem_available_bytes() -> int:
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return 8 << 30
+
+
 def _pin_budget_bytes(reserved: int = 0) -> int | None:
     """Bytes this process can still safely cudaHostRegister, or None when the platform does not cap pinning (plain Linux).
 
@@ -1545,6 +1571,8 @@ _DENSE_MOE_SETTINGS = {
     "moe_prefill_overlap": True,
     "moe_prefill_hit_d2d": False,
     "expert_load": "auto",
+    "moe_disk_tier": False,
+    "moe_host_cache_mem": None,
 }
 
 
@@ -1603,6 +1631,26 @@ def offload_expert_method(config: EngineConfig):
     with torch.device("meta"), torch_dtype(config.dtype):
         model = create_model(config.model_config)
     return shared_offload_method(model)
+
+
+def _adjust_disk_tier_config(config: EngineConfig, override) -> None:
+    """--moe-disk-tier: GPU offload decode of a GGUF's experts, eager decode (the miss count is read back per layer) and routed-only prefill staging."""
+    from freetoken.models.gguf.reader import is_gguf_path
+
+    if not is_gguf_path(config.model_path):
+        raise ValueError("--moe-disk-tier reads routed experts straight from a GGUF checkpoint; this model is not GGUF")
+    if config.moe_strategy == "hybrid" and config.moe_cpu_layers is None:
+        logger.info_rank0("--moe-disk-tier decodes every expert on the GPU; using --moe-strategy offload instead of hybrid")
+        override("moe_strategy", "offload")
+    if config.moe_strategy != "offload" or config.moe_cpu_layers:
+        raise ValueError(f"--moe-disk-tier needs --moe-strategy offload without --moe-cpu-layers (got {config.moe_strategy!r})")
+    for name, value in (("moe_prefill_overlap", False), ("moe_prefill_hit_d2d", False)):
+        if getattr(config, name) != value:
+            override(name, value)
+    if config.cuda_graph_max_bs != 0 or config.cuda_graph_bs:
+        logger.info_rank0("--moe-disk-tier: decode runs without CUDA graphs (each MoE layer reads its expert misses back to the host)")
+        override("cuda_graph_bs", [])
+        override("cuda_graph_max_bs", 0)
 
 
 def _adjust_config(config: EngineConfig):
@@ -1925,6 +1973,9 @@ def _adjust_config(config: EngineConfig):
     if is_moe and config.moe_cpu_layers and config.moe_cpu_layers.strip() != "auto":
         if not _parse_cpu_layers_spec(config.moe_cpu_layers, model_config.num_moe_layers):
             override("moe_cpu_layers", None)
+
+    if is_moe and getattr(config, "moe_disk_tier", False):
+        _adjust_disk_tier_config(config, override)
 
     if is_moe:
         object.__setattr__(model_config, "moe_strategy", config.moe_strategy)
