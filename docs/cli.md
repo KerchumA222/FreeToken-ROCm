@@ -97,6 +97,8 @@ See [models.md](models.md#moe-strategies) for what each strategy does, and [perf
 | `--moe-collect-stats` | off | Log decode MoE stats with each decode log line: hit rate, and per layer-step the misses, experts fetched and experts computed on CPU, for pinned, locked and CPU-only layers |
 | `--moe-prefill-hit-d2d` | off | Prefill: copy cache-hit experts device-side, stream only misses (CUDA >= 13) |
 | `--disable-moe-prefill-overlap` | overlap on | Disable the two-buffer prefill copy overlap |
+| `--moe-disk-tier` | off | GGUF + `offload` only: leave the routed experts in the GGUF files and read them on demand (O_DIRECT; `FREETOKEN_DISK_TIER_IO=buffered` reads through the page cache) into a bounded pinned host cache, for models whose experts exceed RAM. Decode runs without CUDA graphs and prefill stages only the routed experts, without overlap |
+| `--moe-host-cache-mem` | 1/4 of available RAM | With `--moe-disk-tier`: pinned host RAM for the expert cache, e.g. `8GiB` |
 
 ### API behaviour
 

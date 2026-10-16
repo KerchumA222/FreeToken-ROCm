@@ -1,12 +1,16 @@
 """The MoE disk tier (--moe-disk-tier): GGUF experts read from their files into a bounded pinned host cache.
 
 Factuality only: every expert row the tier hands to the GPU must be byte-identical to the row the complete-bank loader builds, through
-pool hits, misses, evictions, prefill staging and mixed per-layer ggml types."""
+pool hits, misses, evictions, prefill staging and mixed per-layer ggml types; and a real model must decode the same greedy tokens with the
+tier on (and a host cache forced tiny) as with every expert in host RAM."""
 
 from __future__ import annotations
 
+import json
 import os
 import struct
+import subprocess
+import sys
 
 import numpy as np
 import pytest
@@ -288,3 +292,85 @@ def test_decode_and_prefill_slots_hold_the_resident_rows(expert_gguf, host_bytes
         decode(1, batch=2)
     _check_prefill(cache, ref, layers, rng)
     decode(30)
+
+
+def test_disk_tier_config_turns_off_graphs_and_prefill_overlap(expert_gguf):
+    from types import SimpleNamespace
+
+    from freetoken.engine.engine import _adjust_disk_tier_config
+
+    path, _ = expert_gguf
+
+    def config(**kw):
+        base = dict(model_path=path, moe_strategy="offload", moe_cpu_layers=None, moe_prefill_overlap=True, moe_prefill_hit_d2d=True, cuda_graph_bs=None, cuda_graph_max_bs=4)
+        return SimpleNamespace(**(base | kw))
+
+    def override(cfg):
+        return lambda name, value: setattr(cfg, name, value)
+
+    cfg = config()
+    _adjust_disk_tier_config(cfg, override(cfg))
+    assert (cfg.moe_prefill_overlap, cfg.moe_prefill_hit_d2d, cfg.cuda_graph_bs, cfg.cuda_graph_max_bs) == (False, False, [], 0)
+    cfg = config(moe_strategy="hybrid")
+    _adjust_disk_tier_config(cfg, override(cfg))
+    assert cfg.moe_strategy == "offload"
+    for bad in (config(moe_strategy="cpu"), config(moe_cpu_layers="4"), config(moe_strategy="fused"), config(model_path=os.path.dirname(path))):
+        with pytest.raises(ValueError, match="disk-tier"):
+            _adjust_disk_tier_config(bad, override(bad))
+
+
+_QWEN36 = os.path.expanduser("~/models/Qwen3.6-35B-A3B/Qwen3.6-35B-A3B-Q4_0exp.gguf")
+
+_RUN = r"""
+import json, sys, torch
+from freetoken.core import SamplingParams
+from freetoken.llm import LLM
+path, extra, out = sys.argv[1], json.loads(sys.argv[2]), sys.argv[3]
+llm = LLM(model_path=path, dtype=torch.bfloat16, max_running_req=1, max_seq_len_override=2048, moe_strategy="offload", **extra)
+prompts = ["The capital of France is", "Write a haiku about the sea.\n", "def fibonacci(n):"]
+res = llm.generate(prompts, SamplingParams(temperature=0.0, max_tokens=32, ignore_eos=True))
+tier = llm.engine.moe_offload_cache.host_tier
+json.dump({"tokens": [r["token_ids"] for r in res], "tier": None if tier is None else [tier.hits, tier.misses]}, open(out, "w"))
+"""
+
+
+def _greedy(tmp_path, name: str, extra: dict, model: str = _QWEN36) -> dict:
+    out = tmp_path / f"{name}.json"
+    script = tmp_path / "run.py"
+    script.write_text(_RUN)
+    extra = {"moe_cache_size": 512} | extra if model == _QWEN36 else extra
+    proc = subprocess.run([sys.executable, str(script), model, json.dumps(extra), str(out)], capture_output=True, text=True, timeout=1800)
+    assert proc.returncode == 0, proc.stderr[-4000:]
+    return json.loads(out.read_text())
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not torch.cuda.is_available() or not os.path.isfile(_QWEN36), reason="needs a GPU and the Qwen3.6-35B-A3B GGUF")
+def test_qwen36_greedy_decode_is_the_same_with_the_disk_tier(tmp_path):
+    """Every expert in pinned host RAM (eager, and the default CUDA-graph + prefill-overlap run) against the disk tier with a host cache of
+    one decode step per layer (every miss read from disk) and with a 4 GiB one (hits and misses): the same greedy tokens."""
+    eager = _greedy(tmp_path, "eager", {"cuda_graph_max_bs": 0, "moe_prefill_overlap": False})
+    graphs = _greedy(tmp_path, "graphs", {})
+    tiny = _greedy(tmp_path, "tiny", {"moe_disk_tier": True, "moe_host_cache_mem": 1})
+    big = _greedy(tmp_path, "big", {"moe_disk_tier": True, "moe_host_cache_mem": 4 << 30})
+    assert all(len(t) == 32 for t in eager["tokens"])
+    assert tiny["tier"][0] == 0 and tiny["tier"][1] > 0
+    assert big["tier"][0] > 0 and big["tier"][1] > 0
+    assert tiny["tokens"] == eager["tokens"]
+    assert big["tokens"] == eager["tokens"]
+    assert graphs["tokens"] == eager["tokens"]
+
+
+_FLASH_NEXT_IQ1_M = os.path.expanduser("~/models/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF/IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf")
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not torch.cuda.is_available() or not os.path.isfile(_FLASH_NEXT_IQ1_M), reason="needs a GPU and the Flash-Next IQ1_M GGUF")
+def test_flash_next_greedy_decode_is_the_same_with_the_disk_tier(tmp_path):
+    """Flash-Next's experts come in several ggml types (one host pool per slot layout); its IQ1_M experts (23 GiB) still fit in host RAM,
+    so the tier with a tiny host cache can be checked against every expert pinned."""
+    cache = {"moe_cache_size": 4096, "kv_reserve_tokens": 4096}
+    base = _greedy(tmp_path, "base", cache | {"cuda_graph_max_bs": 0, "moe_prefill_overlap": False}, _FLASH_NEXT_IQ1_M)
+    tier = _greedy(tmp_path, "tier", cache | {"moe_disk_tier": True, "moe_host_cache_mem": 1}, _FLASH_NEXT_IQ1_M)
+    assert tier["tier"][1] > 0
+    assert tier["tokens"] == base["tokens"]
