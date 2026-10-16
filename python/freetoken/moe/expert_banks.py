@@ -52,6 +52,8 @@ class ExpertBanks:
     layer_tags: list | None = None
     # per bank, per layer: bytes past an expert matrix's last row that the kernel reads and that must read as zeros (ggml MMQ); None = no such reads
     row_tail_bytes: dict[str, list[int]] | None = None
+    # the sources are meta tensors (shapes and types only) and the experts stay in the checkpoint files, for the disk tier
+    on_disk: bool = False
 
 
 def _dummy_fill(role: str, tensor: torch.Tensor) -> None:
@@ -256,6 +258,7 @@ def load_expert_banks(
     layer_sink=None,
     layer_residency: list[str] | None = None,
     resident: bool = False,
+    on_disk: bool = False,
 ) -> ExpertBanks:
     """Load (or fabricate, with ``dummy=True``) the expert banks. Two paths, both returning
     the same normalized ``ExpertBanks`` and both pinning after fill:
@@ -282,9 +285,17 @@ def load_expert_banks(
     Applied labels are echoed on ``ExpertBanks.layer_residency``; a loader that settles some other way leaves it ``None`` (CPU-layer decode still works on pinned banks, it just saves no pin quota).
 
     ``resident`` (with ``method``): the banks land on ``device`` for the resident 'fused' experts; no host bank outlives the load.
+
+    ``on_disk`` (GGUF only, --moe-disk-tier): read no expert, return meta banks with the layer shapes (see ``ExpertBanks.on_disk``).
     """
     from freetoken.checkpoint.ftw import is_ftw_checkpoint, load_ftw_banks, load_ftw_banks_to_device
 
+    if on_disk:
+        if dummy or resident or method is None or method.kind is not QuantKind.GGUF:
+            raise ValueError("--moe-disk-tier serves the routed experts of a GGUF checkpoint from its files; this checkpoint's experts are not GGUF")
+        from freetoken.models.gguf.experts import load_gguf_expert_banks
+
+        return load_gguf_expert_banks(model_path, model_config.num_moe_layers, on_disk=True)
     if resident:
         assert method is not None and layer_sink is None and layer_residency is None
     if model_path and is_ftw_checkpoint(model_path) and not dummy:
