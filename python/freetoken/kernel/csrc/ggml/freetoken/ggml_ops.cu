@@ -425,6 +425,8 @@ void op_get_rows(TensorView w, int64_t type_id, int64_t k, TensorView ids, Tenso
 
 bool op_uses_mmvq(int64_t type_id, int64_t m) { return ggml_cuda_should_use_mmvq((ggml_type) type_id, device_cc(), m); }
 
+bool op_uses_mmq(int64_t type_id, int64_t m, int64_t n_experts) { return ggml_cuda_should_use_mmq((ggml_type) type_id, device_cc(), m, n_experts); }
+
 int64_t op_mmvq_max_tokens(int64_t type_id) {
     return std::min<int64_t>(MMVQ_MAX_BATCH_SIZE, get_mmvq_mmid_max_batch((ggml_type) type_id, device_cc()));
 }
@@ -439,4 +441,5 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_weighted_sum, op_moe_weighted_sum);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(dequantize, op_dequantize);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_rows, op_get_rows);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(uses_mmvq, op_uses_mmvq);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(uses_mmq, op_uses_mmq);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(mmvq_max_tokens, op_mmvq_max_tokens);

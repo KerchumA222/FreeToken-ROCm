@@ -71,6 +71,9 @@ def mul_mat(w: torch.Tensor, ggml_type: int, x: torch.Tensor, *, out: torch.Tens
     if out is None:
         out = torch.empty(m, w.shape[0], dtype=x.dtype, device=x.device)
     if not uses_mmvq(ggml_type, m):
+        if not uses_mmq(ggml_type, m, 0):
+            # no matrix kernel for this type (IQ1_M): llama.cpp's fallback, dequantize and run a dense GEMM
+            return torch.mm(x, dequantize(w.contiguous(), ggml_type, k, x.dtype).t(), out=out)
         _check_mmq_tail(w, ggml_type, k)
     _module().mul_mat(w, ggml_type, x.contiguous(), out, xq)
     return out
@@ -90,6 +93,12 @@ def _q8_1_row_bytes(k: int) -> int:
 
 
 @functools.cache
+def uses_mmq(ggml_type: int, m: int, n_experts: int) -> bool:
+    """Whether this GPU has a matrix kernel for ``ggml_type`` at ``m`` rows (``n_experts`` > 0 for the expert GEMM)."""
+    return _module().uses_mmq(ggml_type, m, n_experts)
+
+
+@functools.cache
 def uses_mmvq(ggml_type: int, m: int) -> bool:
     """Whether ``mul_mat`` of ``m`` rows on this GPU runs the vector kernel, the one that reads ``xq``."""
     return _module().uses_mmvq(ggml_type, m)
@@ -100,8 +109,20 @@ def mul_mat_id(w: torch.Tensor, ggml_type: int, x: torch.Tensor, ids: torch.Tens
     t, top_k = ids.shape
     out = torch.empty(t, top_k, w.shape[1], dtype=x.dtype, device=x.device)
     if t > mmvq_max_tokens(ggml_type):
+        if not uses_mmq(ggml_type, t, w.shape[0]):
+            return _mul_mat_id_dequant(w, ggml_type, x, ids, out)
         _check_mmq_tail(w, ggml_type, x.shape[-1])
     _module().mul_mat_id(w, ggml_type, (x.unsqueeze(1) if x.dim() == 2 else x).contiguous(), ids, out)
+    return out
+
+
+def _mul_mat_id_dequant(w: torch.Tensor, ggml_type: int, x: torch.Tensor, ids: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    """``mul_mat_id`` for a type with no matrix kernel (IQ1_M): one dense GEMM per routed expert over its dequantized rows."""
+    k = x.shape[-1]
+    for e in ids.unique().tolist():
+        t_idx, j_idx = (ids == e).nonzero(as_tuple=True)
+        a = x[t_idx] if x.dim() == 2 else x[t_idx, j_idx]
+        out[t_idx, j_idx] = a @ dequantize(w[e].contiguous(), ggml_type, k, x.dtype).t()
     return out
 
 
@@ -151,5 +172,6 @@ __all__ = [
     "mul_mat_id",
     "mul_mat_id_glu",
     "quantize_q8_1",
+    "uses_mmq",
     "uses_mmvq",
 ]
