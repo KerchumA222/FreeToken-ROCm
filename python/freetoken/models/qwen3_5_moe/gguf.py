@@ -51,16 +51,30 @@ _TOP_LEAVES: dict[str, tuple[str, ...]] = {
     "lm_head": ("output",),
 }
 _LAYER_RE = re.compile(r"^model\.language_model\.layers\.(\d+)\.(.+)$")
+_NEXTN_RE = re.compile(r"^blk\.(\d+)\.nextn\.eh_proj\.weight$")
+_MTP_PREFIX = "mtp."
 
 
 def to_gguf(name: str, tensors: dict[str, int]) -> tuple[str, ...]:
     """Checkpoint module name -> the GGUF tensors (without ``.weight``) that store it; empty for modules the GGUF has no matrix for."""
     if name in _TOP_LEAVES:
         return _TOP_LEAVES[name]
-    m = _LAYER_RE.match(name)
-    if m is None:
-        return ()
-    blk, leaf = f"blk.{m.group(1)}", m.group(2)
+    if name.startswith(_MTP_PREFIX):
+        # the nextn draft head (Qwen3_5MTPHead under "mtp."): its block is blk.<nextn>, its projection nextn.eh_proj
+        n = nextn_block(tensors)
+        if n is None:
+            return ()
+        rest = name[len(_MTP_PREFIX):]
+        if rest == "eh_proj":
+            return (f"blk.{n}.nextn.eh_proj",)
+        if not rest.startswith("layer."):
+            return ()
+        blk, leaf = f"blk.{n}", rest[len("layer."):]
+    else:
+        m = _LAYER_RE.match(name)
+        if m is None:
+            return ()
+        blk, leaf = f"blk.{m.group(1)}", m.group(2)
     if leaf in ("mlp.experts.0.gate_proj", "mlp.experts.0.up_proj") and f"{blk}.ffn_gate_up_exps.weight" in tensors:
         return (f"{blk}.ffn_gate_up_exps",)
     return tuple(f"{blk}.{t}" for t in _LAYER_LEAVES.get(leaf, ()))
@@ -144,6 +158,64 @@ def _untile(t: torch.Tensor, num_k_heads: int, head_dim: int, dim: int = 0) -> t
     return t.index_select(dim, idx)
 
 
+def _iter_layer(index: dict[str, GgufTensorInfo], config: ModelConfig, blk: str, pre: str, linear: bool) -> Iterator[tuple[str, torch.Tensor]]:
+    """One decoder block's dense tensors (``blk.N`` in the file, ``pre`` in the model)."""
+    g = config.linear_attention_group()
+    hidden = config.hidden_size
+
+    def t(name: str) -> GgufTensorInfo:
+        return index[name if name in index else f"{name}.weight"]
+
+    def norm(name: str) -> torch.Tensor:
+        # the file stores the zero-centred weight + 1; the block's GemmaPlusOne norms add the 1 back in fp32
+        return float_tensor(t(name)).float() - 1.0
+
+    yield f"{pre}.input_layernorm.weight", norm(f"{blk}.attn_norm")
+    yield f"{pre}.post_attention_layernorm.weight", norm(f"{blk}.post_attention_norm")
+    if linear:
+        la = f"{pre}.linear_attn"
+        nk, dk = g.num_key_heads, g.key_head_dim
+        qkv, gate = t(f"{blk}.attn_qkv"), t(f"{blk}.attn_gate")
+        qkv_rows = matrix(qkv)
+        v_start = 2 * nk * dk
+        qkv_rows = torch.cat([qkv_rows[:v_start], _untile(qkv_rows[v_start:], nk, g.value_head_dim)])
+        z_rows = _untile(matrix(gate), nk, g.value_head_dim)
+        beta_info, alpha_info = t(f"{blk}.ssm_beta"), t(f"{blk}.ssm_alpha")
+        beta, alpha = (_untile(matrix(i), nk, 1) for i in (beta_info, alpha_info))
+        if is_quantized(qkv.ggml_type) or is_quantized(gate.ggml_type):
+            yield from fused(f"{la}.in_proj_qkvz", [qkv, gate], [qkv_rows, z_rows], hidden)
+            yield from fused(f"{la}.in_proj_ba", [beta_info, alpha_info], [beta, alpha], hidden)
+        else:
+            yield from fused(f"{la}.in_proj", [qkv, gate, beta_info, alpha_info], [qkv_rows, z_rows, beta, alpha], hidden)
+        conv = float_tensor(t(f"{blk}.ssm_conv1d")).float()
+        conv = torch.cat([conv[:v_start], _untile(conv[v_start:], nk, g.value_head_dim)])
+        yield f"{la}.conv1d.weight", conv.unsqueeze(1)
+        yield f"{la}.dt_bias", _untile(float_tensor(t(f"{blk}.ssm_dt.bias")).float(), nk, 1)
+        yield f"{la}.A_log", _untile(torch.log(-float_tensor(t(f"{blk}.ssm_a")).float()), nk, 1)
+        yield f"{la}.norm.weight", float_tensor(t(f"{blk}.ssm_norm"))
+        yield from fused(f"{la}.out_proj", [t(f"{blk}.ssm_out")], [matrix(t(f"{blk}.ssm_out"))], g.num_value_heads * g.value_head_dim)
+    else:
+        sa = f"{pre}.self_attn"
+        parts = [t(f"{blk}.attn_{p}") for p in ("q", "k", "v")]
+        yield from fused(f"{sa}.qkv_proj", parts, [matrix(p) for p in parts], hidden)
+        out = t(f"{blk}.attn_output")
+        yield from fused(f"{sa}.o_proj", [out], [matrix(out)], int(out.ne[0]))
+        yield f"{sa}.q_norm.weight", norm(f"{blk}.attn_q_norm")
+        yield f"{sa}.k_norm.weight", norm(f"{blk}.attn_k_norm")
+
+    mlp = f"{pre}.mlp"
+    if config.moe_enabled:
+        yield f"{mlp}.gate.weight", float_tensor(t(f"{blk}.ffn_gate_inp"))
+        sg, su, sd = (t(f"{blk}.ffn_{p}_shexp") for p in ("gate", "up", "down"))
+        yield from fused(f"{mlp}.shared_expert.gate_up_proj", [sg, su], [matrix(sg), matrix(su)], hidden)
+        yield from fused(f"{mlp}.shared_expert.down_proj", [sd], [matrix(sd)], config.shared_expert_intermediate_size)
+        yield f"{mlp}.shared_expert_gate.weight", float_tensor(t(f"{blk}.ffn_gate_inp_shexp")).reshape(1, -1)
+    else:
+        fg, fu, fd = (t(f"{blk}.ffn_{p}") for p in ("gate", "up", "down"))
+        yield from fused(f"{mlp}.gate_up_proj", [fg, fu], [matrix(fg), matrix(fu)], hidden)
+        yield from fused(f"{mlp}.down_proj", [fd], [matrix(fd)], config.intermediate_size)
+
+
 def iter_gguf_weights(
     model_path: str,
     device: torch.device,
@@ -152,7 +224,9 @@ def iter_gguf_weights(
     include_non_moe: bool,
     include_vision: bool = True,
 ) -> Iterator[tuple[str, torch.Tensor]]:
-    """The dense state dict from the GGUF; the routed experts load as offload banks (``freetoken.models.gguf.experts``)."""
+    """The dense state dict from the GGUF; the routed experts load as offload banks (``freetoken.models.gguf.experts``).
+
+    A ``nextn`` (MTP) block after the decoder is skipped here; ``iter_gguf_mtp_weights`` loads it when a draft head asks."""
     if not include_non_moe:
         return
     from freetoken.utils import cached_load_hf_config
@@ -161,7 +235,6 @@ def iter_gguf_weights(
     vision = include_vision and config.is_multimodal
     log_mmproj(model_path, vision)
     index = gguf_tensor_index(model_path)
-    g = config.linear_attention_group()
     hidden = config.hidden_size
 
     def t(name: str) -> GgufTensorInfo:
@@ -174,56 +247,32 @@ def iter_gguf_weights(
     if not config.tie_word_embeddings:
         yield from fused("lm_head", [t("output")], [matrix(t("output"))], hidden)
     yield "model.norm.weight", norm("output_norm")
-
     for layer in range(config.num_layers):
-        blk, pre = f"blk.{layer}", f"model.layers.{layer}"
-        yield f"{pre}.input_layernorm.weight", norm(f"{blk}.attn_norm")
-        yield f"{pre}.post_attention_layernorm.weight", norm(f"{blk}.post_attention_norm")
-        if config.is_linear_layer(layer):
-            la = f"{pre}.linear_attn"
-            nk, dk = g.num_key_heads, g.key_head_dim
-            qkv, gate = t(f"{blk}.attn_qkv"), t(f"{blk}.attn_gate")
-            qkv_rows = matrix(qkv)
-            v_start = 2 * nk * dk
-            qkv_rows = torch.cat([qkv_rows[:v_start], _untile(qkv_rows[v_start:], nk, g.value_head_dim)])
-            z_rows = _untile(matrix(gate), nk, g.value_head_dim)
-            beta_info, alpha_info = t(f"{blk}.ssm_beta"), t(f"{blk}.ssm_alpha")
-            beta, alpha = (_untile(matrix(i), nk, 1) for i in (beta_info, alpha_info))
-            if is_quantized(qkv.ggml_type) or is_quantized(gate.ggml_type):
-                yield from fused(f"{la}.in_proj_qkvz", [qkv, gate], [qkv_rows, z_rows], hidden)
-                yield from fused(f"{la}.in_proj_ba", [beta_info, alpha_info], [beta, alpha], hidden)
-            else:
-                yield from fused(f"{la}.in_proj", [qkv, gate, beta_info, alpha_info], [qkv_rows, z_rows, beta, alpha], hidden)
-            conv = float_tensor(t(f"{blk}.ssm_conv1d")).float()
-            conv = torch.cat([conv[:v_start], _untile(conv[v_start:], nk, g.value_head_dim)])
-            yield f"{la}.conv1d.weight", conv.unsqueeze(1)
-            yield f"{la}.dt_bias", _untile(float_tensor(t(f"{blk}.ssm_dt.bias")).float(), nk, 1)
-            yield f"{la}.A_log", _untile(torch.log(-float_tensor(t(f"{blk}.ssm_a")).float()), nk, 1)
-            yield f"{la}.norm.weight", float_tensor(t(f"{blk}.ssm_norm"))
-            yield from fused(f"{la}.out_proj", [t(f"{blk}.ssm_out")], [matrix(t(f"{blk}.ssm_out"))], g.num_value_heads * g.value_head_dim)
-        else:
-            sa = f"{pre}.self_attn"
-            parts = [t(f"{blk}.attn_{p}") for p in ("q", "k", "v")]
-            yield from fused(f"{sa}.qkv_proj", parts, [matrix(p) for p in parts], hidden)
-            out = t(f"{blk}.attn_output")
-            yield from fused(f"{sa}.o_proj", [out], [matrix(out)], int(out.ne[0]))
-            yield f"{sa}.q_norm.weight", norm(f"{blk}.attn_q_norm")
-            yield f"{sa}.k_norm.weight", norm(f"{blk}.attn_k_norm")
-
-        mlp = f"{pre}.mlp"
-        if config.moe_enabled:
-            yield f"{mlp}.gate.weight", float_tensor(t(f"{blk}.ffn_gate_inp"))
-            sg, su, sd = (t(f"{blk}.ffn_{p}_shexp") for p in ("gate", "up", "down"))
-            yield from fused(f"{mlp}.shared_expert.gate_up_proj", [sg, su], [matrix(sg), matrix(su)], hidden)
-            yield from fused(f"{mlp}.shared_expert.down_proj", [sd], [matrix(sd)], config.shared_expert_intermediate_size)
-            yield f"{mlp}.shared_expert_gate.weight", float_tensor(t(f"{blk}.ffn_gate_inp_shexp")).reshape(1, -1)
-        else:
-            fg, fu, fd = (t(f"{blk}.ffn_{p}") for p in ("gate", "up", "down"))
-            yield from fused(f"{mlp}.gate_up_proj", [fg, fu], [matrix(fg), matrix(fu)], hidden)
-            yield from fused(f"{mlp}.down_proj", [fd], [matrix(fd)], config.intermediate_size)
+        yield from _iter_layer(index, config, f"blk.{layer}", f"model.layers.{layer}", config.is_linear_layer(layer))
 
     if vision:
         yield from iter_mmproj_weights(find_mmproj(model_path))
 
 
-__all__ = ["gguf_mm_config", "iter_gguf_weights", "parse_gguf_config", "to_gguf"]
+def iter_gguf_mtp_weights(model_path: str, prefix: str = "mtp") -> Iterator[tuple[str, torch.Tensor]]:
+    """The ``nextn`` draft block's dense tensors under ``prefix`` (``Qwen3_5MTPHead``'s naming), in the same packed form as the decoder's.
+
+    The block is always full attention; its routed experts load with ``load_gguf_expert_banks(path, 1, first_layer=nextn_block(...))``.
+    A head that borrows the target's embedding and lm_head (no ``nextn.embed_tokens`` / ``nextn.shared_head_head``) gets neither here."""
+    from freetoken.utils import cached_load_hf_config
+
+    config = parse_gguf_config(cached_load_hf_config(model_path))
+    index = gguf_tensor_index(model_path)
+    n = nextn_block(index)
+    if n is None:
+        raise ValueError(f"{model_path}: no nextn (MTP draft) block")
+    blk = f"blk.{n}"
+    # the head's own norms are GemmaRMSNorm (scale by the stored w + 1); its decoder block's take the -1 in _iter_layer
+    for norm in ("enorm", "hnorm", "shared_head_norm"):
+        yield f"{prefix}.{norm}.weight", float_tensor(index[f"{blk}.nextn.{norm}.weight"])
+    eh = index[f"{blk}.nextn.eh_proj.weight"]
+    yield from fused(f"{prefix}.eh_proj", [eh], [matrix(eh)], 2 * config.hidden_size)
+    yield from _iter_layer(index, config, blk, f"{prefix}.layer", linear=False)
+
+
+__all__ = ["gguf_mm_config", "iter_gguf_mtp_weights", "iter_gguf_weights", "nextn_block", "parse_gguf_config", "to_gguf"]
