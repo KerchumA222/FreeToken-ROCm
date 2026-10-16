@@ -244,3 +244,33 @@ def test_user_defined_tokens_encode_as_single_ids(pattern):
         assert i in tok.encode(f"a{t}b", add_special_tokens=False), t
     ids = tok.encode("<think>\nhi</think>", add_special_tokens=False)
     assert tok.decode(ids, skip_special_tokens=True) == "<think>\nhi</think>"
+
+
+def test_qwen36_nextn_block_loads_only_when_asked():
+    """The decoder iterator skips the nextn (MTP) block; the draft-head iterator yields it as a full-attention block under ``mtp.``,
+    packed like the decoder's own blocks, and the GGUF quant config names its modules."""
+    from freetoken.models.qwen3_5_moe.gguf import _iter_layer, iter_gguf_mtp_weights, nextn_block, parse_gguf_config, to_gguf
+    from freetoken.models.gguf.reader import gguf_tensor_index
+    from freetoken.utils import cached_load_hf_config
+
+    path = _model(_QWEN36)
+    index = gguf_tensor_index(path)
+    cfg = parse_gguf_config(cached_load_hf_config(path))
+    n = nextn_block(index)
+    assert n == cfg.num_layers == 40
+
+    mtp = dict(iter_gguf_mtp_weights(path))
+    own = {k for k in mtp if not k.startswith("mtp.layer.")}
+    assert own == {"mtp.enorm.weight", "mtp.hnorm.weight", "mtp.shared_head_norm.weight", "mtp.eh_proj.weight"}
+    assert mtp["mtp.eh_proj.weight"].dtype == torch.uint8  # packed Q8_0, K = 2 * hidden
+    attn = next(i for i in range(cfg.num_layers) if not cfg.is_linear_layer(i))
+    block = dict(_iter_layer(index, cfg, f"blk.{attn}", "x", linear=False))
+    assert {k.replace("mtp.layer.", "x.") for k in mtp if k not in own} == set(block)
+    for k, v in block.items():
+        assert mtp[k.replace("x.", "mtp.layer.")].shape[0] == v.shape[0], k
+
+    tensors = {name: info.ggml_type for name, info in index.items()}
+    assert to_gguf("mtp.eh_proj", tensors) == (f"blk.{n}.nextn.eh_proj",)
+    assert to_gguf("mtp.layer.self_attn.q_proj", tensors) == (f"blk.{n}.attn_q",)
+    assert to_gguf("mtp.layer.mlp.experts.0.down_proj", tensors) == (f"blk.{n}.ffn_down_exps",)
+    assert to_gguf("model.language_model.layers.0.mlp.gate", tensors) == ("blk.0.ffn_gate_inp",)

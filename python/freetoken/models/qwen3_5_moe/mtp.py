@@ -109,18 +109,6 @@ class Qwen3_5MTPHead(BaseOP):
 # Weights.
 # --------------------------------------------------------------------------------------
 
-# The draft block's own tensors, on top of the decoder-block suffixes the target's
-# reader already knows. Everything else in `blk.<mtp>.*` is an ordinary block tensor.
-_NEXTN_MAP = {
-    "nextn.enorm.weight": "enorm.weight",
-    "nextn.hnorm.weight": "hnorm.weight",
-    "nextn.eh_proj.weight": "eh_proj.weight",
-    "nextn.shared_head_norm.weight": "shared_head_norm.weight",
-}
-# Present only when a head does NOT borrow them from the target; the draft-head-only
-# GGUFs omit both, which is what makes them 1.3 GB smaller.
-_BORROWED = ("nextn.embed_tokens.weight", "nextn.shared_head_head.weight")
-
 MTP_DRAFT_LAYER_KV = "mtp.draft_layer"
 
 
@@ -143,63 +131,10 @@ def mtp_draft_layer(model_path: str) -> int | None:
 
 
 def iter_gguf_mtp_weights(model_path: str, prefix: str = "mtp"):
-    """Yield ``(name, tensor)`` for the draft head, in this module's naming.
+    """Yield ``(name, tensor)`` for the draft head, in this module's naming (see ``gguf.iter_gguf_mtp_weights``)."""
+    from .gguf import iter_gguf_mtp_weights as _iter
 
-    The block's ordinary tensors go through the target family's own translation, so
-    the two stay in agreement by construction rather than by a second copy of the
-    table; only the four ``nextn.*`` tensors are specific to the head.
-    """
-    from freetoken.models.gguf.reader import iter_gguf_tensors
-
-    from .gguf import _SUFFIX_MAP, _to_bf16
-
-    layer = mtp_draft_layer(model_path)
-    if layer is None:
-        raise ValueError(f"{model_path}: no MTP draft block (no nextn metadata)")
-
-    stem = f"blk.{layer}."
-    fuse: dict[str, dict[str, torch.Tensor]] = {}
-    qkv_slots = ("attn_q.weight", "attn_k.weight", "attn_v.weight")
-    shexp_slots = ("ffn_gate_shexp.weight", "ffn_up_shexp.weight")
-    seen = set()
-
-    for t in iter_gguf_tensors(model_path):
-        if not t.name.startswith(stem):
-            continue
-        suffix = t.name[len(stem):]
-        seen.add(suffix)
-        if suffix in _BORROWED:
-            continue                      # the head uses the target's copy
-        if suffix in _NEXTN_MAP:
-            yield f"{prefix}.{_NEXTN_MAP[suffix]}", _to_bf16(t)
-            continue
-        if suffix in qkv_slots:
-            buf = fuse.setdefault("qkv", {})
-            buf[suffix] = _to_bf16(t)
-            if len(buf) == 3:
-                yield (f"{prefix}.layer.self_attn.qkv_proj.weight",
-                       torch.cat([buf[s] for s in qkv_slots], dim=0).contiguous())
-            continue
-        if suffix in shexp_slots:
-            buf = fuse.setdefault("shexp", {})
-            buf[suffix] = _to_bf16(t)
-            if len(buf) == 2:
-                yield (f"{prefix}.layer.mlp.shared_expert.gate_up_proj.weight",
-                       torch.cat([buf[s] for s in shexp_slots], dim=0).contiguous())
-            continue
-        if suffix == "ffn_gate_inp_shexp.weight":
-            yield f"{prefix}.layer.mlp.shared_expert_gate.weight", _to_bf16(t).reshape(1, -1)
-            continue
-        rel = _SUFFIX_MAP.get(suffix)
-        if rel is not None:
-            yield f"{prefix}.layer.{rel}", _to_bf16(t)
-            continue
-        if suffix.startswith("ffn_") and "_exps." in suffix:
-            continue                      # routed experts: the bank reader's job
-        raise ValueError(f"{t.name}: unrecognized MTP draft tensor")
-
-    if not seen:
-        raise ValueError(f"{model_path}: no tensors under {stem}")
+    yield from _iter(model_path, prefix)
 
 
 __all__ = ["Qwen3_5MTPHead", "iter_gguf_mtp_weights", "mtp_draft_layer"]
