@@ -37,6 +37,7 @@ const TypeInfo * type_infos() {
         set(GGML_TYPE_I64, "i64", 1, sizeof(int64_t), false);
         set(GGML_TYPE_Q1_0, "q1_0", QK1_0, sizeof(block_q1_0), true);
         set(GGML_TYPE_Q2_0, "q2_0", QK2_0, sizeof(block_q2_0), true);
+        set(GGML_TYPE_Q2_0_SYM, "q2_0_sym", QK2_0, sizeof(block_q2_0), true);
         set(GGML_TYPE_Q4_0, "q4_0", QK4_0, sizeof(block_q4_0), true);
         set(GGML_TYPE_Q4_1, "q4_1", QK4_1, sizeof(block_q4_1), true);
         set(GGML_TYPE_Q5_0, "q5_0", QK5_0, sizeof(block_q5_0), true);

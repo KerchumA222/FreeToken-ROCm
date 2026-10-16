@@ -28,8 +28,22 @@ def float_dtype(ggml_type: int) -> torch.dtype | None:
     return _FLOAT_DTYPES.get(int(ggml_type))
 
 
+# FreeToken-local ggml type (not in llama.cpp): Q2_0 blocks whose codes 0..3 mean -3, -1, 1, 3 times the scale instead of -1, 0, 1, 2.
+# A GGUF marks it by storing Q2_0 (42) tensors with ``freetoken.q2_0.codebook = symmetric_odd``; the reader re-types them on load.
+Q2_0_SYM = 43
+Q2_0_CODEBOOK_KV = "freetoken.q2_0.codebook"
+Q2_0_SYMMETRIC_ODD = "symmetric_odd"
+
+
 def type_name(ggml_type: int) -> str:
-    return gguf.GGMLQuantizationType(ggml_type).name
+    return "Q2_0_SYM" if int(ggml_type) == Q2_0_SYM else gguf.GGMLQuantizationType(ggml_type).name
+
+
+def _block(ggml_type: int) -> tuple[int, int]:
+    """(values, bytes) of one ggml block."""
+    if int(ggml_type) == Q2_0_SYM:
+        return gguf.GGML_QUANT_SIZES[gguf.GGMLQuantizationType.Q2_0]
+    return gguf.GGML_QUANT_SIZES[gguf.GGMLQuantizationType(ggml_type)]
 
 
 def is_quantized(ggml_type: int) -> bool:
@@ -37,7 +51,7 @@ def is_quantized(ggml_type: int) -> bool:
 
 
 def row_bytes(ggml_type: int, k: int) -> int:
-    block, size = gguf.GGML_QUANT_SIZES[gguf.GGMLQuantizationType(ggml_type)]
+    block, size = _block(ggml_type)
     if k % block:
         raise ValueError(f"{type_name(ggml_type)} rows need a multiple of {block} values, got {k}")
     return k // block * size
@@ -54,6 +68,25 @@ def mmq_tail_bytes(ggml_type: int, k: int) -> int:
     """Bytes past the last row of a packed [rows, K] matrix that MMQ reads and that must read as zeros."""
     rem = k % MATRIX_ROW_PADDING
     return 0 if rem == 0 or not is_quantized(ggml_type) else row_bytes(ggml_type, MATRIX_ROW_PADDING - rem)
+
+
+def dequantize_cpu(raw, ggml_type: int, k: int):
+    """``[rows, row_bytes]`` packed ggml rows (numpy or torch uint8) as a float32 ``[rows, k]`` numpy array, on the CPU (gguf-py's reference decoders)."""
+    import numpy as np
+
+    raw = np.ascontiguousarray(raw.numpy() if isinstance(raw, torch.Tensor) else raw).view(np.uint8)
+    rows = raw.size // row_bytes(ggml_type, k)
+    t = int(ggml_type)
+    if t in (int(gguf.GGMLQuantizationType.Q2_0), Q2_0_SYM):
+        blocks = raw.reshape(-1, 18)
+        d = blocks[:, :2].copy().view(np.float16).astype(np.float32)
+        codes = (blocks[:, 2:, None] >> np.array([0, 2, 4, 6], dtype=np.uint8)) & 3
+        codes = codes.reshape(-1, 64).astype(np.float32)
+        vals = 2 * codes - 3 if t == Q2_0_SYM else codes - 1
+        return (vals * d).reshape(rows, k)
+    if t in _FLOAT_DTYPES:
+        return torch.from_numpy(raw.copy()).view(_FLOAT_DTYPES[t]).float().numpy().reshape(rows, k)
+    return gguf.quants.dequantize(raw.reshape(rows, -1), gguf.GGMLQuantizationType(t)).astype(np.float32).reshape(rows, k)
 
 
 @dataclass(frozen=True)
@@ -87,4 +120,4 @@ def segment_param(index: int) -> str:
     return "weight" if index == 0 else f"weight_{index}"
 
 
-__all__ = ["MATRIX_ROW_PADDING", "Segment", "float_dtype", "is_quantized", "mmq_tail_bytes", "pad_rows", "row_bytes", "segment_param", "segments", "type_name"]
+__all__ = ["MATRIX_ROW_PADDING", "Q2_0_CODEBOOK_KV", "Q2_0_SYM", "Q2_0_SYMMETRIC_ODD", "Segment", "dequantize_cpu", "float_dtype", "is_quantized", "mmq_tail_bytes", "pad_rows", "row_bytes", "segment_param", "segments", "type_name"]

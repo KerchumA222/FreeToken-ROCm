@@ -725,7 +725,12 @@ static __device__ __forceinline__ float vec_dot_q1_0_q8_1(
     return d1 * d8 * sumi;
 }
 
-static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
+// Q2_0 code c -> int8 value, as the byte table of a perm: c - 1 for Q2_0, 2c - 3 for FreeToken's Q2_0_SYM
+#define Q2_0_LUT     0x020100FF
+#define Q2_0_SYM_LUT 0x0301FFFD
+
+template <int lut>
+static __device__ __forceinline__ float vec_dot_q2_0_q8_1_impl(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
     const block_q2_0 * bq2_0 = (const block_q2_0 *) vbq + kbx;
@@ -751,12 +756,12 @@ static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
         const uint32_t qx_indices = (q & 0x03) | ((q & 0x0C) << 6) | ((q & 0x30) << 12) | ((q & 0xC0) << 18);
         const uint32_t qy_bits    = q >> 8;
         const uint32_t qy_indices = (qy_bits & 0x03) | ((qy_bits & 0x0C) << 6) | ((qy_bits & 0x30) << 12) | ((qy_bits & 0xC0) << 18);
-        const int qx = __builtin_amdgcn_perm(0x020100FF, 0x020100FF, qx_indices);
-        const int qy = __builtin_amdgcn_perm(0x020100FF, 0x020100FF, qy_indices);
+        const int qx = __builtin_amdgcn_perm(lut, lut, qx_indices);
+        const int qy = __builtin_amdgcn_perm(lut, lut, qy_indices);
 #else
         // unpack even and odd crumbs into byte values
-        const int qe = __byte_perm(0x020100FF, 0x020100FF, q >> 0);
-        const int qo = __byte_perm(0x020100FF, 0x020100FF, q >> 2);
+        const int qe = __byte_perm(lut, lut, q >> 0);
+        const int qo = __byte_perm(lut, lut, q >> 2);
         // unshuffle values
         const int qx = __byte_perm(qe, qo, 0x5140);
         const int qy = __byte_perm(qe, qo, 0x7362);
@@ -769,6 +774,16 @@ static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
     // Apply Q2_0's single scale and this chunk's Q8_1 scale
     const float d8 = __low2float(bq8_1_chunk->ds);
     return d2 * d8 * sumi;
+}
+
+static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    return vec_dot_q2_0_q8_1_impl<Q2_0_LUT>(vbq, bq8_1, kbx, iqs);
+}
+
+static __device__ __forceinline__ float vec_dot_q2_0_sym_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    return vec_dot_q2_0_q8_1_impl<Q2_0_SYM_LUT>(vbq, bq8_1, kbx, iqs);
 }
 
 static __device__ __forceinline__ float vec_dot_q4_0_q8_1(
