@@ -1412,3 +1412,35 @@
      };
  
      // [TAG_GGML_PREC]
+--- a/ggml/src/ggml-cuda/dequantize.cuh
++++ b/ggml/src/ggml-cuda/dequantize.cuh
+@@ -52,6 +52,15 @@ static __device__ __forceinline__ void dequantize_q2_0_sym(const void * vx, cons
+     dequantize_q2_0_impl<true>(vx, ib, iqs, v);
+ }
+ 
++// FreeToken: IQ4_NL in the 32-wide q4_0 layout, for get_rows of rows that are not whole 256-value superblocks
++static __device__ __forceinline__ void dequantize_iq4_nl_q(const void * vx, const int64_t ib, const int iqs, float2 & v){
++    const block_iq4_nl * x = (const block_iq4_nl *) vx;
++    const float d = x[ib].d;
++    const int vui = x[ib].qs[iqs];
++    v.x = kvalues_iq4nl[vui & 0xF] * d;
++    v.y = kvalues_iq4nl[vui >> 4] * d;
++}
++
+ static __device__ __forceinline__ void dequantize_q4_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
+     const block_q4_0 * x = (const block_q4_0 *) vx;
+ 
+--- a/ggml/src/ggml-cuda/getrows.cu
++++ b/ggml/src/ggml-cuda/getrows.cu
+@@ -397,6 +397,11 @@ static void ggml_cuda_get_rows_switch_src0_type(
+                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+             break;
+         case GGML_TYPE_IQ4_NL:
++            if (ne00 % QK_K != 0) {  // FreeToken: the superblock kernel needs whole 256-value rows
++                get_rows_cuda_q<QK4_NL, QR4_NL, dequantize_iq4_nl_q>(src0_d, src1_d, dst_d,
++                    ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
++                break;
++            }
+             get_rows_cuda_kq<32, dst_t, dequantize_iq4_nl<dst_t>>(src0_d, src1_d, dst_d,
+                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+             break;

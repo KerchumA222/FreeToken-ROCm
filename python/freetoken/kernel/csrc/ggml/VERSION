@@ -13,5 +13,6 @@ Local changes, kept in freetoken.patch (already applied):
 - mmvq.cu, common.cuh: the NVFP4 scale fusion (x_scale, gate_scale) reads strided scale vectors, e.g. columns of a per-expert scale bank.
 - getrows.cu, dequantize.cuh: get_rows reads NVFP4 rows, e.g. an NVFP4 token_embd.
 - ggml.h and the Q2_0 paths (common.cuh, dequantize.cuh, convert.cu, getrows.cu, vecdotq.cuh, mmvq.cu, mmq-load-tiles.cuh, mmq.cu/.cuh, template-instances/mmq-instance-q2_0_sym.cu): GGML_TYPE_Q2_0_SYM (43, FreeToken-local; check it is still free in a newer ggml.h) is Q2_0 with the codes 0..3 read as -3, -1, 1, 3 instead of -1, 0, 1, 2. It shares Q2_0's MMQ configs and kernels except for the code-to-int8 table.
+- dequantize.cuh, getrows.cu: get_rows of IQ4_NL rows that are not whole 256-value superblocks decodes them in the 32-wide q4_0 layout (llama.cpp asserts instead).
 
 To update: copy the same files from a newer llama.cpp, apply freetoken.patch, and update this file.

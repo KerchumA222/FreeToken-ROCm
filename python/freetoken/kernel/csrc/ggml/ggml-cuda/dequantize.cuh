@@ -52,6 +52,15 @@ static __device__ __forceinline__ void dequantize_q2_0_sym(const void * vx, cons
     dequantize_q2_0_impl<true>(vx, ib, iqs, v);
 }
 
+// FreeToken: IQ4_NL in the 32-wide q4_0 layout, for get_rows of rows that are not whole 256-value superblocks
+static __device__ __forceinline__ void dequantize_iq4_nl_q(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_iq4_nl * x = (const block_iq4_nl *) vx;
+    const float d = x[ib].d;
+    const int vui = x[ib].qs[iqs];
+    v.x = kvalues_iq4nl[vui & 0xF] * d;
+    v.y = kvalues_iq4nl[vui >> 4] * d;
+}
+
 static __device__ __forceinline__ void dequantize_q4_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
     const block_q4_0 * x = (const block_q4_0 *) vx;
 
