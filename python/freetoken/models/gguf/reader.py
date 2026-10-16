@@ -47,7 +47,7 @@ def gguf_config_source(model_path: str) -> str | None:
     can parse, so no downstream code learns about the FTW wrapper.
     """
     if is_gguf_path(model_path):
-        return model_path
+        return _first_split(model_path)
     if isinstance(model_path, str) and os.path.isdir(model_path):
         cand = os.path.join(model_path, FTW_METADATA_GGUF)
         if os.path.isfile(cand):
@@ -118,6 +118,15 @@ def load_gguf_metadata(model_path: str) -> dict[str, Any]:
 
 
 _SPLIT_RE = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$")
+
+
+def _first_split(model_path: str) -> str:
+    """Split 1 of a split GGUF named by any of its files (only split 1 carries the model's metadata), else the file itself."""
+    match = _SPLIT_RE.search(model_path)
+    if match is None or int(match.group(1)) == 1:
+        return model_path
+    first = f"{model_path[: match.start()]}-00001-of-{match.group(2)}.gguf"
+    return first if os.path.isfile(first) else model_path
 
 
 @functools.cache
