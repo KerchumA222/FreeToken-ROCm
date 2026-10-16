@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, ClassVar
 
-from ..ggml_types import has_expert_scales, has_weight_scale, is_quantized, type_name
+from ..ggml_types import forced_dense, has_expert_scales, has_weight_scale, is_quantized, type_name
 from ..names import NameMap
 from ..quant_backend import get_quant_backend
 from ..registry import LayerKind, method_class, register_dialect
@@ -59,6 +59,9 @@ class GGUFConfig(QuantConfig):
     def scheme_for(self, prefix: str) -> QuantScheme | None:
         if prefix in self._schemes:
             return self._schemes[prefix]
+        if forced_dense(prefix):
+            self._schemes[prefix] = None
+            return None
         names = self.name_map.to_checkpoint(prefix)
         tensors = [() if self.unquantized(n) else self._part_tensors(n) for n in names]
         parts = [tuple(self.tensor_types[key] for key in ts) for ts in tensors]

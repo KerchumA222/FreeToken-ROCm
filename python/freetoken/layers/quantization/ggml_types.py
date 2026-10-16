@@ -89,6 +89,18 @@ def dequantize_cpu(raw, ggml_type: int, k: int):
     return gguf.quants.dequantize(raw.reshape(rows, -1), gguf.GGMLQuantizationType(t)).astype(np.float32).reshape(rows, k)
 
 
+DENSE_MODULES_ENV = "FT_GGUF_DENSE_MODULES"
+
+
+def forced_dense(prefix: str) -> bool:
+    """Whether ``FT_GGUF_DENSE_MODULES`` (comma-separated module-name suffixes, unset by default) asks to serve ``prefix``
+    as a bf16 Linear dequantized at load instead of from its packed ggml rows: a bisection tool for a suspected packed kernel."""
+    import os
+
+    suffixes = [s for s in os.environ.get(DENSE_MODULES_ENV, "").split(",") if s]
+    return any(prefix == s or prefix.endswith("." + s) for s in suffixes)
+
+
 @dataclass(frozen=True)
 class Segment:
     """A run of consecutive fused parts that share one ggml type: one packed matrix and one GEMM."""
@@ -147,5 +159,5 @@ def has_expert_scales(tensor_types: dict[str, int]) -> bool:
 
 
 __all__ = [
-    "MATRIX_ROW_PADDING", "NVFP4", "Q2_0_CODEBOOK_KV", "Q2_0_SYM", "Q2_0_SYMMETRIC_ODD", "Segment", "dequantize_cpu", "float_dtype", "has_expert_scales", "has_weight_scale", "is_quantized", "mmq_tail_bytes", "pad_rows", "row_bytes", "scale_name", "segment_param", "segments", "type_name",
+    "DENSE_MODULES_ENV", "MATRIX_ROW_PADDING", "NVFP4", "Q2_0_CODEBOOK_KV", "Q2_0_SYM", "Q2_0_SYMMETRIC_ODD", "Segment", "dequantize_cpu", "float_dtype", "forced_dense", "has_expert_scales", "has_weight_scale", "is_quantized", "mmq_tail_bytes", "pad_rows", "row_bytes", "scale_name", "segment_param", "segments", "type_name",
 ]
