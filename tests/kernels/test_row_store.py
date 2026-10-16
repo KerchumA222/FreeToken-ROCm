@@ -85,3 +85,15 @@ def test_geometry_and_bounds_are_checked_up_front(tmp_path):
     with pytest.raises(RuntimeError, match="exceeds a page"):
         _row_store.RowStore(paths=[str(path)], extent_file=[0], extent_base=[0], rows_per_extent=1,
                             row_bytes=4097, row_stride=4097, use_io_uring=False)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+def test_wait_sync_only_where_capture_records_memops():
+    """wait-sync parks a captured graph on a memop WAIT; picking it where capture does not record memops (HIP runs them eagerly) hangs
+    the capture stream and replays with no wait."""
+    from freetoken.kernel.pinned import alloc_pinned_tensor
+    from freetoken.kernel.row_store import _memops_capture, probe_wait_sync
+
+    if probe_wait_sync("auto", torch.device("cuda")):
+        assert _memops_capture(alloc_pinned_tensor(1, dtype=torch.int64))
+    assert probe_wait_sync("gate", torch.device("cuda")) is False

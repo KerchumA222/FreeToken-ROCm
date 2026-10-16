@@ -36,9 +36,34 @@ def probe_wait_sync(mode: str, device: torch.device) -> bool:
     if ok:
         stream.synchronize()
         ok = int(scratch[0]) == 7
+    # accepting the memop is not enough: HIP runs memops eagerly under capture and records no node, which parks
+    # the capture stream on the WAIT and replays with no wait at all
+    if ok:
+        ok = _memops_capture(scratch)
     if mode == "wait" and not ok:
         raise RuntimeError("wait-sync requested but stream memops are unavailable")
     return ok
+
+
+def _memops_capture(scratch: torch.Tensor) -> bool:
+    """Whether a memop issued under CUDA-graph capture becomes a graph node: it must not land at capture, only at replay."""
+    scratch.zero_()
+    graph = torch.cuda.CUDAGraph()
+    sink = torch.zeros(1, device="cuda")
+    try:
+        torch.cuda.synchronize()
+        with torch.cuda.graph(graph):
+            sink.add_(1.0)
+            _row_store.memop_write(torch.cuda.current_stream().cuda_stream, scratch.data_ptr(), 9)
+        if int(scratch[0]) == 9:
+            return False
+        graph.replay()
+        torch.cuda.synchronize()
+        return int(scratch[0]) == 9
+    except Exception:
+        return False
+    finally:
+        scratch.zero_()
 
 
 def wait_reset(stream: torch.cuda.Stream, flag: torch.Tensor) -> None:
