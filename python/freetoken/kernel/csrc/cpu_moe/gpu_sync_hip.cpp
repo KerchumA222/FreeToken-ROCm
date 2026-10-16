@@ -19,6 +19,11 @@
 
 #include "gpu_sync.h"
 
+// ROCm < 7.2 headers lack the named default flag; the value is 0x0 (hipStreamWriteValue* default semantics).
+#ifndef hipStreamWriteValueDefault
+#define hipStreamWriteValueDefault 0x0
+#endif
+
 namespace freetoken::cpu_moe {
 
 namespace {
