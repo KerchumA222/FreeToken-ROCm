@@ -44,8 +44,10 @@ def row_bytes(ggml_type: int, k: int) -> int:
 
 
 def pad_rows(k: int) -> int:
-    """Zero rows to append after a packed [rows, K] matrix so ggml's tail reads stay inside it."""
-    return 0 if k % MATRIX_ROW_PADDING == 0 else 1
+    """Zero rows to append after a packed [rows, K] matrix so ggml's tail reads stay inside it: MMQ reads up to the next multiple of
+    MATRIX_ROW_PADDING values past the last row, which is more than one row when K < 256 (Flash-Next's hyper-connection up projections)."""
+    rem = k % MATRIX_ROW_PADDING
+    return 0 if rem == 0 else -(-(MATRIX_ROW_PADDING - rem) // k)
 
 
 def mmq_tail_bytes(ggml_type: int, k: int) -> int:
