@@ -7,7 +7,7 @@ from typing import Iterator
 import numpy as np
 import torch
 
-from freetoken.layers.quantization.ggml_types import is_quantized, pad_rows, segment_param, segments
+from freetoken.layers.quantization.ggml_types import dequantize_cpu, forced_dense, is_quantized, pad_rows, segment_param, segments
 
 from .reader import GgufTensorInfo
 
@@ -33,6 +33,9 @@ def fused(prefix: str, infos: list[GgufTensorInfo], parts: list[torch.Tensor], k
     """One fused module: float parts concatenated into ``weight``; with any quantized part, one matrix per ggml-type run (float runs as bf16 rows, quantized runs packed)."""
     types = [i.ggml_type for i in infos]
     pad = (-sum(p.shape[0] for p in parts)) % pad_to if pad_to else 0
+    if forced_dense(prefix):
+        parts = [torch.from_numpy(dequantize_cpu(p, t, k)) if is_quantized(t) else p for p, t in zip(parts, types)]
+        types = [0] * len(parts)  # F32
     if not any(is_quantized(t) for t in types):
         rows = [p.to(torch.bfloat16) for p in parts]
         if pad:

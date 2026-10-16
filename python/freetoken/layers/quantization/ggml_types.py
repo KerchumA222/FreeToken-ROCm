@@ -59,7 +59,7 @@ def row_bytes(ggml_type: int, k: int) -> int:
 
 def pad_rows(k: int) -> int:
     """Zero rows to append after a packed [rows, K] matrix so ggml's tail reads stay inside it: MMQ reads up to the next multiple of
-    MATRIX_ROW_PADDING values past the last row, which is more than one row when K < 256 (Flash-Next's hyper-connection up projections)."""
+    MATRIX_ROW_PADDING values past the last row, which is more than one row when K < 256."""
     rem = k % MATRIX_ROW_PADDING
     return 0 if rem == 0 else -(-(MATRIX_ROW_PADDING - rem) // k)
 
@@ -87,6 +87,18 @@ def dequantize_cpu(raw, ggml_type: int, k: int):
     if t in _FLOAT_DTYPES:
         return torch.from_numpy(raw.copy()).view(_FLOAT_DTYPES[t]).float().numpy().reshape(rows, k)
     return gguf.quants.dequantize(raw.reshape(rows, -1), gguf.GGMLQuantizationType(t)).astype(np.float32).reshape(rows, k)
+
+
+DENSE_MODULES_ENV = "FT_GGUF_DENSE_MODULES"
+
+
+def forced_dense(prefix: str) -> bool:
+    """Whether ``FT_GGUF_DENSE_MODULES`` (comma-separated module-name suffixes, unset by default) asks to serve ``prefix``
+    as a bf16 Linear dequantized at load instead of from its packed ggml rows: a bisection tool for a suspected packed kernel."""
+    import os
+
+    suffixes = [s for s in os.environ.get(DENSE_MODULES_ENV, "").split(",") if s]
+    return any(prefix == s or prefix.endswith("." + s) for s in suffixes)
 
 
 @dataclass(frozen=True)
@@ -120,4 +132,4 @@ def segment_param(index: int) -> str:
     return "weight" if index == 0 else f"weight_{index}"
 
 
-__all__ = ["MATRIX_ROW_PADDING", "Q2_0_CODEBOOK_KV", "Q2_0_SYM", "Q2_0_SYMMETRIC_ODD", "Segment", "dequantize_cpu", "float_dtype", "is_quantized", "mmq_tail_bytes", "pad_rows", "row_bytes", "segment_param", "segments", "type_name"]
+__all__ = ["MATRIX_ROW_PADDING", "Q2_0_CODEBOOK_KV", "Q2_0_SYM", "Q2_0_SYMMETRIC_ODD", "Segment", "DENSE_MODULES_ENV", "dequantize_cpu", "forced_dense", "float_dtype", "is_quantized", "mmq_tail_bytes", "pad_rows", "row_bytes", "segment_param", "segments", "type_name"]
