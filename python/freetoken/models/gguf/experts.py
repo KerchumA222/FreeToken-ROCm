@@ -62,18 +62,23 @@ def _expert_scales(gate_up: list[GgufTensorInfo], down: GgufTensorInfo, experts:
     return out
 
 
-def load_gguf_expert_banks(model_path: str, num_layers: int, *, first_layer: int = 0, dummy: bool = False, device: torch.device | None = None):
-    """``ExpertBanks`` with one bank per (layer, role): pinned host banks for the offload cache, filled from the file and pinned while later layers load, or resident banks on ``device``."""
+def load_gguf_expert_banks(
+    model_path: str, num_layers: int, *, first_layer: int = 0, dummy: bool = False, device: torch.device | None = None, on_disk: bool = False
+):
+    """``ExpertBanks`` with one bank per (layer, role): pinned host banks for the offload cache, filled from the file and pinned while later layers load, or resident banks on ``device``.
+
+    ``on_disk`` reads nothing: the banks are meta tensors that only carry each layer's shapes and types, for the disk tier (``moe.disk_tier``) to address the experts in the file."""
     from freetoken.moe.expert_banks import ExpertBanks
     from freetoken.moe.host_banks import HostBank, PinPipeline
 
+    assert not (on_disk and device is not None), "disk-tier banks stay on disk"
     index = gguf_tensor_index(model_path)
     scaled = has_expert_scales({name: info.ggml_type for name, info in index.items()})
     roles = ("gate_up", "down", "global") if scaled else ("gate_up", "down")
     sources: dict[str, list[torch.Tensor]] = {role: [] for role in roles}
     tails: dict[str, list[int]] = {role: [] for role in roles}
     tags = []
-    with PinPipeline() if device is None else contextlib.nullcontext() as pins:
+    with PinPipeline() if device is None and not on_disk else contextlib.nullcontext() as pins:
         for layer in range(num_layers):
             blk = f"blk.{first_layer + layer}"
             down = index[f"{blk}.ffn_down_exps.weight"]
@@ -94,6 +99,12 @@ def load_gguf_expert_banks(model_path: str, num_layers: int, *, first_layer: int
             d = _expert_rows(down)
             gate_up_shape = (rows[0].shape[0], sum(r.shape[1] for r in rows), rows[0].shape[2])
             experts = rows[0].shape[0]
+            if on_disk:
+                if scaled:
+                    raise NotImplementedError(f"{model_path}: the disk tier does not serve experts with per-expert NVFP4 scales")
+                sources["gate_up"].append(torch.empty(gate_up_shape, dtype=rows[0].dtype, device="meta"))
+                sources["down"].append(torch.empty(tuple(d.shape), dtype=d.dtype, device="meta"))
+                continue
             if device is None:
                 host = {"gate_up": HostBank(gate_up_shape, rows[0].dtype), "down": HostBank(tuple(d.shape), d.dtype)}
                 if scaled:
@@ -124,8 +135,12 @@ def load_gguf_expert_banks(model_path: str, num_layers: int, *, first_layer: int
             for role, bank in banks.items():
                 sources[role].append(bank)
     total = sum(t.numel() * t.element_size() for ts in sources.values() for t in ts)
-    logger.info_rank0(f"GGUF expert banks: {num_layers} layers, {total / 2**30:.1f} GiB {'on ' + str(device) if device is not None else 'in host RAM'}")
-    return ExpertBanks("gguf_scaled" if scaled else "gguf", sources, kind=QuantKind.GGUF, kernel="ggml", layout=None, layer_tags=tags, row_tail_bytes=tails)
+    where = "on disk (disk tier)" if on_disk else "on " + str(device) if device is not None else "in host RAM"
+    logger.info_rank0(f"GGUF expert banks: {num_layers} layers, {total / 2**30:.1f} GiB {where}")
+    return ExpertBanks(
+        "gguf_scaled" if scaled else "gguf", sources, kind=QuantKind.GGUF, kernel="ggml", layout=None, layer_tags=tags, row_tail_bytes=tails,
+        on_disk=on_disk,
+    )
 
 
 __all__ = ["load_gguf_expert_banks"]

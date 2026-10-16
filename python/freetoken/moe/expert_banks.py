@@ -55,6 +55,8 @@ class ExpertBanks:
     layer_formats: list[str] | None = None
     # the residency plan holding DEFERRED layers' banks, for host_banks.probe_pin; None when nothing was deferred
     deferred_plan: object | None = None
+    # the sources are meta tensors (shapes and types only) and the experts stay in the checkpoint files, for the disk tier
+    on_disk: bool = False
 
 
 def _dummy_fill(role: str, tensor: torch.Tensor) -> None:
@@ -337,6 +339,7 @@ def load_expert_banks(
     layer_residency: list[str] | None = None,
     resident: bool = False,
     layer_methods: list | None = None,
+    on_disk: bool = False,
 ) -> ExpertBanks:
     """Load (or fabricate, with ``dummy=True``) the expert banks. Two paths, both returning
     the same normalized ``ExpertBanks`` and both pinning after fill:
@@ -366,8 +369,16 @@ def load_expert_banks(
 
     ``layer_methods`` (one bound method per MoE layer) serves experts of several formats: each
     format fills its own layers and the banks merge over the union of roles (``merge_expert_banks``).
+    ``on_disk`` (GGUF only, --moe-disk-tier): read no expert, return meta banks with the layer shapes (see ``ExpertBanks.on_disk``).
     """
     from freetoken.checkpoint.ftw import is_ftw_checkpoint, load_ftw_banks, load_ftw_banks_to_device
+
+    if on_disk:
+        if dummy or resident or method is None or method.kind is not QuantKind.GGUF or is_mixed(layer_methods):
+            raise ValueError("--moe-disk-tier serves the routed experts of a GGUF checkpoint from its files; this checkpoint's experts are not GGUF")
+        from freetoken.models.gguf.experts import load_gguf_expert_banks
+
+        return load_gguf_expert_banks(model_path, model_config.num_moe_layers, on_disk=True)
 
     mixed = is_mixed(layer_methods)
     if mixed and (resident or layer_residency is not None):

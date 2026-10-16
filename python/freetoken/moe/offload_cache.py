@@ -344,6 +344,9 @@ class OffloadMoeCache:
         self._batch_memcpy = None
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
+        # disk tier (attach_disk_tier): a bounded pinned host cache over the checkpoint files stands in for the complete host banks
+        self.host_tier = None
+        self._disk_tier_args: tuple | None = None
         self._slice_pools()
 
     def _pool_layout(self, pool: int) -> int:
@@ -454,6 +457,35 @@ class OffloadMoeCache:
         assert self.banks, "set_bank_sources must register the banks first"
         return self._pool_bank_views[self.pool_of_layer[layer_id]]
 
+    def attach_disk_tier(self, store, host_bytes: int, min_slots: int) -> None:
+        """Serve the experts from ``store`` (a ``moe.disk_tier.GgufExpertStore``) through a pinned host cache of about ``host_bytes``, instead of complete host banks.
+
+        Call before :meth:`set_bank_sources`, which then takes meta banks (shapes only) and builds the host pools, one per slot layout and each of at
+        least ``min_slots`` experts. The copy plan reads pool slots where it read expert rows: decode rewrites ``src_indices`` from experts to
+        pool slots after reading the GPU misses back (no CUDA graphs), and prefill stages only the routed experts (:meth:`materialize_routed`)."""
+        if self.bank_sources:
+            raise RuntimeError("attach_disk_tier must be called before set_bank_sources")
+        if self.prefill_overlap or self.prefill_hit_d2d:
+            raise ValueError("the disk tier stages each prefill layer from its routing; disable MoE prefill overlap and hit-D2D")
+        if self.decode_target != "gpu":
+            raise ValueError(f"the disk tier serves GPU decode only, not decode_target={self.decode_target!r}")
+        self._disk_tier_args = (store, host_bytes, min_slots)
+
+    def _build_host_tier(self) -> None:
+        from freetoken.moe.disk_tier import HostExpertTier, split_host_capacity
+
+        store, host_bytes, min_slots = self._disk_tier_args
+        slot_bytes = [sum(rows) for rows in self._row_bytes]
+        caps = split_host_capacity(host_bytes, self.layer_layout, slot_bytes, self.num_experts, min_slots)
+        self.host_tier = HostExpertTier(store, self.num_experts, self.bank_schema, self.layouts, self.layer_layout, caps, pin=self.device.type == "cuda")
+        # a layer's source is its layout's pool, indexed by pool slot instead of expert id
+        for k, name in enumerate(self.bank_schema):
+            self.bank_sources[name] = [self.host_tier.pool(layer, k) for layer in range(self.num_layers)]
+        logger.info(
+            f"MoE disk tier: {sum(caps)} host slots in {len(caps)} pools ({self.host_tier.host_bytes / 2**30:.2f} GiB pinned incl. the prefill stage), "
+            f"{store.io_mode} reads from {store.model_path}"
+        )
+
     def set_bank_sources(
         self,
         sources: dict[str, list[torch.Tensor]],
@@ -548,6 +580,10 @@ class OffloadMoeCache:
             self.num_experts * max(rows[k] for rows in self._row_bytes) + max(pads[k] for pads in self._pad_bytes)
             for k in range(len(self.bank_schema))
         ]
+        if self._disk_tier_args is not None:
+            self._build_host_tier()
+        elif any(t.is_meta for per_layer in self.bank_sources.values() for t in per_layer):
+            raise ValueError("the expert banks were loaded for the disk tier (meta tensors); attach_disk_tier first")
         self._alloc_banks()
         if not self._stage_fits(1):
             raise ValueError(f"MoE cache of {self.cache_size} slots cannot stage one whole layer of experts")
@@ -1078,6 +1114,60 @@ class OffloadMoeCache:
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
         ensure_experts(self, layer_id, expert_ids)
+        if self.host_tier is not None:
+            self._admit_from_disk(layer_id)
+
+    def _admit_from_disk(self, layer_id: int) -> None:
+        """Make the GPU misses ``ensure_experts`` staged resident in the host tier and point ``src_indices`` at their pool slots.
+
+        Reading the count back drains the stream, so every earlier copy out of a pool slot has landed before ``ensure`` may evict it."""
+        n = int(self.num_indices.item())
+        if n == 0:
+            return
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("the MoE disk tier reads the misses back on the host and cannot run under CUDA graph capture")
+        try:
+            slots = self.host_tier.ensure(layer_id, self.src_indices[:n].tolist())
+        except BaseException:
+            # the kernel already mapped these experts to their new GPU slots; unmap them so no later step reads slots that were never filled
+            id_of_slot, usage = self.pool_state(layer_id)
+            staged = self.evict_slots[:n].long()
+            self.slot_for_id.view(-1)[id_of_slot[staged].long()] = -1
+            id_of_slot[staged] = -1
+            usage[staged] = 0
+            raise
+        self.src_indices[:n].copy_(torch.tensor(slots, dtype=torch.int32))
+
+    def materialize_routed(self, layer_id: int, expert_ids: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        """Disk-tier prefill: stage this layer's routed experts into staging buffer 0 at row == expert id, from the host pool or the disk.
+
+        Rows of experts the chunk does not route to are left as they are (stale bytes of earlier layers); a layout with an MMQ tail
+        gets its staging rows zeroed first, since the tail of a routed expert's last row reads into the next expert's rows."""
+        assert self.host_tier is not None
+        experts = torch.unique(expert_ids.reshape(-1)).tolist()  # drains the stream: the stage and pool rows earlier copies read are free
+        experts = [e for e in experts if 0 <= e < self.num_experts]
+        self._invalidate_prefill_buffer(0, layer_id)
+        g = self.layer_layout[layer_id]
+        views = self.stage_views(layer_id, 0)
+        if any(self._pad_bytes[g]):
+            for view in views:
+                view.view(torch.uint8).zero_()
+        hits, staged = self.host_tier.prefill(layer_id, experts)
+        tier = self.host_tier
+        for rows, source in ((hits, tier.pool), ([(e, e) for e in staged], tier.stage)):
+            if not rows:
+                continue
+            for k, view in enumerate(views):
+                src = source(layer_id, k)
+                if self.device.type != "cuda":
+                    dst_idx = torch.tensor([d for d, _ in rows])
+                    view.index_copy_(0, dst_idx, src[torch.tensor([s for _, s in rows])])
+                    continue
+                for d, s, n in _runs(rows):
+                    view[d : d + n].copy_(src[s : s + n], non_blocking=True)
+        self.prefill_hit_rows += len(hits)
+        self.prefill_total_rows += len(experts)
+        return views
 
     def ensure_experts_hybrid(
         self, layer_id: int, expert_ids: torch.Tensor, weights: torch.Tensor, clamp: bool = False
@@ -1094,6 +1184,7 @@ class OffloadMoeCache:
         Returns the routes split between GPU and CPU (:class:`freetoken.moe.offload_kernels.HybridRoutes`)."""
         from freetoken.moe.offload_kernels import ensure_experts_hybrid
 
+        assert self.host_tier is None, "the disk tier serves GPU decode only"
         if self.collect_decode_freq:
             ids = expert_ids.reshape(-1).long()
             self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
@@ -1109,6 +1200,9 @@ class OffloadMoeCache:
 
     def materialize_layer(self, layer_id: int) -> None:
         from freetoken.moe.offload_kernels import materialize_layer
+
+        if self.host_tier is not None:
+            raise RuntimeError("the disk tier holds no complete layer to materialize; prefill through materialize_routed")
 
         self._pending_src_layer = layer_id
         self._pending_whole_layer = True
@@ -1306,6 +1400,17 @@ class OffloadMoeCache:
 
 def _layers(n: int) -> str:
     return f"{n} layer" if n == 1 else f"{n} layers"
+
+
+def _runs(pairs: list[tuple[int, int]]) -> list[tuple[int, int, int]]:
+    """``(dst, src)`` row pairs as ``(dst, src, count)`` runs where both sides advance together."""
+    runs: list[list[int]] = []
+    for d, s in sorted(pairs):
+        if runs and runs[-1][0] + runs[-1][2] == d and runs[-1][1] + runs[-1][2] == s:
+            runs[-1][2] += 1
+        else:
+            runs.append([d, s, 1])
+    return [tuple(r) for r in runs]
 
 
 def iter_offload_moe_layers(model) -> Iterator:

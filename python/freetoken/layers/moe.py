@@ -354,6 +354,20 @@ class OffloadMoELayer(MoELayer):
         pass through unmapped."""
         cache = self.offload_cache
         assert cache is not None
+        if cache.host_tier is not None:
+            views = cache.materialize_routed(self.layer_id, topk_ids)
+            out = self._expert_gemm(
+                cache,
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                views=views,
+                n=self.num_experts,
+                alphas=cache.alphas_for_layer(self.layer_id),
+                is_prefill=True,
+            )
+            cache.release_prefill_layer(self.layer_id)
+            return out
         if cache.prefill_overlap:
             views = self._wait_prefill_overlap(cache)
             out = self._expert_gemm(
