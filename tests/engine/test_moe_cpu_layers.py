@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from freetoken.engine.engine import _cpu_moe_executor_max_tokens
 from freetoken.engine.engine import _parse_cpu_layers_spec as parse
 from freetoken.engine.engine import _resolve_cpu_layers as resolve
 
@@ -59,6 +60,23 @@ def test_resolve_backend_dispatch():
     assert resolve(_cfg("offload", None), L) == frozenset()
     # non-offload backend ignores the spec (validation lives in _adjust_config)
     assert resolve(_cfg("fused", "8"), L) == frozenset()
+
+
+def test_cpu_moe_capacity_covers_mtp_verify_rows_and_graph_padding():
+    config = SimpleNamespace(
+        max_running_req=4,
+        speculative_algorithm="mtp",
+        speculative_num_draft_tokens=2,
+        cuda_graph_max_bs=None,
+        cuda_graph_bs=None,
+    )
+    assert _cpu_moe_executor_max_tokens(config) == 12
+
+    config.cuda_graph_bs = [16]
+    assert _cpu_moe_executor_max_tokens(config) == 16
+
+    config.speculative_algorithm = None
+    assert _cpu_moe_executor_max_tokens(config) == 16
 
 
 if __name__ == "__main__":

@@ -75,6 +75,12 @@ class EnvClassSingleton:
     # fp32 matches the Qwen3.x configs (mamba_ssm_dtype); fp16/bf16 halves the GDN state
     # pool at some precision cost on the long recurrence (mirrors SGLang's mamba_ssm_dtype).
     MAMBA_SSM_DTYPE = EnvStr("float32")
+    # MTP verification controls used for correctness checks.
+    SPEC_SEQUENTIAL_VERIFY = EnvBool(False)
+    SPEC_FORCE_REJECT = EnvBool(False)
+    # Resolve simultaneous stop-string matches by earliest output position; off preserves upstream list order.
+    EARLIEST_STOP_MATCH = EnvBool(False)
+    QWEN35_ROUTER_GEMV = EnvBool(False)
 
     def __new__(cls):
         # single instance

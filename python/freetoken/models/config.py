@@ -359,10 +359,28 @@ class ModelConfig:
     # Extra per-request tensors riding the LinearStatePool slots (see SlotStateSpec);
     # () for models without any. Requires a linear-attention group to ride on.
     slot_states: Tuple[SlotStateSpec, ...] = ()
+    # Draft-head (MTP) blocks the engine runs after the decoder, at layer ids num_layers.. ; they
+    # own a KV layer (they sit in a full-attention group) but are not decoder layers. 0 = none.
+    num_draft_layers: int = 0
+    # A small number of architectures use different query-head counts by layer. Empty
+    # keeps the common scalar ``num_qo_heads`` contract.
+    num_qo_heads_per_layer: Tuple[int, ...] = ()
+
+    def num_qo_heads_for_layer(self, layer_id: int) -> int:
+        if not self.num_qo_heads_per_layer:
+            return self.num_qo_heads
+        if layer_id < 0 or layer_id >= self.num_layers:
+            raise IndexError(f"layer id {layer_id} outside [0, {self.num_layers})")
+        return self.num_qo_heads_per_layer[layer_id]
 
     @property
     def is_moe(self) -> bool:
         return "moe" in self.model_type or self.moe_enabled
+
+    @property
+    def num_kv_layers(self) -> int:
+        """Layer ids the KV pool addresses: the decoder's plus any draft-head blocks."""
+        return self.num_layers + self.num_draft_layers
 
     @property
     def num_moe_layers(self) -> int:

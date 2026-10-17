@@ -130,6 +130,58 @@ def test_disk_tier_meta_banks_match_the_loaded_banks(expert_gguf):
             assert m.is_meta and (m.shape, m.dtype) == (r.shape, r.dtype)
 
 
+def test_dense_prefix_offset_selects_the_matching_gguf_expert_blocks(expert_gguf):
+    from freetoken.models.gguf.experts import load_gguf_expert_banks
+    from freetoken.moe.disk_tier import GgufExpertStore
+
+    path, _ = expert_gguf
+    offset_banks = load_gguf_expert_banks(path, 2, first_layer=1, device=torch.device("cpu"))
+    block1 = load_gguf_expert_banks(path, 1, first_layer=1, device=torch.device("cpu"))
+    block2 = load_gguf_expert_banks(path, 1, first_layer=2, device=torch.device("cpu"))
+    for bank in ("gate_up", "down"):
+        assert torch.equal(offset_banks.sources[bank][0], block1.sources[bank][0])
+        assert torch.equal(offset_banks.sources[bank][1], block2.sources[bank][0])
+
+    store = GgufExpertStore(path, 2, first_layer=1, io_mode="buffered")
+    try:
+        for layer, reference in enumerate((block1, block2), start=0):
+            for bank in ("gate_up", "down"):
+                for expert in range(E):
+                    row = reference.sources[bank][0][expert].contiguous().view(torch.uint8).numpy().reshape(-1)
+                    actual = np.empty_like(row)
+                    store.read_expert(bank, layer, expert, actual)
+                    assert np.array_equal(actual, row), (bank, layer, expert)
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("on_disk", [False, True])
+def test_expert_bank_dispatch_passes_the_dense_prefix_offset(monkeypatch, on_disk):
+    from types import SimpleNamespace
+
+    from freetoken.layers.quantization import QuantKind
+    from freetoken.moe import expert_banks
+
+    calls = []
+    monkeypatch.setattr(
+        "freetoken.models.gguf.experts.load_gguf_expert_banks",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or "loaded",
+    )
+    config = SimpleNamespace(num_moe_layers=2, first_k_dense_replace=1)
+    method = SimpleNamespace(kind=QuantKind.GGUF)
+    loaded = expert_banks.load_expert_banks(
+        "synthetic.gguf",
+        config,
+        method=method,
+        device=torch.device("cpu"),
+        dummy=not on_disk,
+        parallel=False,
+        on_disk=on_disk,
+    )
+    assert loaded == "loaded"
+    assert calls[0][1]["first_layer"] == 1
+
+
 def _tier(path: str, layers: int, capacities, workers: int = 4):
     from freetoken.moe.disk_tier import GgufExpertStore, HostExpertTier
     from freetoken.moe.offload_cache import bank_layouts

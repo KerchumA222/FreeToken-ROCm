@@ -89,6 +89,20 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
     from .dsv4.v4_pool import DSV4PagedKVCache
 
     model_config = config.model_config
+    kv_cache_dtype = getattr(config, "kv_cache_dtype", "model")
+    if kv_cache_dtype not in ("model", "q8_0", "turboquant_4bit_nc"):
+        raise ValueError(f"unsupported KV cache dtype {kv_cache_dtype!r}")
+    if kv_cache_dtype in ("q8_0", "turboquant_4bit_nc"):
+        from .mha_pool import MHAKVCache
+
+        if (
+            model_config.has_swa_attention
+            or model_config.has_linear_attention
+            or resolve_pool_class(model_config) is not MHAKVCache
+        ):
+            raise ValueError(
+                f"{kv_cache_dtype} KV cache currently supports ordinary FULL attention only"
+            )
     if resolve_pool_class(model_config) is DSV4PagedKVCache:
         # DSV4 is driven by the generic CacheManager over the shared page table; the pool is
         # the only DSV4-specific piece (the swa_pool plug-in: window tier + cmp/idx/state
@@ -136,6 +150,7 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
         device=device,
         dtype=dtype,
         num_req_slots=config.max_running_req + 1,  # + 1 for the dummy request row
+        kv_cache_dtype=getattr(config, "kv_cache_dtype", "model"),
     )
 
 
@@ -147,13 +162,22 @@ def create_kvcache_pool(
     device: torch.device,
     num_swa_tokens: int | None = None,
     num_req_slots: int | None = None,
+    kv_cache_dtype: str = "model",
 ) -> BaseKVCachePool:
+    if kv_cache_dtype not in ("model", "q8_0", "turboquant_4bit_nc"):
+        raise ValueError(f"unsupported KV cache dtype {kv_cache_dtype!r}")
+    if kv_cache_dtype in ("q8_0", "turboquant_4bit_nc") and (
+        model_config.has_swa_attention or model_config.has_linear_attention
+    ):
+        raise ValueError(
+            f"{kv_cache_dtype} KV cache currently supports ordinary FULL attention only"
+        )
     if model_config.has_swa_attention:
         from .hybrid_swa_pool import HybridSWAKVCache
 
         return HybridSWAKVCache(
             groups=model_config.kv_cache_group_specs(),
-            num_layers=model_config.num_layers,
+            num_layers=getattr(model_config, "num_kv_layers", model_config.num_layers),
             num_full_pages=num_pages,
             page_size=page_size,
             num_swa_tokens=num_swa_tokens,
@@ -183,6 +207,19 @@ def create_kvcache_pool(
     # the budget can never disagree.
     from freetoken.attention import AttnType as _AttnType
 
+    if kv_cache_dtype in ("q8_0", "turboquant_4bit_nc") and any(
+        spec.attn_type != _AttnType.FULL or spec.mla for spec in kv_specs
+    ):
+        raise ValueError(
+            f"{kv_cache_dtype} KV cache currently supports ordinary FULL attention only"
+        )
+    if kv_cache_dtype == "turboquant_4bit_nc":
+        if len(kv_specs) != 1:
+            raise ValueError("TurboQuant currently requires one uniform FULL-attention KV group")
+        head_dim = kv_specs[0].head_dim
+        if head_dim < 2 or head_dim & (head_dim - 1):
+            raise ValueError(f"TurboQuant requires an even power-of-two head_dim, got {head_dim}")
+
     if len(kv_specs) == 1 and kv_specs[0].attn_type == _AttnType.BSA:
         from .bsa_pool import BSAKVCache
 
@@ -190,7 +227,7 @@ def create_kvcache_pool(
         assert layer_ids is None, "hybrid-linear x BSA has no pool support yet"
         return BSAKVCache(
             num_kv_heads=spec.num_kv_heads,
-            num_layers=model_config.num_layers,
+            num_layers=getattr(model_config, "num_kv_layers", model_config.num_layers),
             head_dim=spec.head_dim,
             num_pages=num_pages,
             page_size=page_size,
@@ -212,7 +249,7 @@ def create_kvcache_pool(
             raise ValueError("QSA pools need num_req_slots (max_running_req + 1)")
         return QSAKVCache(
             num_kv_heads=spec.num_kv_heads,
-            num_layers=model_config.num_layers,
+            num_layers=getattr(model_config, "num_kv_layers", model_config.num_layers),
             head_dim=spec.head_dim,
             num_pages=num_pages,
             page_size=page_size,
@@ -232,7 +269,7 @@ def create_kvcache_pool(
         spec = kv_specs[0]
         # With a layer remap the pool allocates len(layer_ids) slabs; without one
         # it backs every model layer (all-MLA models, GLM-5.2).
-        num_layers = model_config.num_layers if layer_ids is None else len(layer_ids)
+        num_layers = getattr(model_config, "num_kv_layers", model_config.num_layers) if layer_ids is None else len(layer_ids)
         if spec.index_head_dim > 0 and spec.num_index_layers > 0:
             common = dict(
                 latent_dim=spec.head_dim,
@@ -270,11 +307,12 @@ def create_kvcache_pool(
         num_kv_heads=spec.num_kv_heads if spec is not None else model_config.num_kv_heads,
         num_pages=num_pages,
         page_size=page_size,
-        num_layers=model_config.num_layers,
+        num_layers=getattr(model_config, "num_kv_layers", model_config.num_layers),
         head_dim=spec.head_dim if spec is not None else model_config.head_dim,
         device=device,
         dtype=dtype,
         layer_ids=layer_ids,
+        kv_cache_dtype=kv_cache_dtype,
     )
 
 

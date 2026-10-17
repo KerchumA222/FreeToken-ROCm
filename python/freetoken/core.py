@@ -69,6 +69,10 @@ class Req:
     # _process_last_data frees the request when the batch drains (after copy_done.synchronize).
     aborted: bool = False
     output_token_counts: torch.Tensor | None = field(default=None, init=False, repr=False)
+    # MTP speculation (--speculative-algorithm mtp): the draft head's token for position
+    # device_len, and which slot of the engine's hidden store holds the head state it came from.
+    pending_draft: int | None = field(default=None, init=False, repr=False)
+    pending_slot: int = field(default=0, init=False, repr=False)
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
@@ -112,6 +116,73 @@ class Req:
             f"cached_len={self.cached_len}, device_len={self.device_len}, "
             f"max_device_len={self.max_device_len})"
         )
+
+
+class VerifyRow:
+    """One query row of a speculative verify: request ``req`` at position ``req.cached_len + step``.
+
+    A verify batch lists these instead of its requests, so every per-request consumer (page
+    allocation, positions, attention and GDN metadata, sampling) sees ``1 + k`` decode rows per
+    request, each attending to the positions up to its own."""
+
+    __slots__ = ("req", "step")
+
+    def __init__(self, req: Req, step: int) -> None:
+        self.req = req
+        self.step = step
+
+    @property
+    def cached_len(self) -> int:
+        return self.req.cached_len + self.step
+
+    @property
+    def device_len(self) -> int:
+        return self.req.cached_len + self.step + 1
+
+    @property
+    def extend_len(self) -> int:
+        return 1
+
+    def __getattr__(self, name: str):
+        return getattr(self.req, name)
+
+
+@dataclass
+class SpecVerify:
+    """A verify step: ``k`` drafts per request, its rows ordered step-major (row ``s * B + i`` is
+    request ``i`` at ``cached_len + s``), and the GDN snapshot slot of each request after each of
+    the first ``k`` steps, ``snap_slots[s]`` an int64 ``[B]`` device tensor."""
+
+    reqs: List[Req]
+    k: int
+    first_drafts: List[int]
+    snap_slots: List[torch.Tensor] | None = None
+    # set by the engine when it runs the verify one step per forward (FREETOKEN_SPEC_SEQUENTIAL_VERIFY)
+    step: int | None = None
+
+    @property
+    def num_reqs(self) -> int:
+        return len(self.reqs)
+
+
+@dataclass
+class MtpPlan:
+    """What the MTP draft head does after one forward. It runs over every row (its own KV has to
+    cover every position), fed the token that follows each row: the next prompt token inside a
+    prefill extent (``next_ids``), the sampled token at each row that was sampled (``sampled_rows``,
+    None = every row, in order; ``sampled_src_rows`` selects those tokens from sampler output).
+    It drafts at ``draft_rows`` (None = every row), one per request
+    on a plain step and one per row on a verify, and keeps the head state of each draft row in the
+    engine's hidden store at ``store_idx`` for the next step's chained drafts."""
+
+    store_idx: torch.Tensor
+    draft_rows: torch.Tensor | None = None
+    sampled_rows: torch.Tensor | None = None
+    # Source indices in the sampler's per-request output for sampled_rows; None means its prefix.
+    sampled_src_rows: torch.Tensor | None = None
+    next_ids: torch.Tensor | None = None
+    # (table row, position) of each row's next token in the token pool, resolved into next_ids
+    next_at: tuple | None = None
 
 
 
@@ -160,6 +231,12 @@ class Batch:
     # _prepare_batch succeeds. Continuation chunks leave this empty, so accounting is
     # exactly-once.
     prompt_admissions: List[Tuple[int, int, int]] = field(default_factory=list, init=False)
+    # MTP speculation: a verify step (reqs are VerifyRow views), and the LM head input of every
+    # row, kept for the draft head when capture_hidden is set.
+    spec: SpecVerify | None = field(default=None, init=False)
+    capture_hidden: bool = field(default=False, init=False)
+    hidden_states: torch.Tensor | None = field(default=None, init=False)
+    mtp_plan: MtpPlan | None = field(default=None, init=False)
 
     @property
     def is_prefill(self) -> bool:

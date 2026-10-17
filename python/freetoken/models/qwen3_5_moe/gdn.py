@@ -122,6 +122,39 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         conv_win = conv_in[fla.track_conv_src].transpose(-1, -2).contiguous()  # [nt, conv_dim, K-1]
         cv.index_copy_(0, fla.track_dst, conv_win.to(cv.dtype))
 
+    def _decode_rows(self, conv_in, a, b, idx, pool, li, cu_seqlens, dtype) -> torch.Tensor:
+        """One token per request through the decode conv + recurrence, updating slots ``idx`` in place."""
+        mixed = self._conv_decode(conv_in, idx, pool)  # [B, conv_dim]
+        B = mixed.shape[0]
+        qf, kf, vf = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
+        q = qf.reshape(1, B, self.num_k_heads, self.head_k_dim).to(dtype)
+        k = kf.reshape(1, B, self.num_k_heads, self.head_k_dim).to(dtype)
+        v = vf.reshape(1, B, self.num_v_heads, self.head_v_dim).to(dtype)
+        return gdn_decode_fla(
+            q, k, v, a, b, A_log=self.A_log, dt_bias=self.dt_bias,
+            state_source=pool.recurrent_states[li], indices=idx,
+            cu_seqlens=cu_seqlens, scale=self.head_k_dim ** -0.5,
+        )
+
+    def _verify(self, conv_in, a, b, pool, li, fla, spec, dtype) -> torch.Tensor:
+        """A speculative verify: rows are step-major, ``B`` requests per step, each step through the
+        decode kernels exactly as a plain decode step would run it. The state after each of the first
+        ``k`` steps is copied to that step's snapshot slots, so a partial accept restores it."""
+        B = spec.num_reqs
+        steps = range(spec.k + 1) if spec.step is None else (spec.step,)
+        cu = fla.cu_seqlens[: B + 1]
+        rec, conv = pool.recurrent_states[li], pool.conv_states[li]
+        outs = []
+        for i, s in enumerate(steps):
+            rows = slice(i * B, (i + 1) * B)
+            idx = fla.cache_indices[rows]
+            outs.append(self._decode_rows(conv_in[rows], a[rows], b[rows], idx, pool, li, cu, dtype))
+            if s < spec.k:
+                dst = spec.snap_slots[s]
+                rec.index_copy_(0, dst, rec.index_select(0, idx))
+                conv.index_copy_(0, dst, conv.index_select(0, idx))
+        return outs[0] if len(outs) == 1 else torch.cat(outs, dim=0)
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         ctx = get_global_ctx()
         batch = ctx.batch
@@ -150,21 +183,14 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         z = z.reshape(total, self.num_v_heads, self.head_v_dim)
         li = pool.local_index(self.layer_id)
 
-        if batch.is_decode:
+        spec = getattr(batch, "spec", None)
+        if spec is not None:
+            core_out = self._verify(conv_in, a, b, pool, li, fla, spec, dtype)
+        elif batch.is_decode:
             # Fused fla decode kernel: gating + in-kernel l2norm + recurrent update +
             # per-request state read/write-by-index, all in one kernel (no gather/scatter,
             # no clone, no external l2norm). q/k stay at num_k_heads (kernel handles GQA).
-            mixed = self._conv_decode(conv_in, fla.cache_indices, pool)  # [B, conv_dim]
-            B = mixed.shape[0]
-            qf, kf, vf = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
-            q = qf.reshape(1, B, self.num_k_heads, self.head_k_dim).to(dtype)
-            k = kf.reshape(1, B, self.num_k_heads, self.head_k_dim).to(dtype)
-            v = vf.reshape(1, B, self.num_v_heads, self.head_v_dim).to(dtype)
-            core_out = gdn_decode_fla(
-                q, k, v, a, b, A_log=self.A_log, dt_bias=self.dt_bias,
-                state_source=pool.recurrent_states[li], indices=fla.cache_indices,
-                cu_seqlens=fla.cu_seqlens, scale=self.head_k_dim ** -0.5,
-            )
+            core_out = self._decode_rows(conv_in, a, b, fla.cache_indices, pool, li, fla.cu_seqlens, dtype)
         else:
             mixed = self._conv_prefill(
                 conv_in, pool, fla.cu_seqlens, fla.cache_indices, fla.has_initial_state)

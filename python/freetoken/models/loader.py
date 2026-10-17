@@ -11,7 +11,7 @@ from typing import Iterable, Iterator
 import torch
 from freetoken.utils import div_ceil, download_hf_weight
 
-SPLIT_DIM_0 = (".q_proj", ".k_proj", ".v_proj", ".gate_proj", ".up_proj")
+SPLIT_DIM_0 = (".q_proj", ".k_proj", ".v_proj", ".g_proj", ".gate_proj", ".up_proj")
 SPLIT_DIM_1 = (".o_proj", ".down_proj")
 
 

@@ -283,6 +283,20 @@ class CacheManager:
                 self.swa_pool.alloc_swa(allocated)
             _write_page_table(self.page_table, allocated, allocation_info, self.page_size)
 
+    def rollback_pages(self, req: Req, staged_len: int) -> None:
+        """Return the pages a speculative verify allocated past the accepted tokens.
+
+        The verify allocated through ``staged_len``; the request now keeps ``req.cached_len``
+        positions, and the next ``allocate_paged`` starts at page ``div_ceil(cached_len)``, so every
+        page from there to ``div_ceil(staged_len)`` goes back (their stale KV is never read)."""
+        first = div_ceil(req.cached_len, self.page_size)
+        last = div_ceil(staged_len, self.page_size)
+        if last > first:
+            rows = self.page_table[req.table_idx, first * self.page_size : last * self.page_size]
+            if self.swa_paged:
+                self._free_swa(rows)
+            self._free(rows)
+
     def cache_req(self, req: Req, *, finished: bool) -> None:
         if self.is_swa:
             return self._cache_req_swa(req, finished=finished)

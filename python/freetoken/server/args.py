@@ -47,6 +47,7 @@ class ServerArgs(SchedulerConfig):
     # a turn cannot also kill the engine — see server/launch.py:_detach_process_group.
     shell_mode: bool = False
     served_model_name: str | None = None
+    kv_cache_dtype: str = "model"
     tool_call_parser: str = "llama3"
     # Reasoning parser that splits <think> reasoning from content for OpenAI
     # responses. None disables it (default for models without a reasoning protocol).
@@ -208,6 +209,13 @@ def parse_args(
         marker = " ".join(candidates).lower()
         if "flint" in marker:
             return "glm47"
+        if "laguna" in marker and (
+            os.environ.get("FREETOKEN_ENABLE_LAGUNA_HF", "0").strip().lower()
+            in ("1", "true", "yes", "on")
+            or os.environ.get("FREETOKEN_ENABLE_LAGUNA_GGUF", "0").strip().lower()
+            in ("1", "true", "yes", "on")
+        ):
+            return "glm47"
         if "gpt_oss" in marker or "gpt-oss" in marker or "gptoss" in marker:
             return "gpt_oss"
         # M3 first: its marker also contains the bare "minimax" substring, but the
@@ -225,6 +233,9 @@ def parse_args(
         if (
             "qwen3_5" in marker
             or "qwen3.5" in marker
+            or "qwen3_6" in marker
+            or "qwen3.6" in marker
+            or "qwen3-6" in marker
             or ("qwen3" in marker and "coder" in marker)
         ):
             return "qwen3_coder"
@@ -261,6 +272,13 @@ def parse_args(
         marker = " ".join(candidates).lower()
         if "flint" in marker:
             return "flint"
+        if "laguna" in marker and (
+            os.environ.get("FREETOKEN_ENABLE_LAGUNA_HF", "0").strip().lower()
+            in ("1", "true", "yes", "on")
+            or os.environ.get("FREETOKEN_ENABLE_LAGUNA_GGUF", "0").strip().lower()
+            in ("1", "true", "yes", "on")
+        ):
+            return "qwen3"
         if "gpt_oss" in marker or "gpt-oss" in marker or "gptoss" in marker:
             return "gpt_oss"
         if "deepseek" in marker and any(
@@ -463,6 +481,16 @@ def parse_args(
         type=int,
         default=ServerArgs.page_size,
         help="Set the page size for system management.",
+    )
+
+    parser.add_argument(
+        "--kv-cache-dtype",
+        choices=("model", "q8_0", "turboquant_4bit_nc"),
+        default=ServerArgs.kv_cache_dtype,
+        help=(
+            "KV storage format; q8_0 and turboquant_4bit_nc are opt-in and currently "
+            "use the Triton FULL-attention path."
+        ),
     )
 
     parser.add_argument(
@@ -934,6 +962,27 @@ def parse_args(
         default=ServerArgs.moe_host_cache_mem,
         help="Pinned host RAM for the --moe-disk-tier expert cache, e.g. 8GiB (default: a quarter of the available RAM).",
     )
+    parser.add_argument(
+        "--speculative-algorithm",
+        choices=["mtp"],
+        default=ServerArgs.speculative_algorithm,
+        help=(
+            "Speculative decoding: 'mtp' drafts with the checkpoint's MTP (nextn) head and verifies the drafts in one forward. "
+            "Greedy requests only; GGUF Qwen3.5/3.6 checkpoints. Off by default."
+        ),
+    )
+    parser.add_argument(
+        "--speculative-num-draft-tokens",
+        type=int,
+        default=None,
+        help="Drafts per step with --speculative-algorithm mtp (default 1; the head chains on its own output past 1).",
+    )
+    parser.add_argument(
+        "--speculative-draft-model-path",
+        type=str,
+        default=ServerArgs.speculative_draft_model_path,
+        help="GGUF holding the MTP draft head when the checkpoint has none (a draft-head-only mtp-*.gguf).",
+    )
 
     parser.add_argument(
         "--shell-mode",
@@ -953,6 +1002,15 @@ def parse_args(
 
     # Parse arguments
     kwargs = parser.parse_args(args).__dict__.copy()
+
+    if kwargs["speculative_num_draft_tokens"] is not None and kwargs["speculative_algorithm"] is None:
+        parser.error("--speculative-num-draft-tokens needs --speculative-algorithm mtp")
+    if kwargs["speculative_draft_model_path"] is not None:
+        if kwargs["speculative_algorithm"] is None:
+            parser.error("--speculative-draft-model-path needs --speculative-algorithm mtp")
+        kwargs["speculative_draft_model_path"] = os.path.expanduser(kwargs["speculative_draft_model_path"])
+    if kwargs["speculative_num_draft_tokens"] is None:
+        kwargs["speculative_num_draft_tokens"] = ServerArgs.speculative_num_draft_tokens
 
     # reject a too-long list here with a clear reason, not as a dead rank later
     if len(kwargs["gpu"]) not in (0, kwargs["tensor_parallel_size"]):

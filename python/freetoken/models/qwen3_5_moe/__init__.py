@@ -6,6 +6,7 @@ from .model import (
     Qwen3_5MoeForCausalLM,
     Qwen3_5MoeForConditionalGeneration,
 )
+from .mtp import QWEN3_5_MTP
 from .weight import iter_expert_pieces, iter_vision_weights, iter_weights, iter_weights_parallel, nvfp4_expert_spec
 
 __all__ = [
@@ -23,4 +24,5 @@ __all__ = [
     "iter_gguf_weights",
     "parse_gguf_config",
     "to_gguf",
+    "QWEN3_5_MTP",
 ]

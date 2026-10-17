@@ -129,6 +129,9 @@ class ParallelLMHead(VocabParallelEmbedding):
         ctx = get_global_ctx()
         batch = ctx.batch
         bs = batch.size
+        if getattr(batch, "capture_hidden", False):
+            # every row, before the prefill gather: the MTP draft head runs over all of them
+            batch.hidden_states = x
         if batch.is_prefill:
             indices = batch.attn_metadata.get_last_indices(bs)
             x = x[indices].contiguous()

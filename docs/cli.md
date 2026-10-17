@@ -72,6 +72,7 @@ ft serve --model ... --gpu GPU-9e8d7c6b  # the same card by UUID (a unique prefi
 | `--memory-ratio` | 0.9 | Fraction of free VRAM the engine may use (weights + MoE cache + KV) |
 | `--num-pages` / `--num-tokens` | auto | KV capacity override in pages / tokens (mutually exclusive; auto sizes from VRAM left after weights and MoE cache) |
 | `--embed-weights` | gpu | Where the input token embedding table lives. `host` keeps it in pinned host RAM and each lookup reads its rows over PCIe, so its VRAM goes to the expert cache and KV. Refused when the table is tied to the LM head |
+| `--kv-cache-dtype` | `model` | KV storage format: `model` preserves model-dtype storage; opt-in `q8_0` uses int8 values with fp16 scales, while experimental `turboquant_4bit_nc` uses packed 4-bit codes. Both currently require ordinary FULL attention with the Triton backend |
 | `--page-size` | 1 | KV page size; DSV4 forces 128, the TRTLLM backend needs 16/32/64, SWA models require 1 |
 | `--cache-type` | radix | `radix` (prefix reuse; SWA/GDN-aware variants picked automatically) or `naive` |
 | `--attention-backend`, `--attn` | auto | `trtllm`/`fi`/`fa`/`triton`/`dsv4_sparse`/`dsa`; `prefill,decode` pair allowed; auto picks per model + GPU |
@@ -100,7 +101,28 @@ See [models.md](models.md#moe-strategies) for what each strategy does, and [perf
 | `--moe-disk-tier` | off | GGUF + `offload` only: leave the routed experts in the GGUF files and read them on demand (O_DIRECT; `FREETOKEN_DISK_TIER_IO=buffered` reads through the page cache) into a bounded pinned host cache, for models whose experts exceed RAM. Decode runs without CUDA graphs and prefill stages only the routed experts, without overlap |
 | `--moe-host-cache-mem` | 1/4 of available RAM | With `--moe-disk-tier`: pinned host RAM for the expert cache, e.g. `8GiB` |
 
+Two optional MoE routing controls are disabled by default. They apply to models that use the generic `MoELayer` top-k path; architectures that compute routing in a custom router and call `routed_forward` bypass these controls and retain their existing routing behavior.
+
+- `FT_ROUTE_BIAS` adds a selection-only score offset to experts resident in the GPU cache for batches of up to 8 rows. `FT_ROUTE_BIAS_PREFILL` independently sets the offset for larger batches. Both default to `0`; router weights are still computed from the unmodified logits.
+- `FREETOKEN_QWEN35_ROUTER_GEMV=1` opts into the Qwen3.5 small-router broadcast-reduction path for HIP batches of up to 4 rows. It defaults to `0`; the default keeps `LinearReplicated`'s upstream arithmetic. The opt-in reduction can change close router rankings because its low-precision accumulation differs.
+- `FT_EXPERT_REMAP=/path/to/map.pt` enables source-to-destination expert remapping. Save either an integer `[layers, experts]` tensor for a hard map, or a `{"ids": [layers, experts, choices], "w": [layers, experts, choices]}` dictionary for a soft map. Soft-map weights must be finite, nonnegative, and sum to 1 per source expert. Source probability mass is aggregated by destination before top-k; each token keeps the configured top-k count of distinct destination IDs. Layers beyond the table are routed normally.
+- `FT_RDNA2_GDN_TILES=1` opts into the alternate chunked-GDN prefill tiles only when Triton reports a `gfx103x` target. It defaults to `0`; existing tiles remain selected on every GPU unless explicitly enabled on gfx103x.
+
+### Laguna-S-2.1 (experimental)
+
+Laguna support is opt-in and defaults off. Set `FREETOKEN_ENABLE_LAGUNA_HF=1` for HF checkpoints or `FREETOKEN_ENABLE_LAGUNA_GGUF=1` for GGUF checkpoints. The GGUF adapter currently accepts only the verified S-2.1 geometry and supports tensor parallelism 1 only.
+
+### Speculative decoding
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--speculative-algorithm` | off | `mtp`: greedy speculative decoding using a Qwen3.5/3.6 GGUF's MTP (nextn) draft head; currently single-GPU only and runs without CUDA graphs |
+| `--speculative-num-draft-tokens` | 1 | Drafts per verify step; values above 1 chain the draft head on its own output |
+| `--speculative-draft-model-path` | — | GGUF containing the MTP `nextn` tensors when they are not embedded in the model checkpoint; for a GGUF-converted FTW target, pass its original source GGUF here |
+
 ### API behaviour
+
+`FREETOKEN_EARLIEST_STOP_MATCH=1` selects the earliest stop-string position when multiple configured stops match one decoded chunk. It defaults to `0`, preserving upstream stop-list priority.
 
 | Flag | Default | Meaning |
 |---|---|---|

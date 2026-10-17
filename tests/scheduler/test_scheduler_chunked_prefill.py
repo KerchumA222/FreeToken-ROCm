@@ -198,6 +198,27 @@ def test_a_shared_pass_defers_an_image_it_cannot_hold_whole():
     assert [(r.uid, r.extend_len) for r in second.reqs] == [(UID + 1, 30)]
 
 
+def test_mtp_chunk_stages_the_next_prompt_token_only_when_enabled():
+    from freetoken.core import SamplingParams
+    from freetoken.scheduler.prefill import ChunkedReq
+    from freetoken.scheduler.utils import PendingReq
+
+    def first_chunk(write_next_token):
+        _cm, tm, _dm, pm = _build_managers(num_pages=64)
+        pm.write_next_token = write_next_token
+        prompt = torch.arange(CHUNK * 2, dtype=torch.int32)
+        pm.pending_list = [
+            PendingReq(uid=UID, input_ids=prompt, sampling_params=SamplingParams(max_tokens=4))
+        ]
+        batch = pm.schedule_next_batch(CHUNK)
+        assert batch is not None and isinstance(batch.reqs[0], ChunkedReq)
+        row = batch.reqs[0].table_idx
+        return tm.token_pool[row, : CHUNK + 1].clone()
+
+    assert first_chunk(write_next_token=True).tolist() == list(range(CHUNK + 1))
+    assert first_chunk(write_next_token=False).tolist() == list(range(CHUNK)) + [0]
+
+
 def test_the_sliding_window_pool_cap_cannot_recut_an_image():
     """The image boundary is decided after the pool cap: a pool of 5000 tokens ends the chunk before the image at 4900, not inside it."""
     from freetoken.core import SamplingParams

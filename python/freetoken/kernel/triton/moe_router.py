@@ -50,6 +50,7 @@ def _keep_top_groups(ranked, offs_n, N_GROUP: tl.constexpr, TOPK_GROUP: tl.const
 def _router_triton_kernel(
     scores_ptr,
     bias_ptr,
+    selection_bias_ptr,
     out_weights_ptr,
     out_indices_ptr,
     num_token_non_padded_ptr,
@@ -57,6 +58,7 @@ def _router_triton_kernel(
     routed_scale,
     stride_sm,
     stride_sn,
+    stride_sb,
     stride_wm,
     stride_wk,
     stride_im,
@@ -72,6 +74,7 @@ def _router_triton_kernel(
     BLOCK_G: tl.constexpr,
     RENORMALIZE: tl.constexpr,
     HAS_TOKEN_LIMIT: tl.constexpr,
+    HAS_SELECTION_BIAS: tl.constexpr,
     launch_pdl: tl.constexpr,
 ) -> None:
     # Row-tiled: each program handles BLOCK_M rows; all reductions run along the
@@ -101,6 +104,13 @@ def _router_triton_kernel(
         row_max = tl.max(ranked, axis=1)[:, None]
         exp_row = tl.where(mask_n[None, :], tl.exp(ranked - row_max), 0.0)
         activated = exp_row / tl.sum(exp_row, axis=1)[:, None]
+
+    if HAS_SELECTION_BIAS:
+        bias = tl.load(
+            selection_bias_ptr + offs_n * stride_sb, mask=mask_n, other=0.0
+        ).to(tl.float32)
+        ranked = logits + bias[None, :]
+        ranked = tl.where(mask_n[None, :], ranked, -float("inf"))
 
     # Map NaN -> a finite floor
     ranked = tl.where(ranked == ranked, ranked, -1e30)
@@ -158,9 +168,16 @@ def _launch_router(
     n_group: int,
     topk_group: int,
     num_token_non_padded: torch.Tensor | None,
+    selection_bias: torch.Tensor | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """``bias`` (sigmoid routers) is the router's own selection bias; ``selection_bias`` (softmax routers, FT_ROUTE_BIAS)
+    shifts which experts the logits select. Both affect selection only: the weights come from the unbiased scores."""
     assert gating_output.ndim == 2, "gating_output must be 2D"
     M, N = gating_output.shape
+    if selection_bias is not None:
+        assert bias is None, "selection_bias is for softmax routers; a sigmoid router carries its bias in bias"
+        assert selection_bias.shape == (N,), "selection_bias must have one value per expert"
+        assert selection_bias.device == gating_output.device, "selection_bias must share the logits device"
     weights = torch.empty((M, topk), dtype=torch.float32, device=gating_output.device)
     indices = torch.empty((M, topk), dtype=torch.int32, device=gating_output.device)
 
@@ -178,6 +195,7 @@ def _launch_router(
     _router_triton_kernel[(triton.cdiv(M, BLOCK_M),)](
         gating_output,
         bias,
+        gating_output if selection_bias is None else selection_bias,
         weights,
         indices,
         num_token_non_padded,
@@ -185,6 +203,7 @@ def _launch_router(
         routed_scale,
         gating_output.stride(0),
         gating_output.stride(1),
+        selection_bias.stride(0) if selection_bias is not None else 0,
         weights.stride(0),
         weights.stride(1),
         indices.stride(0),
@@ -200,6 +219,7 @@ def _launch_router(
         BLOCK_G=triton.next_power_of_2(n_group),
         RENORMALIZE=renormalize,
         HAS_TOKEN_LIMIT=num_token_non_padded is not None,
+        HAS_SELECTION_BIAS=selection_bias is not None,
         launch_pdl=_pdl_supported(),
         num_warps=num_warps,
     )
@@ -211,12 +231,14 @@ def fused_topk_softmax(
     topk: int,
     renormalize: bool,
     num_token_non_padded: torch.Tensor | None = None,
+    selection_bias: torch.Tensor | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Softmax over all experts, top-k, then renormalize; ties keep the lowest expert id.
+    """Softmax over all experts, top-k (by the logits plus the optional ``selection_bias``), then renormalize.
 
-    ``num_token_non_padded`` is a device scalar; rows at or past it get expert id -1.
+    ``selection_bias`` affects expert selection only; returned weights come from the original logits.
+    ``num_token_non_padded`` is a device scalar; rows at or past it get expert id -1. Ties keep the lowest expert id.
     """
-    return _launch_router(gating_output, None, topk, renormalize, 1.0, 1, 1, num_token_non_padded)
+    return _launch_router(gating_output, None, topk, renormalize, 1.0, 1, 1, num_token_non_padded, selection_bias)
 
 
 def fused_topk_sigmoid(

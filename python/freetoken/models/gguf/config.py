@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import functools
 import importlib
+import os
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -27,6 +28,7 @@ GGUF_ARCH_TO_REGISTRY: dict[str, str] = {
     # glm5-next: the llama.cpp spelling; glm5next: unsloth's first release
     "glm5-next": "Glm5NextGGUFForCausalLM",
     "glm5next": "Glm5NextGGUFForCausalLM",
+    "laguna": "LagunaGGUFForCausalLM",
     "llama": "LlamaGGUFForCausalLM",
     "minimax-m2": "MiniMaxM2GGUFForCausalLM",
     "minimax-m3": "MiniMaxM3GGUFForCausalLM",
@@ -113,6 +115,11 @@ def mm_fields(model_path: str, mmproj: Mmproj) -> tuple[dict[str, Any], dict[str
 def build_gguf_shim(model_path: str) -> GgufConfigShim:
     arch = gguf_architecture(model_path)
     registry_key = GGUF_ARCH_TO_REGISTRY.get(arch)
+    laguna_gguf_enabled = os.environ.get("FREETOKEN_ENABLE_LAGUNA_GGUF", "0").strip().lower()
+    if arch == "laguna" and laguna_gguf_enabled not in ("1", "true", "yes", "on"):
+        raise ValueError(
+            "Laguna GGUF support is opt-in; set FREETOKEN_ENABLE_LAGUNA_GGUF=1 to enable it"
+        )
     if registry_key is None:
         raise ValueError(
             f"GGUF architecture {arch!r} is not supported "

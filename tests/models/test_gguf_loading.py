@@ -166,7 +166,10 @@ def _model(pattern: str) -> str:
     return found[0]
 
 
-_QWEN36 = "Qwen3.6-35B-A3B-MTP-GGUF/Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf"
+_QWEN36 = os.environ.get(
+    "FT_GGUF_QWEN36",
+    "Qwen3.6-35B-A3B-MTP-GGUF/Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf",
+)
 _FLASH_NEXT = [
     "Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF/IQ1_M/*-00001-of-*.gguf",
     "Qwen3.8-Flash-Next-IQ2_S-Q2SYM/*-00001-of-*.gguf",
@@ -263,6 +266,17 @@ def test_qwen36_nextn_block_loads_only_when_asked():
     own = {k for k in mtp if not k.startswith("mtp.layer.")}
     assert own == {"mtp.enorm.weight", "mtp.hnorm.weight", "mtp.shared_head_norm.weight", "mtp.eh_proj.weight"}
     assert mtp["mtp.eh_proj.weight"].dtype == torch.uint8  # packed Q8_0, K = 2 * hidden
+    # Full-attention q_proj includes both query and per-head gate rows; the output
+    # projection consumes only the query half after the model splits them.
+    expected_projection_shapes = {
+        f"blk.{n}.attn_q.weight": (cfg.hidden_size, 2 * cfg.num_qo_heads * cfg.head_dim),
+        f"blk.{n}.attn_k.weight": (cfg.hidden_size, cfg.num_kv_heads * cfg.head_dim),
+        f"blk.{n}.attn_v.weight": (cfg.hidden_size, cfg.num_kv_heads * cfg.head_dim),
+        f"blk.{n}.attn_output.weight": (cfg.num_qo_heads * cfg.head_dim, cfg.hidden_size),
+    }
+    for name, shape in expected_projection_shapes.items():
+        assert tuple(index[name].ne) == shape, name
+
     attn = next(i for i in range(cfg.num_layers) if not cfg.is_linear_layer(i))
     block = dict(_iter_layer(index, cfg, f"blk.{attn}", "x", linear=False))
     assert {k.replace("mtp.layer.", "x.") for k in mtp if k not in own} == set(block)

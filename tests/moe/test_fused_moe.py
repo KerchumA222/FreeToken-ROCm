@@ -59,6 +59,23 @@ def test_fused_topk_accepts_triton_kernel_tuple_output():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_fused_topk_reads_non_contiguous_selection_bias_by_stride():
+    from freetoken.moe.fused import fused_topk
+
+    logits = torch.zeros((1, 2), device="cuda")
+    hidden_states = torch.zeros((1, 4), device="cuda")
+    bias = torch.tensor([0.0, 100.0, 0.0, -100.0], device="cuda")[::2]
+    assert not bias.is_contiguous()
+
+    weights, ids = fused_topk(
+        hidden_states, logits, topk=1, renormalize=False, selection_bias=bias
+    )
+
+    assert ids.tolist() == [[0]]
+    torch.testing.assert_close(weights, torch.tensor([[0.5]], device="cuda"))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16, 24])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_fused_experts_decode_matches_reference_for_non_contiguous_slots(batch_size, dtype):
@@ -310,6 +327,23 @@ def test_fused_topk_softmax_matches_torch_reference(num_tokens, num_experts, top
     assert weights.dtype == torch.float32 and ids.dtype == torch.int32
     assert torch.equal(ids, ref_i)
     torch.testing.assert_close(weights, ref_w, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("renormalize", [True, False])
+def test_fused_topk_selection_bias_changes_ids_not_router_weights(renormalize):
+    from freetoken.kernel.triton.moe_router import fused_topk_softmax
+
+    logits = torch.tensor([[4.0, 3.0, 2.5, 1.0]], device="cuda")
+    bias = torch.tensor([0.0, 0.0, 1.0, 1.0], device="cuda")
+
+    weights, ids = fused_topk_softmax(logits, 2, renormalize, selection_bias=bias)
+
+    assert ids.tolist() == [[0, 2]]
+    expected = torch.softmax(logits.float(), dim=-1).gather(1, ids.long())
+    if renormalize:
+        expected = expected / expected.sum(dim=-1, keepdim=True)
+    torch.testing.assert_close(weights, expected)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

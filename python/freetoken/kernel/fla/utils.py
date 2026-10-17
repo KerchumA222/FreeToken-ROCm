@@ -267,6 +267,24 @@ device_torch_lib = getattr(torch, device)
 device_platform = _check_platform()
 
 is_amd = device_platform == "amd"
+
+
+def _current_triton_arch() -> str:
+    try:
+        return str(triton.runtime.driver.active.get_current_target().arch)
+    except BaseException:
+        return ""
+
+
+def _use_rdna2_gdn_tiles() -> bool:
+    return (
+        is_amd
+        and os.getenv("FT_RDNA2_GDN_TILES", "0") == "1"
+        and _current_triton_arch().startswith("gfx103")
+    )
+
+
+is_rdna2_gdn = _use_rdna2_gdn_tiles()
 is_intel = device_platform == "intel"
 is_nvidia = device_platform == "nvidia"
 is_intel_alchemist = is_intel and "Intel(R) Arc(TM) A" in torch.xpu.get_device_name(0)

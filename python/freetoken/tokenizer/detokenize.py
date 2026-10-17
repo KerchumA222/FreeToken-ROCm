@@ -91,6 +91,9 @@ class DetokenizeManager:
         self.decode_map.pop(uid, None)
 
     def detokenize(self, msgs: List[DetokenizeMsg]) -> List[str]:
+        if len({msg.uid for msg in msgs}) != len(msgs):
+            return [output for msg in msgs for output in self.detokenize([msg])]
+
         read_ids: List[List[int]] = []
         surr_ids: List[List[int]] = []
         for msg in msgs:

@@ -12,6 +12,7 @@ from typing import Any, Dict, Iterable, NamedTuple, Tuple
 import torch
 from freetoken.attention import AttnType, attention_backend_info, create_attention_backend
 from freetoken.core import Batch, Context, Req, set_global_ctx
+from freetoken.env import ENV
 from freetoken.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
 from freetoken.gpu_select import gpu_identity
 from freetoken.checkpoint.ftw import ftw_tensor_names, is_ftw_checkpoint
@@ -36,18 +37,31 @@ from freetoken.kvcache import create_kv_pool, resolve_pool_class
 from freetoken.kvcache.base import CacheRebuildRejected
 from freetoken.kvcache.cache_status import _supports_swa_ratio
 from freetoken.kvcache.linear_state_pool import (
-    _linear_pool_min_slots, _linear_pool_num_slots, state_pool_bytes,
+    _linear_pool_min_slots, _linear_pool_num_slots, _linear_pool_spec_slots, state_pool_bytes,
 )
 
 logger = init_logger(__name__)
 
-def _clamp_decode_batch_to_pools(config: EngineConfig, pool_sizes: list[int]) -> None:
+def _decode_rows_per_req(config: EngineConfig) -> int:
+    """Tokens one running request puts through a decode step: 1, or 1 + the drafts of an MTP verify."""
+    if config.speculative_algorithm is None:
+        return 1
+    return 1 + int(config.speculative_num_draft_tokens)
+
+
+def _cpu_moe_executor_max_tokens(config: EngineConfig) -> int:
+    """Rows needed for the largest decode or speculative verify batch."""
+    decode_rows = config.max_running_req * _decode_rows_per_req(config)
+    return max(decode_rows, config.cuda_graph_max_bs or 0, *(config.cuda_graph_bs or []), 1)
+
+
+def _clamp_decode_batch_to_pools(config: EngineConfig, pool_sizes: list[int], rows_per_req: int = 1) -> None:
     """Clamp the decode batch so every GPU-decoded layer's routed experts fit in its pool."""
     num_experts = config.model_config.num_experts
     small = [s for s in pool_sizes if s < num_experts]
     if not small:
         return
-    limit = min(small) // config.model_config.num_experts_per_tok
+    limit = min(small) // (config.model_config.num_experts_per_tok * rows_per_req)
     if config.max_running_req > limit:
         logger.warning_rank0(
             f"the smallest MoE slot pool has {min(small)} slots; lowering max_running_req "
@@ -109,6 +123,32 @@ def _page_table_width(max_seq_len: int, page_size: int) -> int:
     alone does not cover once page_size > 32 (an unaligned --max-seq-len-override on DSV4's P=128
     or trtllm's forced 64 would index past the row)."""
     return align_ceil(align_ceil(max_seq_len, page_size), 32)
+
+
+def _validate_per_layer_attention_tp(model_config, tp_size: int) -> None:
+    """Reject unsupported per-layer head geometry before model weights are loaded."""
+    q_heads_per_layer = getattr(model_config, "num_qo_heads_per_layer", ())
+    if not q_heads_per_layer:
+        return
+
+    for layer_id, q_heads in enumerate(q_heads_per_layer):
+        if q_heads % tp_size:
+            raise ValueError(
+                f"tensor parallel size {tp_size} must divide Laguna query-head count "
+                f"{q_heads} for layer {layer_id}"
+            )
+
+    kv_heads = model_config.num_kv_heads
+    if tp_size > kv_heads:
+        if tp_size % kv_heads:
+            raise ValueError(
+                f"Laguna KV heads ({kv_heads}) can be replicated only when tensor "
+                f"parallel size ({tp_size}) is divisible by the KV-head count"
+            )
+    elif kv_heads % tp_size:
+        raise ValueError(
+            f"tensor parallel size {tp_size} must divide Laguna KV-head count {kv_heads}"
+        )
 
 
 def _required_attn_types(model_config) -> frozenset[AttnType]:
@@ -401,6 +441,9 @@ class ForwardOutput(NamedTuple):
     next_tokens_gpu: torch.Tensor
     next_tokens_cpu: torch.Tensor
     copy_done_event: torch.cuda.Event
+    # MTP: the draft head's token at each draft row of MtpPlan, and a verify's chained drafts [B, k-1]
+    draft_tokens_cpu: torch.Tensor | None = None
+    chain_tokens_cpu: torch.Tensor | None = None
 
 
 class Engine:
@@ -437,6 +480,12 @@ class Engine:
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
         self._load_weights(config)
+        self.mtp = None
+        if config.speculative_algorithm is not None:
+            from freetoken.speculative.mtp import MtpDrafter
+
+            with _weight_load_context():
+                self.mtp = MtpDrafter(config, self.model, device=self.device, page_table_ref=lambda: self.page_table)
         if config.active_encoders:
             from freetoken.models.blocks import SupportsMultimodal
 
@@ -517,6 +566,7 @@ class Engine:
                 device=self.device,
                 tp_size=config.tp_info.size,
                 slot_states=config.model_config.slot_states,
+                spec_slots=_linear_pool_spec_slots(config),
             )
             self.ctx.linear_state_pool = self.linear_state_pool
         else:
@@ -721,6 +771,9 @@ class Engine:
 
         method = shared_offload_method(self.model)
         num_moe_layers = config.model_config.num_moe_layers
+        # an MTP draft head's routed experts ride the same cache as one more layer after the decoder's
+        head_layers = list(iter_offload_moe_layers(self.mtp.head)) if self.mtp is not None else []
+        cache_layers = num_moe_layers + len(head_layers)
         # experts of several formats: one method per MoE layer, one slot pool per format
         layer_methods = offload_layer_methods(self.model)
         if not is_mixed(layer_methods):
@@ -763,13 +816,16 @@ class Engine:
                 requested_residency = [
                     HostResidency.LOCKED.value if i in cpu_layer_ids
                     else HostResidency.PINNED.value
-                    for i in range(config.model_config.num_moe_layers)
+                    for i in range(cache_layers)
                 ]
         # read before the expert load, so a bad profile fails in seconds
         expert_counts = resolve_profile(
             config.moe_cache_split, config.model_path,
             config.model_config.num_moe_layers, config.model_config.num_experts,
         )
+        if expert_counts is not None and head_layers:
+            # the draft head routes like the last decoder layer (no profile has a row for it)
+            expert_counts = torch.cat([expert_counts, expert_counts[-1:].expand(len(head_layers), -1)])
         try:
             with _weight_load_context():
                 banks = load_expert_banks(
@@ -789,6 +845,8 @@ class Engine:
         if probe:
             cpu_layer_ids = probed
             decode_target, split_residency = self._residency_split(config, cpu_layer_ids, method, capped=True)
+        if head_layers:
+            banks = self._append_mtp_banks(config, banks, head_layers)
         from freetoken.engine.cache_budget import expert_bytes_per_slot, layer_slot_bytes
 
         self._moe_layer_slot_bytes = layer_slot_bytes(banks.sources)
@@ -853,7 +911,7 @@ class Engine:
                 f"slots ({config.moe_cache_split})"
             )
             if decode_target == "gpu":
-                _clamp_decode_batch_to_pools(config, pool_sizes)
+                _clamp_decode_batch_to_pools(config, pool_sizes, _decode_rows_per_req(config))
         layout = layer_layouts = max_slots = None
         if layer_methods is not None:
             _check_layer_formats(banks, layer_methods)
@@ -876,7 +934,7 @@ class Engine:
         cache = OffloadMoeCache(
             # Models with leading dense layers (GLM-4) only have experts on the MoE
             # layers; num_moe_layers == num_layers when first_k_dense_replace == 0.
-            num_layers=config.model_config.num_moe_layers,
+            num_layers=cache_layers,
             num_experts=config.model_config.num_experts,
             cache_size=config.moe_cache_size,
             device=self.device,
@@ -889,7 +947,7 @@ class Engine:
             layout=layout,
             layer_layouts=layer_layouts,
             max_slots=max_slots,
-            pool_of_layer=pool_of_layer(pools, config.model_config.num_moe_layers),
+            pool_of_layer=pool_of_layer(pools, cache_layers),
             pool_sizes=pool_sizes,
         )
         # before set_bank_sources: the residency validation and the copy plan's skip of non-pinned layers key on the CPU-layer set
@@ -905,6 +963,8 @@ class Engine:
         cache.collect_stats = config.moe_collect_stats
         layers = attach_offload_moe_cache(self.model, cache)
         assert len(layers) == config.model_config.num_moe_layers
+        if head_layers:
+            attach_offload_moe_cache(self.mtp.head, cache)
         if cache.decode_target in ("cpu", "hybrid"):
             self._init_cpu_moe_executor(config, cache, layers)
         if decode_target == "hybrid":
@@ -923,8 +983,41 @@ class Engine:
         if host_bytes is None:
             host_bytes = _mem_available_bytes() // 4
             logger.info_rank0(f"--moe-disk-tier: host expert cache of {host_bytes / 2**30:.1f} GiB (a quarter of the available RAM; --moe-host-cache-mem sets it)")
-        min_slots = min(mc.num_experts, mc.num_experts_per_tok * config.max_running_req)
-        cache.attach_disk_tier(GgufExpertStore(config.model_path, mc.num_moe_layers), host_bytes, min_slots)
+        # a verify step routes every draft row too
+        min_slots = min(mc.num_experts, mc.num_experts_per_tok * config.max_running_req * _decode_rows_per_req(config))
+        store = GgufExpertStore(
+            config.model_path,
+            mc.num_moe_layers,
+            first_layer=mc.first_k_dense_replace,
+        )
+        if cache.num_layers > mc.num_moe_layers:
+            src = self.mtp.source
+            store.append_layers(GgufExpertStore(src.path, cache.num_layers - mc.num_moe_layers, first_layer=src.block))
+        cache.attach_disk_tier(store, host_bytes, min_slots)
+
+    def _append_mtp_banks(self, config: EngineConfig, banks, head_layers):
+        """The target's expert banks with the draft head's appended as the last layer(s)."""
+        from freetoken.models.gguf.experts import load_gguf_expert_banks
+
+        mc = config.model_config
+        for i, layer in enumerate(head_layers):
+            if layer.layer_id != mc.num_moe_layers + i:
+                raise NotImplementedError(f"MTP head MoE layer {layer.layer_id} is not cache layer {mc.num_moe_layers + i}")
+        if banks.kind is not QuantKind.GGUF:
+            raise NotImplementedError("an MTP draft head's routed experts load from GGUF checkpoints only")
+        src = self.mtp.source
+        with _weight_load_context():
+            head = load_gguf_expert_banks(src.path, len(head_layers), first_layer=src.block, dummy=config.use_dummy_weight, on_disk=banks.on_disk)
+        for role, layers in head.sources.items():
+            banks.sources[role].extend(layers)
+        if banks.layer_tags is not None:
+            banks.layer_tags.extend(head.layer_tags)
+        if banks.row_tail_bytes is not None:
+            for role, tails in head.row_tail_bytes.items():
+                banks.row_tail_bytes[role].extend(tails)
+        if banks.layer_residency is not None:
+            banks.layer_residency.extend(head.layer_residency or ["pinned"] * len(head_layers))
+        return banks
 
     def _residency_split(self, config: EngineConfig, cpu_layer_ids, method, *, capped: bool):
         """(decode_target, split_residency) for a CPU-layer set; turns prefill overlap off when some layers stay unpinned."""
@@ -1051,9 +1144,9 @@ class Engine:
                 "CPU MoE backend is not yet supported for this model architecture "
                 f"(MoE layer {type(sample).__name__} is missing {required})."
             )
-        # Decode batches never exceed max_running_req, but CUDA-graph padding can
-        # round a batch up to the largest captured size; cover both.
-        max_tokens = max(config.max_running_req, config.cuda_graph_max_bs or 0, *(config.cuda_graph_bs or []), 1)
+        # MTP verifies k + 1 rows per running request; CUDA-graph padding can
+        # also round a batch up to the largest captured size.
+        max_tokens = _cpu_moe_executor_max_tokens(config)
         by_id = sorted(layers, key=lambda layer: layer.layer_id)
         layer_formats = [layer.quant_method.cpu_spec() for layer in by_id]
         executor = CpuMoeExecutor(
@@ -1284,27 +1377,90 @@ class Engine:
             mrope=config.model_config.model_is_mrope,
         )
 
-    def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
+    def forward_batch(self, batch: Batch, args: BatchSamplingArgs, chain_tokens: torch.Tensor | None = None) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
         if batch.mm_gather_plan:
             self._run_mm_encoder(batch)
         use_graph = self.graph_runner.can_use_cuda_graph(batch)
-        with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, use_graph):
-            logits = self.graph_runner.replay(batch) if use_graph else self.model.forward()
+        next_tokens_gpu = draft_tokens_gpu = None
+        if batch.spec is not None and ENV.SPEC_SEQUENTIAL_VERIFY:
+            logits = self._verify_sequential(batch)
+            with self.ctx.forward_batch(batch):
+                next_tokens_gpu = self.sampler.sample(logits[: batch.size], args).to(torch.int32)
+                draft_tokens_gpu = self.mtp.head_pass(batch, next_tokens_gpu)
+        else:
+            with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, use_graph):
+                logits = self.graph_runner.replay(batch) if use_graph else self.model.forward()
+                if batch.capture_hidden:
+                    # the draft head runs in this batch context: it is a decoder block on these rows
+                    next_tokens_gpu = self.sampler.sample(logits[: batch.size], args).to(torch.int32)
+                    draft_tokens_gpu = self.mtp.head_pass(batch, next_tokens_gpu)
         if self.cpu_moe_executor is not None:
             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
             # -> stale expert outputs) as a loud error instead of silent corruption.
             self.cpu_moe_executor.raise_if_unhealthy()
 
-        for req in batch.reqs:
-            req.complete_one()
+        if batch.spec is None:
+            # a verify advances each request by the tokens it accepts, settled by the scheduler
+            for req in batch.reqs:
+                req.complete_one()
 
-        batch_logits = logits[: batch.size]
-        next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
+        if next_tokens_gpu is None:
+            batch_logits = logits[: batch.size]
+            next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
+        draft_tokens_cpu = draft_tokens_gpu.to("cpu", non_blocking=True) if draft_tokens_gpu is not None else None
+        chain_tokens_cpu = chain_tokens.to("cpu", non_blocking=True) if chain_tokens is not None else None
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
-        return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+        return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event, draft_tokens_cpu, chain_tokens_cpu)
+
+    def _verify_sequential(self, batch: Batch) -> torch.Tensor:
+        """A verify run as ``k + 1`` forwards of one row per request (FREETOKEN_SPEC_SEQUENTIAL_VERIFY).
+
+        Each step is shaped exactly like a plain decode step, so its logits match plain decoding bit
+        for bit; that makes greedy output with MTP on and off comparable token for token, which the
+        batched verify (different matmul shapes) does not promise. Returns the step-major logits and
+        leaves every row's LM-head input in ``batch.hidden_states``."""
+        from dataclasses import replace
+
+        from freetoken.attention.linear import FLAMetadata
+
+        spec = batch.spec
+        B = spec.num_reqs
+        logits, hidden = [], []
+        for s in range(spec.k + 1):
+            rows = slice(s * B, (s + 1) * B)
+            step = Batch(reqs=batch.reqs[rows], phase="decode")
+            step.padded_reqs = step.reqs
+            step.input_ids = batch.input_ids[rows]
+            step.positions = batch.positions[rows]
+            if batch.mrope_positions is not None:
+                step.mrope_positions = batch.mrope_positions[:, rows]
+            step.out_loc = batch.out_loc[rows]
+            if batch.linear_table_idx is not None:
+                step.linear_table_idx = batch.linear_table_idx[rows]
+            if batch.fla_metadata is not None:
+                step.fla_metadata = FLAMetadata(
+                    cu_seqlens=batch.fla_metadata.cu_seqlens[: B + 1],
+                    cache_indices=batch.fla_metadata.cache_indices[rows],
+                )
+            if batch.active_table_idx is not None:
+                step.active_table_idx = batch.active_table_idx[rows]
+            step.spec = replace(spec, step=s)
+            step.capture_hidden = True
+            self.attn_backend.prepare_metadata(step)
+            with self.ctx.forward_batch(step), self.model.forward_host_ctx(step, False):
+                logits.append(self.model.forward())
+            hidden.append(step.hidden_states)
+        batch.hidden_states = torch.cat(hidden, dim=0)
+        return torch.cat(logits, dim=0)
+
+    def draft_chain(self, batch: Batch, token_pool: torch.Tensor) -> torch.Tensor | None:
+        """A verify's drafts 2..k, written into ``token_pool`` before its input ids are gathered."""
+        return self.mtp.draft_chain(
+            batch, token_pool, self.ctx, self.attn_backend, self.config.model_config.model_is_mrope
+        )
 
     @torch.inference_mode()
     def _warmup_prefill(self) -> None:
@@ -1819,6 +1975,19 @@ def offload_expert_method(config: EngineConfig):
     return offload_expert_methods(config)[0]
 
 
+def _adjust_speculative_config(config: EngineConfig, override) -> None:
+    """--speculative-algorithm mtp: every step runs eagerly (the draft head reads the forward's hidden states), one engine rank."""
+    if config.tp_info.size != 1:
+        raise ValueError("--speculative-algorithm mtp runs with tensor parallelism 1 only")
+    if config.model_config.is_moe and not is_offload_moe_strategy(config.moe_strategy):
+        raise ValueError(f"--speculative-algorithm mtp serves a MoE draft head's experts from the offload cache; use --moe-strategy offload (got {config.moe_strategy!r})")
+    if config.cuda_graph_max_bs != 0 or config.cuda_graph_bs:
+        logger.info_rank0("--speculative-algorithm mtp: decode runs without CUDA graphs (the draft head runs after every forward)")
+        override("cuda_graph_bs", [])
+        override("cuda_graph_max_bs", 0)
+    logger.info_rank0(f"--speculative-algorithm mtp: draft head at {config.mtp_source.path} block {config.mtp_source.block}")
+
+
 def _adjust_disk_tier_config(config: EngineConfig, override) -> None:
     """--moe-disk-tier: GPU offload decode of a GGUF's experts, eager decode (the miss count is read back per layer) and routed-only prefill staging."""
     from freetoken.models.gguf.reader import is_gguf_path
@@ -1844,6 +2013,7 @@ def _adjust_config(config: EngineConfig):
         object.__setattr__(config, attr, value)
 
     model_config = config.model_config
+    _validate_per_layer_attention_tp(model_config, config.tp_info.size)
     single_stream_only = getattr(model_config, "single_stream_only", False)
     is_dsv4 = getattr(model_config, "dsv4_args", None) is not None
     is_dsv41 = getattr(model_config, "dsv41_args", None) is not None
@@ -1946,6 +2116,56 @@ def _adjust_config(config: EngineConfig):
     if _dtype == torch.float16 and getattr(getattr(model_config, "quant", None), "weight_scales", False):
         # GGUF NVFP4 results are stored in the activation dtype before weight_scale_2 (~1e-4) multiplies them, which overflows fp16.
         raise ValueError("--dtype float16 with NVFP4 GGUF weight scales is unsupported (the unscaled results overflow float16); use bfloat16.")
+    kv_cache_dtype = getattr(config, "kv_cache_dtype", "model")
+    if kv_cache_dtype not in ("model", "q8_0", "turboquant_4bit_nc"):
+        raise ValueError(
+            f"unsupported --kv-cache-dtype {kv_cache_dtype!r}; choose 'model', 'q8_0', or 'turboquant_4bit_nc'"
+        )
+    if kv_cache_dtype == "q8_0":
+        if config.dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError("Q8_0 KV cache requires float16 or bfloat16 model compute")
+        if (
+            required_attn_types != frozenset({AttnType.FULL})
+            or getattr(model_config, "has_linear_attention", False)
+        ):
+            raise ValueError("Q8_0 KV cache currently supports ordinary FULL attention only")
+        from freetoken.kvcache.mha_pool import MHAKVCache
+
+        if resolve_pool_class(model_config) is not MHAKVCache:
+            raise ValueError("Q8_0 KV cache currently supports the MHA cache pool only")
+        bad_dims = sorted({
+            spec.head_dim for spec in model_config.kv_cache_group_specs()
+            if spec.num_layers and spec.head_dim % 32
+        })
+        if bad_dims:
+            raise ValueError(f"Q8_0 KV cache requires head_dim divisible by 32, got {bad_dims}")
+        if config.attention_backend == "auto":
+            override("attention_backend", "triton")
+        elif config.attention_backend != "triton":
+            raise ValueError("Q8_0 KV cache requires --attention-backend triton")
+    elif kv_cache_dtype == "turboquant_4bit_nc":
+        if config.dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError("TurboQuant KV cache requires float16 or bfloat16 model compute")
+        if (
+            required_attn_types != frozenset({AttnType.FULL})
+            or getattr(model_config, "has_linear_attention", False)
+        ):
+            raise ValueError("TurboQuant KV cache currently supports ordinary FULL attention only")
+        from freetoken.kvcache.mha_pool import MHAKVCache
+
+        if resolve_pool_class(model_config) is not MHAKVCache:
+            raise ValueError("TurboQuant KV cache currently supports the MHA cache pool only")
+        specs = [spec for spec in model_config.kv_cache_group_specs() if spec.num_layers]
+        if len(specs) != 1:
+            raise ValueError("TurboQuant currently requires one uniform FULL-attention KV group")
+        head_dim = specs[0].head_dim
+        if head_dim < 2 or head_dim & (head_dim - 1):
+            raise ValueError(f"TurboQuant requires an even power-of-two head_dim, got {head_dim}")
+        if config.attention_backend == "auto":
+            override("attention_backend", "triton")
+        elif config.attention_backend != "triton":
+            raise ValueError("TurboQuant KV cache requires --attention-backend triton")
+
     if config.attention_backend == "auto":
         override(
             "attention_backend",
@@ -2120,6 +2340,9 @@ def _adjust_config(config: EngineConfig):
 
     if is_moe and getattr(config, "moe_disk_tier", False):
         _adjust_disk_tier_config(config, override)
+
+    if config.speculative_algorithm is not None:
+        _adjust_speculative_config(config, override)
 
     if is_moe:
         object.__setattr__(model_config, "moe_strategy", config.moe_strategy)

@@ -378,7 +378,12 @@ def load_expert_banks(
             raise ValueError("--moe-disk-tier serves the routed experts of a GGUF checkpoint from its files; this checkpoint's experts are not GGUF")
         from freetoken.models.gguf.experts import load_gguf_expert_banks
 
-        return load_gguf_expert_banks(model_path, model_config.num_moe_layers, on_disk=True)
+        return load_gguf_expert_banks(
+            model_path,
+            model_config.num_moe_layers,
+            first_layer=model_config.first_k_dense_replace,
+            on_disk=True,
+        )
 
     mixed = is_mixed(layer_methods)
     if mixed and (resident or layer_residency is not None):
@@ -434,7 +439,13 @@ def load_expert_banks(
             from freetoken.models.gguf.experts import load_gguf_expert_banks
 
             # each layer keeps its own ggml types, so the banks come from the file, not from one method's layout
-            return load_gguf_expert_banks(model_path, model_config.num_moe_layers, first_layer=model_config.first_k_dense_replace, dummy=dummy, device=device if resident else None)
+            return load_gguf_expert_banks(
+                model_path,
+                model_config.num_moe_layers,
+                first_layer=model_config.first_k_dense_replace,
+                dummy=dummy,
+                device=device if resident else None,
+            )
         if method is None:
             raise ValueError("the experts of a raw checkpoint are packed by the offload layers' MoE quant method; pass method=")
         return _method_expert_banks(model_path, model_config, method, device, dummy, par, workers, chunk, layer_sink, resident)

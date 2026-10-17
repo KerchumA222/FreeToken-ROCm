@@ -35,12 +35,10 @@ if TYPE_CHECKING:
 
 
 def _with_full_attention(config: "ModelConfig", layer_id: int) -> "ModelConfig":
-    """``config`` with ``layer_id`` moved into the full-attention group.
+    """``config`` with ``layer_id`` moved into the full-attention group (the draft block's KV layer).
 
     The draft block sits one past the target's last layer, where the hybrid pattern
     would place a linear-attention layer; the checkpoints carry ``attn_q/k/v`` for it.
-    llama.cpp sidesteps this by building the MTP graph explicitly rather than from the
-    layer pattern -- this is the same statement, made to the config.
     """
     from dataclasses import replace
 
@@ -55,9 +53,7 @@ def _with_full_attention(config: "ModelConfig", layer_id: int) -> "ModelConfig":
             ids.discard(layer_id)
         groups.append(replace(group, layer_ids=tuple(sorted(ids))))
     out = replace(config, attention_groups=tuple(groups))
-    # replace() keeps only declared fields, and the GGUF readers stash the expert
-    # bank types with object.__setattr__ -- carry those across or the block builds
-    # its MoE against nothing.
+    # replace() keeps only declared fields; carry the rest across
     for key, value in config.__dict__.items():
         if key not in out.__dict__:
             object.__setattr__(out, key, value)
@@ -92,6 +88,11 @@ class Qwen3_5MTPHead(BaseOP):
         )
         self.shared_head_norm = GemmaRMSNorm(hidden, eps=config.rms_norm_eps)
 
+    def forward_chain(self, hidden: torch.Tensor, token_embed: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """The head output twice: a chained draft step takes the LM-head input as its next hidden state."""
+        out = self.forward(hidden, token_embed)
+        return out, out
+
     def forward(self, hidden: torch.Tensor, token_embed: torch.Tensor) -> torch.Tensor:
         """``hidden`` [T, H] from the target at t, ``token_embed`` [T, H] for t+1;
         returns [T, H] for the target's lm_head."""
@@ -113,28 +114,99 @@ MTP_DRAFT_LAYER_KV = "mtp.draft_layer"
 
 
 def mtp_draft_layer(model_path: str) -> int | None:
-    """The block index a draft-head GGUF carries, or ``None`` if it is not one."""
-    from freetoken.models.gguf.reader import gguf_architecture, load_gguf_metadata
+    """The block index a GGUF's draft head occupies (its ``nextn`` tensors), or ``None`` if it has none."""
+    from freetoken.models.gguf.reader import gguf_tensor_index
 
-    md = load_gguf_metadata(model_path)
-    arch = gguf_architecture(model_path)
-    value = md.get(f"{arch}.{MTP_DRAFT_LAYER_KV}")
-    if value is not None:
-        return int(value)
-    # A full checkpoint that happens to carry the head: nextn_predict_layers > 0 puts
-    # it at the end of the block range.
-    n_nextn = md.get(f"{arch}.nextn_predict_layers")
-    n_layer = md.get(f"{arch}.block_count")
-    if n_nextn and n_layer:
-        return int(n_layer) - int(n_nextn)
-    return None
+    from .gguf import nextn_block
+
+    return nextn_block(gguf_tensor_index(model_path))
 
 
-def iter_gguf_mtp_weights(model_path: str, prefix: str = "mtp"):
+def iter_gguf_mtp_weights(model_path: str, prefix: str = "mtp", config: "ModelConfig | None" = None):
     """Yield ``(name, tensor)`` for the draft head, in this module's naming (see ``gguf.iter_gguf_mtp_weights``)."""
     from .gguf import iter_gguf_mtp_weights as _iter
 
-    yield from _iter(model_path, prefix)
+    yield from _iter(model_path, prefix, config)
 
 
-__all__ = ["Qwen3_5MTPHead", "iter_gguf_mtp_weights", "mtp_draft_layer"]
+class Qwen3_5MTP:
+    """``--speculative-algorithm mtp`` for qwen35 / qwen35moe GGUFs: the nextn block of the checkpoint
+    itself, or of a draft-head-only GGUF (``mtp-*.gguf``, ``<arch>.mtp.draft_only``) beside it."""
+
+    def locate(self, model_path: str, draft_path: str | None):
+        from freetoken.models.gguf.reader import gguf_architecture, gguf_config_source
+        from freetoken.speculative.mtp import MtpSource
+
+        model_source = gguf_config_source(model_path) or model_path
+        path = (
+            (gguf_config_source(draft_path) or draft_path)
+            if draft_path
+            else model_source
+        )
+        if draft_path is not None:
+            model_arch = gguf_architecture(model_source)
+            draft_arch = gguf_architecture(path)
+            if draft_arch != model_arch:
+                raise ValueError(
+                    f"draft head {draft_path} is {draft_arch!r}, the checkpoint {model_arch!r}"
+                )
+        block = mtp_draft_layer(path)
+        if block is None:
+            hint = "" if draft_path else "; pass the draft head's GGUF with --speculative-draft-model-path"
+            raise ValueError(f"{path} carries no nextn (MTP) block{hint}")
+        return MtpSource(path=path, block=block)
+
+    def build_head(self, config: "ModelConfig", layer_id: int):
+        return Qwen3_5MTPHead(config, layer_id)
+
+    def iter_weights(self, source, config: "ModelConfig"):
+        for name, tensor in iter_gguf_mtp_weights(source.path, "mtp", config):
+            yield name.removeprefix("mtp."), tensor
+
+    def embed_tokens(self, model):
+        return model.model.embed_tokens
+
+    def lm_head(self, model):
+        return model.lm_head
+
+    def build_token_modules(self, model, config: "ModelConfig", source, *, dtype):
+        from freetoken.layers import ParallelLMHead, VocabParallelEmbedding
+        from freetoken.models.gguf.reader import gguf_tensor_index
+        from freetoken.utils import torch_dtype
+
+        index = gguf_tensor_index(source.path)
+        prefix = f"blk.{source.block}.nextn."
+        build_embed = f"{prefix}embed_tokens.weight" in index
+        build_head = f"{prefix}shared_head_head.weight" in index
+        embed, lm_head = self.embed_tokens(model), self.lm_head(model)
+        if not (build_embed or build_head):
+            return embed, lm_head
+
+        with torch.device("meta"), torch_dtype(dtype):
+            if build_embed:
+                embed = VocabParallelEmbedding(
+                    config.vocab_size,
+                    config.hidden_size,
+                    quant_config=config.quant,
+                    prefix="mtp.embed_tokens",
+                )
+            if build_head:
+                lm_head = ParallelLMHead(
+                    config.vocab_size,
+                    config.hidden_size,
+                    tie_word_embeddings=False,
+                    quant_config=config.quant,
+                    prefix="mtp.shared_head_head",
+                )
+        return embed, lm_head
+
+    def iter_token_weights(self, source, config: "ModelConfig"):
+        from .gguf import iter_gguf_mtp_token_weights
+
+        yield from iter_gguf_mtp_token_weights(source.path, "mtp", config)
+
+
+QWEN3_5_MTP = Qwen3_5MTP()
+
+
+__all__ = ["QWEN3_5_MTP", "Qwen3_5MTPHead", "iter_gguf_mtp_weights", "mtp_draft_layer"]

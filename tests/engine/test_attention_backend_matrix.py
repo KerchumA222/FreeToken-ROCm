@@ -129,6 +129,75 @@ def test_auto_resolves_per_type(monkeypatch, kind, expected):
     assert config.attention_backend == expected
 
 
+def test_q8_0_requires_triton_and_defaults_to_it(monkeypatch):
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_env(monkeypatch)
+    config = _config("full", kv_cache_dtype="q8_0", attention_backend="auto")
+    _adjust_config(config)
+    assert config.attention_backend == "triton"
+
+    config = _config("full", kv_cache_dtype="q8_0", attention_backend="fa")
+    with pytest.raises(ValueError, match="requires --attention-backend triton"):
+        _adjust_config(config)
+
+
+def test_q8_0_rejects_non_full_attention(monkeypatch):
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_env(monkeypatch)
+    config = _config("swa", kv_cache_dtype="q8_0", attention_backend="auto")
+    with pytest.raises(ValueError, match="ordinary FULL attention only"):
+        _adjust_config(config)
+
+
+def test_q8_0_rejects_hybrid_linear_attention_before_model_loading(monkeypatch):
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_env(monkeypatch)
+    config = _config("linear_hybrid", kv_cache_dtype="q8_0", attention_backend="auto")
+    with pytest.raises(ValueError, match="ordinary FULL attention only"):
+        _adjust_config(config)
+
+
+def test_turboquant_requires_triton_and_supported_full_attention(monkeypatch):
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_env(monkeypatch)
+    config = _config(
+        "full", kv_cache_dtype="turboquant_4bit_nc", attention_backend="auto"
+    )
+    _adjust_config(config)
+    assert config.attention_backend == "triton"
+
+    config = _config(
+        "full", kv_cache_dtype="turboquant_4bit_nc", attention_backend="fa"
+    )
+    with pytest.raises(ValueError, match="requires --attention-backend triton"):
+        _adjust_config(config)
+
+    config = _config(
+        "linear_hybrid", kv_cache_dtype="turboquant_4bit_nc", attention_backend="auto"
+    )
+    with pytest.raises(ValueError, match="ordinary FULL attention only"):
+        _adjust_config(config)
+
+
+def test_turboquant_rejects_non_power_of_two_head_dim(monkeypatch):
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_env(monkeypatch)
+    config = _config(
+        "full", kv_cache_dtype="turboquant_4bit_nc", attention_backend="auto"
+    )
+    from dataclasses import replace
+
+    spec = config.model_config.kv_cache_group_specs()[0]
+    config.model_config.kv_cache_group_specs = lambda: (replace(spec, head_dim=48),)
+    with pytest.raises(ValueError, match="power-of-two"):
+        _adjust_config(config)
+
+
 def test_auto_bsa_sets_block_page_size(monkeypatch):
     # m3_sparse declares page_sizes=(128,): one KV page == one sparse block, and
     # config-time resolution must coerce the page size to match.

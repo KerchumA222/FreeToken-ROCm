@@ -147,6 +147,15 @@ class GgufExpertStore:
         self.banks = tuple(self.parts)
         self._reader = _Reader(io_mode)
 
+    def append_layers(self, other: "GgufExpertStore") -> None:
+        """Serve ``other``'s layers after this store's (an MTP draft head's experts, possibly from another file)."""
+        if set(other.banks) != set(self.banks):
+            raise ValueError(f"expert banks {other.banks} of {other.model_path} do not match {self.banks}")
+        for bank in self.banks:
+            self.parts[bank].extend(other.parts[bank])
+        self.num_layers += other.num_layers
+        other.close()
+
     @property
     def io_mode(self) -> str:
         return self._reader.mode

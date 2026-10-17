@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
+from freetoken.env import ENV
 from freetoken.layers import (
     BaseOP,
     LinearColParallelMerged,
@@ -20,11 +21,12 @@ _SMALL_ROUTER_ROWS = 4
 
 
 def _router_linear(gate: LinearReplicated, x: torch.Tensor) -> torch.Tensor:
-    """The router GEMVs ([E, H] and [1, H]) at decode batch sizes. rocBLAS picks large
-    Tensile GEMM tiles for these on RDNA (118 us for the [256, 2048] router on an
-    RX 6800, 40 layers a token); a broadcast multiply-and-sum reads the same bytes in
-    15 us with the same fp32-accumulated result."""
-    if torch.version.hip is not None and x.shape[0] <= _SMALL_ROUTER_ROWS:
+    """Optional broadcast-reduction path for small Qwen3.5 router GEMVs on HIP."""
+    if (
+        ENV.QWEN35_ROUTER_GEMV
+        and torch.version.hip is not None
+        and x.shape[0] <= _SMALL_ROUTER_ROWS
+    ):
         return (x.unsqueeze(1) * gate.weight).sum(-1)
     return gate.forward(x)
 

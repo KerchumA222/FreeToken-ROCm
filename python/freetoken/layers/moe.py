@@ -104,6 +104,37 @@ class MoELayer(BaseOP):
             layer=self, is_prefill=get_global_ctx().batch.is_prefill,
         )
 
+    def _route_topk(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        from freetoken.moe.route_bias import selection_bias
+
+        bias = selection_bias(self, router_logits.shape[0], router_logits.device)
+        from freetoken.moe import expert_remap
+
+        if expert_remap.enabled() and self.layer_id is not None:
+            remapped = expert_remap.route(
+                self.layer_id,
+                router_logits,
+                self.top_k,
+                self.renormalize,
+                selection_bias=bias,
+            )
+            if remapped is not None:
+                return remapped
+
+        kwargs = {
+            "hidden_states": hidden_states,
+            "gating_output": router_logits,
+            "topk": self.top_k,
+            "renormalize": self.renormalize,
+        }
+        if bias is not None:
+            kwargs["selection_bias"] = bias
+        return fused_topk(**kwargs)
+
     def routed_forward(
         self,
         hidden_states: torch.Tensor,
@@ -131,12 +162,7 @@ class MoELayer(BaseOP):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor | None = None,
     ):
-        topk_weights, topk_ids = fused_topk(
-            hidden_states=hidden_states,
-            gating_output=router_logits,
-            topk=self.top_k,
-            renormalize=self.renormalize,
-        )
+        topk_weights, topk_ids = self._route_topk(hidden_states, router_logits)
         return self._maybe_all_reduce(self._resident_gemm(hidden_states, topk_weights, topk_ids))
 
 
@@ -228,12 +254,7 @@ class OffloadMoELayer(MoELayer):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor | None = None,
     ):
-        topk_weights, topk_ids = fused_topk(
-            hidden_states=hidden_states,
-            gating_output=router_logits,
-            topk=self.top_k,
-            renormalize=self.renormalize,
-        )
+        topk_weights, topk_ids = self._route_topk(hidden_states, router_logits)
         return self._decode_routed(hidden_states, topk_weights, topk_ids)
 
     def prefill_forward(
@@ -241,12 +262,7 @@ class OffloadMoELayer(MoELayer):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor | None = None,
     ):
-        topk_weights, topk_ids = fused_topk(
-            hidden_states=hidden_states,
-            gating_output=router_logits,
-            topk=self.top_k,
-            renormalize=self.renormalize,
-        )
+        topk_weights, topk_ids = self._route_topk(hidden_states, router_logits)
         return self._prefill_routed(hidden_states, topk_weights, topk_ids)
 
     # ------------------------------------------------------------------
