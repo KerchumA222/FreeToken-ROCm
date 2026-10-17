@@ -105,7 +105,10 @@ def test_gemma4_router_uses_sgl_kernel_topk_softmax_semantics():
     )
     torch.manual_seed(3)
     router = Gemma4Router(cfg)
-    logits = torch.randn((5, cfg.num_experts), device="cuda", dtype=torch.bfloat16)
+    # Distinct per row (k/32 - 2 is exact in bf16): randn in bf16 ties often at 128
+    # experts, and the kernel and torch.topk may order a tie differently.
+    logits = torch.stack([torch.randperm(cfg.num_experts) for _ in range(5)]).to(
+        device="cuda", dtype=torch.bfloat16) / 32 - 2
     per_expert_scale = (
         torch.rand((cfg.num_experts,), device="cuda", dtype=torch.bfloat16) + 0.5
     )

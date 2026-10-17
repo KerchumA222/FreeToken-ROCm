@@ -278,7 +278,10 @@ def test_block_topk_matches_torch_topk(n_blocks: int, width: int, bs: int, mode:
     logits, visible = _topk_case(n_blocks, bs, mode, seed=31 * n_blocks + 7 * width + bs)
     blocks = torch.empty(bs, width, dtype=torch.int32, device=logits.device)
     qsa_block_topk(logits, visible, blocks)
-    expected = _torch_topk_blocks(logits, visible, width)
+    # torch.topk does not define which members of a tie it keeps (on ROCm, at 4096 columns,
+    # not the lowest columns), so on ties compare against the kernel's documented policy.
+    reference = _policy_topk_blocks if mode == "ties" else _torch_topk_blocks
+    expected = reference(logits, visible, width)
 
     # Selection is a set: torch.topk orders by descending score, the kernel by column id.
     torch.testing.assert_close(blocks.sort(-1).values, expected.sort(-1).values)
