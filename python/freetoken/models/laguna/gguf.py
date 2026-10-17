@@ -143,6 +143,9 @@ def _validate_tensor_geometry(shim: "GgufConfigShim", config: ModelConfig) -> No
                 check(f"{blk}.ffn_{proj}", shape)
 
 
+_GATING_FUNCS = {1: "softmax", 2: "sigmoid", 3: "softmax_weight"}
+
+
 def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
     md = shim.metadata
     num_layers = int(_required(md, "block_count"))
@@ -168,7 +171,8 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
     shared_intermediate = int(_required(md, "expert_shared_feed_forward_length"))
     norm_topk = bool(_required(md, "expert_weights_norm"))
     routed_scale = float(_required(md, "expert_weights_scale"))
-    gating_func = str(_required(md, "expert_gating_func")).lower()
+    # llama.cpp writes its LLAMA_EXPERT_GATING_FUNC_TYPE enum: 1 softmax, 2 sigmoid, 3 softmax over the weights
+    gating_func = _GATING_FUNCS.get(int(_required(md, "expert_gating_func")), "unknown")
     if (hidden, head_dim, kv_heads, sliding_window) != (3072, 128, 8, 512):
         raise NotImplementedError("Laguna GGUF geometry does not match the verified Laguna-S-2.1 attention profile")
     if (full_rotary_dim, swa_rotary_dim, full_base, swa_base) != (64, 128, 500000.0, 10000.0):
@@ -195,7 +199,8 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         "attention_factor": None if yarn_attn_factor == 1.0 else yarn_attn_factor,
         "truncate": bool(md.get(f"{_ARCH}.rope.scaling.yarn_truncate", True)),
     }
-    if yarn["factor"] != 128.0 or yarn["original_max_position_embeddings"] != 8192:
+    # the released S-2.1 GGUF: factor 32 over 8192 positions, which is exactly its 262144 context_length
+    if yarn["original_max_position_embeddings"] != 8192 or yarn["factor"] * 8192 != context:
         raise NotImplementedError("Laguna GGUF YaRN scale does not match the verified Laguna-S-2.1 profile")
     attention_factor = yarn["attention_factor"]
     if (yarn["beta_fast"], yarn["beta_slow"]) != (32.0, 1.0) or (

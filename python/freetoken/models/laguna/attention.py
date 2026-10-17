@@ -81,7 +81,8 @@ class LagunaAttention(BaseOP):
         k = k.reshape(-1, self.kv_attn_dim)
         q, k = self.rotary.forward(ctx.batch.get_attn_positions(), q, k)
         q = q.view(-1, self.num_qo_heads, self.head_dim)
-        v = v.contiguous()
+        # the KV store takes k and v at one shared row stride; both are still slices of qkv here
+        k, v = k.contiguous(), v.contiguous()
         attended = ctx.attn_backend.forward(
             q, k, v, self.layer_id, ctx.batch, attn_spec=self.attn_spec
         )

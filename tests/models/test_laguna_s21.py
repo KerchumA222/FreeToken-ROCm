@@ -190,7 +190,7 @@ def _laguna_gguf_metadata():
         "laguna.block_count": 48,
         "laguna.embedding_length": 3072,
         "laguna.feed_forward_length": 12288,
-        "laguna.context_length": 1048576,
+        "laguna.context_length": 262144,
         "laguna.attention.head_count": [48, 72, 72, 72] * 12,
         "laguna.attention.head_count_kv": 8,
         "laguna.attention.key_length": 128,
@@ -201,7 +201,7 @@ def _laguna_gguf_metadata():
         "laguna.rope.freq_base": 500000.0,
         "laguna.rope.freq_base_swa": 10000.0,
         "laguna.rope.scaling.type": "yarn",
-        "laguna.rope.scaling.factor": 128.0,
+        "laguna.rope.scaling.factor": 32.0,
         "laguna.rope.scaling.original_context_length": 8192,
         "laguna.rope.scaling.yarn_beta_fast": 32.0,
         "laguna.rope.scaling.yarn_beta_slow": 1.0,
@@ -213,7 +213,7 @@ def _laguna_gguf_metadata():
         "laguna.expert_shared_feed_forward_length": 1024,
         "laguna.expert_weights_norm": True,
         "laguna.expert_weights_scale": 2.5,
-        "laguna.expert_gating_func": "sigmoid",
+        "laguna.expert_gating_func": 2,  # llama.cpp enum: sigmoid
     }
 
 
@@ -241,8 +241,8 @@ def test_laguna_gguf_config_uses_verified_topology_and_file_yarn_metadata(monkey
     from freetoken.layers.rotary import _rope_frequencies
 
     _, attention_factor = _rope_frequencies(128, 64, 500000.0, scaling)
-    assert attention_factor == pytest.approx(1.0 + 0.1 * math.log(128.0))
-    assert config.attention_groups[0].rotary_config.table_positions == 1048576
+    assert attention_factor == pytest.approx(1.0 + 0.1 * math.log(32.0))
+    assert config.attention_groups[0].rotary_config.table_positions == 262144
     assert config.routed_scaling_factor == 2.5 and config.num_experts_per_tok == 10
 
 
