@@ -131,7 +131,8 @@ def test_offload_router_matches_resident_remap_before_cache_slot_rewrite(
     resident_weights, resident_ids = MoELayer._route_topk(resident, hidden, logits)
     offload_weights, offload_ids = OffloadMoELayer._route_topk(offload, hidden, logits)
 
-    assert resident_ids.tolist() == [[0, 1]]
+    # destination masses: 0 <- e^3+e^2, 1 <- e^0, 2 <- e^1+e^-1
+    assert resident_ids.tolist() == [[0, 2]]
     assert torch.equal(offload_ids, resident_ids)
     torch.testing.assert_close(offload_weights, resident_weights)
     resident_ids_before = resident_ids.clone()
@@ -139,8 +140,8 @@ def test_offload_router_matches_resident_remap_before_cache_slot_rewrite(
 
     OffloadMoELayer._decode_routed(offload, hidden, offload_weights, offload_ids)
 
-    assert captured["ids"].tolist() == [[4, 3]]
-    assert offload_ids.tolist() == [[4, 3]]
+    assert captured["ids"].tolist() == [[4, 1]]
+    assert offload_ids.tolist() == [[4, 1]]
     assert torch.equal(resident_ids, resident_ids_before)
     assert torch.equal(expert_remap._load(logits.device)[0], table_ids_before)
 

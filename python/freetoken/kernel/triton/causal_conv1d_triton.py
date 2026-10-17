@@ -30,11 +30,26 @@ __expf); allclose(2e-2) in bf16.
 
 from __future__ import annotations
 
+import functools
 from typing import List, Optional, Union
 
 import torch
 import triton
 import triton.language as tl
+
+
+@functools.cache
+def _fp32_taps() -> bool:
+    """RDNA2 (gfx103x) only: multiply the taps in fp32. Left in bf16, LLVM's AMDGPU backend
+    pairs two products into a bf16 v_dot2_bf16_bf16, which gfx103x lacks, and the kernel fails
+    codegen ("Cannot select: intrinsic %llvm.amdgcn.fdot2.bf16.bf16"). Every other target keeps
+    the bf16 products."""
+    if torch.version.hip is None:
+        return False
+    try:
+        return str(triton.runtime.driver.active.get_current_target().arch).startswith("gfx103")
+    except Exception:
+        return False
 
 PAD_SLOT_ID = -1
 
@@ -78,6 +93,7 @@ def _causal_conv1d_fwd_tiled_kernel(
     pad_slot_id: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     KERNEL_WIDTH: tl.constexpr,
+    FP32_TAPS: tl.constexpr,
     SILU_ACTIVATION: tl.constexpr,
     HAS_INITIAL_STATES: tl.constexpr,
     HAS_CACHE: tl.constexpr,
@@ -156,11 +172,8 @@ def _causal_conv1d_fwd_tiled_kernel(
 
     # Left context (< 0) comes from conv_states (chunk_offset==0, load_init) else zero;
     # chunk>0 always reads x.
-    # The taps are cast to fp32 before the multiply, not just accumulated into an fp32
-    # acc: left in bf16, LLVM's AMDGPU backend pairs two products into a bf16
-    # v_dot2_bf16_bf16, which only exists on gfx11+ and makes the kernel fail codegen on
-    # RDNA2 ("Cannot select: intrinsic %llvm.amdgcn.fdot2.bf16.bf16"). fp32 products are
-    # also what the reference op computes.
+    # FP32_TAPS (RDNA2 only, see _fp32_taps): multiply in fp32 so the backend can't pair the
+    # products into a bf16 dot2 that gfx103x doesn't have.
     for j in tl.static_range(KERNEL_WIDTH):
         if j == 0:
             w_j = w_col0
@@ -179,7 +192,10 @@ def _causal_conv1d_fwd_tiled_kernel(
         )
         mask_x = (src_local >= 0)[:, None] & (src_local < seqlen)[:, None] & mfc
         xj = tl.load(x_ptrs, mask_x, 0.0)
-        acc += w_j[None, :].to(tl.float32) * xj.to(tl.float32)
+        if FP32_TAPS:
+            acc += w_j[None, :].to(tl.float32) * xj.to(tl.float32)
+        else:
+            acc += w_j[None, :] * xj
         if HAS_INITIAL_STATES:
             if load_init_state:
                 st_idx = state_len + src_local        # 0..state_len-1 where src_local<0
@@ -189,7 +205,10 @@ def _causal_conv1d_fwd_tiled_kernel(
                 )
                 mask_s = (src_local < 0)[:, None] & mfc
                 sj = tl.load(s_ptrs, mask_s, 0.0)
-                acc += w_j[None, :].to(tl.float32) * sj.to(tl.float32)
+                if FP32_TAPS:
+                    acc += w_j[None, :].to(tl.float32) * sj.to(tl.float32)
+                else:
+                    acc += w_j[None, :] * sj
 
     if SILU_ACTIVATION:
         # silu(x)=x/(1+exp(-x)); exp2 lowers to the native ex2.approx SFU op (faster than the
@@ -278,6 +297,7 @@ def _causal_conv1d_update_kernel(
     pad_slot_id: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     KERNEL_WIDTH: tl.constexpr,
+    FP32_TAPS: tl.constexpr,
     SILU_ACTIVATION: tl.constexpr,
     IS_CONTINUOUS_BATCHING: tl.constexpr,
     NP2_STATELEN: tl.constexpr,
@@ -397,7 +417,10 @@ def _causal_conv1d_update_kernel(
                 elif j == 3:
                     matrix_w = w_col3
                     matrix_x = tl.load(x_base_1d + idx_token * stride_x_token, mask=mask_x_1d)
-            acc += matrix_x.to(tl.float32) * matrix_w.to(tl.float32)
+            if FP32_TAPS:
+                acc += matrix_x.to(tl.float32) * matrix_w.to(tl.float32)
+            else:
+                acc += matrix_x * matrix_w
 
         if KERNEL_WIDTH == 2:
             col0 = matrix_x
@@ -506,6 +529,7 @@ def causal_conv1d_varlen(
         pad_slot_id,
         HAS_BIAS=False,
         KERNEL_WIDTH=width,
+        FP32_TAPS=_fp32_taps(),
         SILU_ACTIVATION=activation in ["silu", "swish"],
         HAS_INITIAL_STATES=has_initial_state is not None,
         HAS_CACHE=True,
@@ -579,6 +603,7 @@ def causal_conv1d_decode(
         pad_slot_id,
         HAS_BIAS=False,
         KERNEL_WIDTH=width,
+        FP32_TAPS=_fp32_taps(),
         SILU_ACTIVATION=activation in ["silu", "swish"],
         IS_CONTINUOUS_BATCHING=conv_state_indices is not None,
         NP2_STATELEN=np2_statelen,

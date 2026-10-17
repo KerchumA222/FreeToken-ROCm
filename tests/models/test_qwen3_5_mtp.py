@@ -219,7 +219,7 @@ def test_mtp_drafter_loads_one_sided_token_override_and_borrows_other(
 ):
     from contextlib import nullcontext
 
-    from freetoken.models.qwen3_5_moe import mtp
+    from freetoken.speculative import mtp
     from freetoken.speculative.mtp import MtpSource
 
     class FakeModule:
@@ -336,7 +336,8 @@ def test_mtp_head_pass_applies_sampled_tokens_and_stores_selected_rows():
     assert draft_tokens.tolist() == [0, 1]
     assert plan.next_ids.tolist() == [101, 102, 103]
     assert drafter.store.shape == (4, 1)
-    torch.testing.assert_close(drafter.store[:2, 0], torch.tensor([37.0, -87.0]))
+    # row 1 takes the sampled token: 20 + 99 + 10; row 2 keeps its next id: -200 + 103 + 10
+    torch.testing.assert_close(drafter.store[:2, 0], torch.tensor([129.0, -87.0]))
 
 
 def test_mtp_draft_chain_feeds_back_state_and_writes_following_tokens(monkeypatch):
@@ -387,6 +388,7 @@ def test_mtp_draft_chain_feeds_back_state_and_writes_following_tokens(monkeypatc
         spec=SimpleNamespace(k=3, reqs=[req], first_drafts=[2])
     )
     page_table = torch.arange(20, dtype=torch.int32).reshape(1, 20)
+    drafter._page_table = lambda: page_table
     token_pool = torch.zeros((1, 12), dtype=torch.int32)
 
     original_tensor = torch.tensor

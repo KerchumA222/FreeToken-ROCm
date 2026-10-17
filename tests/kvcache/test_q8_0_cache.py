@@ -214,7 +214,7 @@ def test_q8_0_writer_matches_block_reference_and_scatter_slots():
                         restored = actual_codes.float() * actual_scale
                         assert torch.count_nonzero(restored) == 0
                         continue
-                    normalized = values / scale
+                    normalized = values * (1.0 / scale)  # GGML and the writer multiply by the reciprocal
                     expected = (
                         torch.sign(normalized) * torch.floor(normalized.abs() + 0.5)
                     ).clamp(-127, 127).to(torch.int8)
@@ -265,7 +265,7 @@ def test_q8_0_pool_store_kv_writes_scale_accessors():
                 for source, cache, scales in ((k, actual_k, k_scale), (v, actual_v, v_scale)):
                     values = source[token, head, start : start + 32].float()
                     scale = values.abs().max() / 127.0
-                    normalized = values / scale
+                    normalized = values * (1.0 / scale)  # GGML and the writer multiply by the reciprocal
                     expected = (
                         torch.sign(normalized) * torch.floor(normalized.abs() + 0.5)
                     ).clamp(-127, 127).to(torch.int8)
