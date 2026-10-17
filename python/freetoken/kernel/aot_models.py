@@ -152,7 +152,8 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         top_k=8,
         moe_intermediate_size=512,
         expert_formats=("bf16",),
-        arch_aliases=("Qwen3_5MoeForCausalLM",),  # text-only release of the same tower
+        # text-only release of the same tower; GGUF expert rows reach the fused copy as runtime sizes
+        arch_aliases=("Qwen3_5MoeForCausalLM", "Qwen3_5MoeGGUFForCausalLM"),
     ),
     AotModel(
         name="Qwen/Qwen3.5-35B-A3B-FP8",
@@ -341,6 +342,17 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         moe_intermediate_size=2304,
         expert_formats=("ds_fp4",),
     ),
+    AotModel(
+        name="poolside/Laguna-S-2.1",
+        architecture="LagunaForCausalLM",
+        hidden_size=3072,
+        kv_groups=((8, 128),),  # sliding and full layers share the same geometry
+        top_k=10,
+        moe_intermediate_size=1024,
+        expert_formats=("bf16",),
+        # GGUF expert rows differ per layer and reach the fused copy as runtime sizes
+        arch_aliases=("LagunaGGUFForCausalLM",),
+    ),
     # ---- dense checkpoints (store/index only, no expert banks) ----
     AotModel(
         name="Qwen/Qwen3.6-27B",
@@ -348,7 +360,7 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         hidden_size=5120,
         kv_groups=((4, 256),),
         aliases=("Qwen/Qwen3.6-27B-FP8", "nvidia/Qwen3.6-27B-NVFP4"),
-        arch_aliases=("Qwen3_5ForCausalLM",),  # text-only release of the same tower
+        arch_aliases=("Qwen3_5ForCausalLM", "Qwen3_5GGUFForCausalLM"),  # text-only and GGUF releases of the same tower
     ),
     AotModel(
         name="google/gemma-4-12B-it",
