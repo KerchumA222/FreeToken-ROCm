@@ -18,6 +18,8 @@ any other bf16 projection.
 from __future__ import annotations
 
 
+import functools
+
 import torch
 import triton
 import triton.language as tl
@@ -224,6 +226,18 @@ def _gemv(a: torch.Tensor, weight: torch.Tensor, scale_codes: torch.Tensor,
     return out
 
 
+@functools.lru_cache(maxsize=None)
+def _gemv_max_rows(device: torch.device) -> int:
+    """Largest M_TILE the split-K GEMV's LDS fits: ~512 bytes per row (a 256-row tile
+    needs 128 KB). RDNA2 has 64 KB, so larger batches run in row chunks there, each a
+    weight pass of its own."""
+    props = torch.cuda.get_device_properties(device)
+    smem = (getattr(props, "shared_memory_per_block_optin", 0)
+            or getattr(props, "shared_memory_per_block", 0) or 65536)
+    rows = 1 << ((smem // 512).bit_length() - 1)
+    return max(16, min(_GEMV_MAX_M, rows))
+
+
 def mxfp8_linear(
     x: torch.Tensor, weight: torch.Tensor, scale_codes: torch.Tensor,
     bias: torch.Tensor | None = None,
@@ -239,7 +253,14 @@ def mxfp8_linear(
     assert K % MXFP8_BLOCK == 0 and scale_codes.shape == (N, K // MXFP8_BLOCK)
     if M <= _GEMV_MAX_M:
         w8 = e4m3_kernel_view(weight)
-        out = _gemv(x.reshape(M, K), w8, scale_codes, x.dtype).reshape(*lead, N)
+        a = x.reshape(M, K)
+        rows = _gemv_max_rows(x.device)
+        if M <= rows:
+            out = _gemv(a, w8, scale_codes, x.dtype)
+        else:
+            out = torch.cat([_gemv(a[i : i + rows], w8, scale_codes, x.dtype)
+                             for i in range(0, M, rows)])
+        out = out.reshape(*lead, N)
     else:
         # Per-call bf16 transient (pow2 descale is lossless in bf16) + cuBLAS.
         w = mxfp8_dequant(weight, scale_codes, dtype=x.dtype)
