@@ -2013,7 +2013,8 @@ def _adjust_config(config: EngineConfig):
         object.__setattr__(config, attr, value)
 
     model_config = config.model_config
-    _validate_per_layer_attention_tp(model_config, config.tp_info.size)
+    if getattr(model_config, "num_qo_heads_per_layer", ()):
+        _validate_per_layer_attention_tp(model_config, config.tp_info.size)
     single_stream_only = getattr(model_config, "single_stream_only", False)
     is_dsv4 = getattr(model_config, "dsv4_args", None) is not None
     is_dsv41 = getattr(model_config, "dsv41_args", None) is not None
@@ -2341,7 +2342,7 @@ def _adjust_config(config: EngineConfig):
     if is_moe and getattr(config, "moe_disk_tier", False):
         _adjust_disk_tier_config(config, override)
 
-    if config.speculative_algorithm is not None:
+    if getattr(config, "speculative_algorithm", None) is not None:
         _adjust_speculative_config(config, override)
 
     if is_moe:
