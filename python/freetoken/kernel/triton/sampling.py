@@ -315,8 +315,9 @@ def _row_barrier(bar_ptr, need):
     # the row's CTAs must be co-resident (cooperative launch), or a lone CTA (G == 1) passes at once.
     # every warp's preceding atomics must be issued before thread 0 announces arrival
     tl.debug_barrier()
-    tl.atomic_add(bar_ptr, 1)
-    n = tl.atomic_add(bar_ptr, 0)
+    # arrival returns the count: a separate atomic read before the loop is merged with the one
+    # inside it into an irreducible loop that deadlocks on its own s_barrier on AMDGPU (gfx1030)
+    n = tl.atomic_add(bar_ptr, 1) + 1
     while n < need:
         n = tl.atomic_add(bar_ptr, 0)
 
@@ -528,26 +529,17 @@ _COOP_CTAS_PER_SM = 2  # the fused kernels use ~80 regs/thread at 8 warps; 4/SM 
 
 
 @cache
-def _cooperative_supported(device) -> bool:
-    """Whether a multi-CTA cooperative launch may be attempted on this device.
-
-    Never on HIP. gfx1030 reports its 60 CUs as 30 WGPs, and neither budget is
-    safe: 2 CTAs/WGP is rejected outright with hipErrorCooperativeLaunchTooLarge,
-    and 1 CTA/WGP is *accepted* and then hangs, because fewer blocks are resident
-    than the grid barrier waits for. Neither is recoverable at runtime -- the
-    rejection poisons the HIP context so the retry in _exact_launch inherits a dead
-    stream, and the hang never returns to be caught at all. force_single runs the
-    same kernel with one CTA per row for identical results, so HIP takes that path
-    from the start.
-    """
-    return not torch.version.hip
+def _coop_ctas_per_sm(device) -> int:
+    # HIP counts gfx10 multiprocessors as WGPs and its occupancy check admits one 8-warp CTA per WGP for the
+    # fused kernels; 2 is rejected with hipErrorCooperativeLaunchTooLarge
+    return 1 if torch.version.hip else _COOP_CTAS_PER_SM
 
 
 def _fused_plan(B, V, device, force_single=False):
-    if force_single or not _cooperative_supported(device):
+    if force_single:
         return 1, V
     # the cooperative launch needs the whole grid co-resident, so cap B*G by an occupancy budget instead of _plan's one CTA per SM
-    g_by_sm = max(1, (_COOP_CTAS_PER_SM * _num_sm(device)) // B)
+    g_by_sm = max(1, (_coop_ctas_per_sm(device) * _num_sm(device)) // B)
     g_by_chunk = max(1, triton.cdiv(V, _MIN_CHUNK))
     G = min(g_by_sm, g_by_chunk)
     return G, triton.cdiv(V, G)
@@ -607,6 +599,14 @@ def _is_cooperative_launch_error(exc):
     return "cooperative" in message or "too many resources requested for launch" in message
 
 
+def _clear_hip_launch_error():
+    # HIP keeps the rejected launch as the thread's last error and the next torch call would raise it
+    if torch.version.hip:
+        import ctypes
+
+        ctypes.CDLL("libamdhip64.so").hipGetLastError()
+
+
 def _exact_launch(probs, kernel, tk, tp, draw, seed, offset):
     key = _cooperative_key(probs, kernel, tk, draw)
     force_single = key in _COOPERATIVE_DISABLED
@@ -617,6 +617,7 @@ def _exact_launch(probs, kernel, tk, tp, draw, seed, offset):
         if force_single or G == 1 or not _is_cooperative_launch_error(exc):
             raise
         _COOPERATIVE_DISABLED.add(key)
+        _clear_hip_launch_error()
         logger.warning("cooperative triton sampling unavailable on %s (%s); retrying with one CTA per row",
                        probs.device, exc)
         return _fused_launch(probs, kernel, tk, tp, draw, seed, offset, force_single=True)
