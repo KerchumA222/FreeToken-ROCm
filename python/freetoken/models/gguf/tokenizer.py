@@ -23,6 +23,7 @@ def load_gguf_tokenizer(model_path: str):
     arch, tok_dict, special = get_gguf_tokenizer(model_path)
     fast, _ = convert_gguf_tokenizer(arch, tok_dict)
     meta = load_gguf_metadata(model_path)
+    fast = _pin_control_tokens(fast, meta)
     # special: bos/eos/unk/pad as the file names them (None when absent) and the chat template
     return PreTrainedTokenizerFast(
         tokenizer_object=fast,
@@ -30,6 +31,61 @@ def load_gguf_tokenizer(model_path: str):
         add_bos_token=bool(meta.get("tokenizer.ggml.add_bos_token")),
         add_eos_token=bool(meta.get("tokenizer.ggml.add_eos_token")),
     )
+
+
+_CONTROL, _USER_DEFINED = 3, 4  # llama.cpp token types
+
+
+def _pin_control_tokens(fast, meta):
+    """Give each control / user-defined GGUF token its file id as an added token.
+
+    The gpt2 converter byte-encodes every vocab string, so a control token with non-ASCII text
+    (Laguna's ``〈|EOS|〉`` at id 2) is stored as its byte form and the raw text no longer
+    resolves: naming it as bos/eos then appends a new id past the embedding table. llama.cpp
+    matches these tokens by their raw text, so pin that text to the file id. Tokens the
+    converter already resolves are left as they are.
+    """
+    import json
+
+    from tokenizers import Tokenizer
+
+    tokens = meta.get("tokenizer.ggml.tokens")
+    types = meta.get("tokenizer.ggml.token_type")
+    if not tokens or types is None:
+        return fast
+    data = json.loads(fast.to_str())
+    added = data.setdefault("added_tokens", [])
+    by_content = {a["content"]: a for a in added}
+    vocab = data.get("model", {}).get("vocab")
+    key_of = {v: k for k, v in vocab.items()} if isinstance(vocab, dict) else {}
+    changed = False
+    for i, (text, kind) in enumerate(zip(tokens, types)):
+        if int(kind) not in (_CONTROL, _USER_DEFINED):
+            continue
+        entry = by_content.get(text)
+        if entry is not None and entry["id"] == i:
+            continue
+        if entry is None and fast.token_to_id(text) == i:
+            continue
+        if entry is not None:
+            added.remove(entry)
+        # tokenizers resolves an added token's id through the model vocab, so the byte-encoded key must become the raw text
+        # (an id can be missing outright when two byte-encoded keys collided)
+        old_key = key_of.get(i)
+        if isinstance(vocab, dict) and old_key != text and text not in vocab:
+            if old_key is not None:
+                del vocab[old_key]
+            vocab[text] = i
+        by_content[text] = {"id": i, "content": text, "single_word": False, "lstrip": False, "rstrip": False,
+                            "normalized": False, "special": int(kind) == _CONTROL}
+        added.append(by_content[text])
+        changed = True
+    if not changed:
+        return fast
+    # the converter's own extras (a default <|endoftext|>) land past the file's vocab, where the model has no embedding row
+    added[:] = [a for a in added if a["id"] < len(tokens)]
+    added.sort(key=lambda a: a["id"])
+    return Tokenizer.from_str(json.dumps(data))
 
 
 def gguf_eos_token_ids(model_path: str) -> set[int]:
