@@ -101,7 +101,7 @@ def _validate_tensor_geometry(shim: "GgufConfigShim", config: ModelConfig) -> No
         return
 
     def check(name: str, expected: tuple[int, ...]) -> None:
-        info = index.get(name if name.endswith(".weight") else f"{name}.weight")
+        info = index.get(name if name.endswith((".weight", ".bias")) else f"{name}.weight")
         if info is None:
             return
         if tuple(info.ne) != expected:
@@ -131,7 +131,7 @@ def _validate_tensor_geometry(shim: "GgufConfigShim", config: ModelConfig) -> No
                 check(f"{blk}.ffn_{proj}", shape)
         else:
             check(f"{blk}.ffn_gate_inp", (config.hidden_size, config.num_experts))
-            check(f"{blk}.exp_probs_b", (config.num_experts,))
+            check(f"{blk}.exp_probs_b.bias", (config.num_experts,))
             for proj, shape in (
                 ("gate_shexp", (config.hidden_size, config.shared_expert_intermediate_size)),
                 ("up_shexp", (config.hidden_size, config.shared_expert_intermediate_size)),
@@ -291,7 +291,7 @@ def iter_gguf_weights(
     index = gguf_tensor_index(model_path)
 
     def t(name: str) -> GgufTensorInfo:
-        return index[name if name.endswith(".weight") else f"{name}.weight"]
+        return index[name if name.endswith((".weight", ".bias")) else f"{name}.weight"]
 
     embed = t("token_embd")
     yield from fused("model.embed_tokens", [embed], [matrix(embed)], config.hidden_size)
@@ -328,7 +328,7 @@ def iter_gguf_weights(
             continue
 
         yield f"{mlp}.gate.weight", float_tensor(t(f"{blk}.ffn_gate_inp"))
-        yield f"{mlp}.e_score_correction_bias", float_tensor(t(f"{blk}.exp_probs_b"))
+        yield f"{mlp}.e_score_correction_bias", float_tensor(t(f"{blk}.exp_probs_b.bias"))
         gate, up, down = (t(f"{blk}.ffn_{p}_shexp") for p in ("gate", "up", "down"))
         yield from fused(
             f"{mlp}.shared_expert.gate_up_proj",

@@ -106,7 +106,8 @@ def test_rdna2_gdn_tile_variants_preserve_factual_outputs(monkeypatch):
     q = torch.randn_like(k)
     v = torch.randn((batch, tokens, heads, dim), device=device, dtype=torch.float16) * 0.1
     beta = torch.rand((batch, tokens, heads), device=device, dtype=torch.float16)
-    decay = torch.randn_like(beta) * 0.01
+    # log-space gates are fp32 in the model (the chunk-local cumsum output); safe_exp requires it
+    decay = torch.randn((batch, tokens, heads), device=device, dtype=torch.float32) * 0.01
     w = torch.randn((batch, tokens, heads, dim), device=device, dtype=torch.float16) * 0.1
     u = torch.randn_like(v) * 0.1
     initial_state = torch.randn((batch, heads, dim, dim), device=device, dtype=torch.float16) * 0.1

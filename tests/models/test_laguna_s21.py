@@ -351,7 +351,6 @@ def test_laguna_gguf_weight_iterator_maps_attention_dense_shared_and_router_tens
         else:
             entries.update({
                 "ffn_gate_inp": (3072, 256),
-                "exp_probs_b": (256,),
                 "ffn_gate_shexp": (3072, 1024),
                 "ffn_up_shexp": (3072, 1024),
                 "ffn_down_shexp": (1024, 3072),
@@ -360,6 +359,9 @@ def test_laguna_gguf_weight_iterator_maps_attention_dense_shared_and_router_tens
                 "ffn_down_exps": (1024, 3072, 256),
             })
         index.update({f"{blk}.{name}.weight": SimpleNamespace(ne=shape) for name, shape in entries.items()})
+        if layer:
+            # llama.cpp names the router correction bias with the "bias" suffix
+            index[f"{blk}.exp_probs_b.bias"] = SimpleNamespace(ne=(256,))
 
     monkeypatch.setattr(gguf, "gguf_tensor_index", lambda _path: index)
     marker = torch.ones(1)
@@ -367,7 +369,8 @@ def test_laguna_gguf_weight_iterator_maps_attention_dense_shared_and_router_tens
     monkeypatch.setattr(gguf, "float_tensor", lambda _info: marker)
     monkeypatch.setattr(gguf, "fused", lambda prefix, *_args, **_kwargs: iter(((f"{prefix}.weight", marker),)))
     monkeypatch.setattr("freetoken.utils.cached_load_hf_config", lambda _path: shim)
-    set_tp_info(rank=0, size=1)
+    if try_get_tp_info() is None:
+        set_tp_info(rank=0, size=1)
 
     weights = dict(gguf.iter_gguf_weights(
         shim.model_path,
@@ -435,7 +438,7 @@ def test_laguna_weight_reader_fuses_attention_dense_shared_and_expert_tensors(
         "model.layers.0.self_attn.q_proj.weight": torch.zeros(128, 128),
         "model.layers.0.self_attn.k_proj.weight": torch.zeros(64, 128),
         "model.layers.0.self_attn.v_proj.weight": torch.zeros(64, 128),
-        "model.layers.0.self_attn.g_proj.weight": torch.zeros(128, 128),
+        "model.layers.0.self_attn.g_proj.weight": torch.zeros(2, 128),
         "model.layers.0.mlp.gate_proj.weight": torch.zeros(256, 128),
         "model.layers.0.mlp.up_proj.weight": torch.zeros(256, 128),
         "model.layers.1.mlp.experts.e_score_correction_bias": torch.ones(4),
@@ -464,7 +467,7 @@ def test_laguna_weight_reader_fuses_attention_dense_shared_and_expert_tensors(
         )
     )
     assert loaded["model.layers.0.self_attn.qkv_proj.weight"].shape == (256, 128)
-    assert loaded["model.layers.0.self_attn.g_proj.weight"].shape == (128, 128)
+    assert loaded["model.layers.0.self_attn.g_proj.weight"].shape == (2, 128)
     assert loaded["model.layers.0.mlp.gate_up_proj.weight"].shape == (512, 128)
     assert loaded["model.layers.1.mlp.shared_expert.gate_up_proj.weight"].shape == (64, 128)
     assert loaded["model.layers.1.mlp.experts.gate_up_proj"].shape == (4, 64, 128)
