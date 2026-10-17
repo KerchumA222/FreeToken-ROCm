@@ -9,6 +9,7 @@ the raw GGUF metadata dict, and a few derived facts that need the tensor table
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -18,6 +19,7 @@ from .reader import gguf_architecture, load_gguf_metadata, gguf_tensor_names
 # reuses the model classes but a GGUF parse_config / iter_weights).
 GGUF_ARCH_TO_REGISTRY: dict[str, str] = {
     "gemma4": "Gemma4GGUFForCausalLM",
+    "laguna": "LagunaGGUFForCausalLM",
     "qwen35": "Qwen3_5GGUFForCausalLM",
     "qwen35moe": "Qwen3_5MoeGGUFForCausalLM",
     "qwen4exp": "Qwen4ExpGGUFForCausalLM",
@@ -65,6 +67,11 @@ def _vocab_size(model_path: str) -> int:
 def build_gguf_shim(model_path: str) -> GgufConfigShim:
     arch = gguf_architecture(model_path)
     registry_key = GGUF_ARCH_TO_REGISTRY.get(arch)
+    laguna_gguf_enabled = os.environ.get("FREETOKEN_ENABLE_LAGUNA_GGUF", "0").strip().lower()
+    if arch == "laguna" and laguna_gguf_enabled not in ("1", "true", "yes", "on"):
+        raise ValueError(
+            "Laguna GGUF support is opt-in; set FREETOKEN_ENABLE_LAGUNA_GGUF=1 to enable it"
+        )
     if registry_key is None:
         raise ValueError(
             f"GGUF architecture {arch!r} is not supported "

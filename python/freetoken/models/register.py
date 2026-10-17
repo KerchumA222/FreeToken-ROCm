@@ -32,6 +32,8 @@ class ModelSpec:
     # "module:Class" turning the checkpoint's media into items; None: the family takes no multimodal input
     mm_processor: str | None = None
     encoders: tuple[EncoderSpec, ...] = ()
+    # attribute of ``module`` holding the family's MTP draft-head adapter (speculative.mtp.MtpAdapter); None: no --speculative-algorithm mtp
+    mtp: str | None = None
 
 
 # Multimodal wrappers store the text tower under model.language_model.
@@ -48,6 +50,7 @@ _DENSE_PACKED = (
 # per-expert checkpoints: probe the first expert's projections for the experts container
 _EXPERTS_PACKED = (("experts", ("experts.0.gate_proj", "experts.0.up_proj", "experts.0.down_proj")),)
 _EXPERTS_W123_PACKED = (("experts", ("experts.0.w1", "experts.0.w2", "experts.0.w3")),)
+_LAGUNA_PACKED = _DENSE_PACKED + _EXPERTS_PACKED
 # pre-stacked expert checkpoints (Qwen3-VL-MoE): the container's own two tensors are the probe
 _STACKED_EXPERTS_PACKED = (("experts", ("experts.gate_up_proj", "experts.down_proj")),)
 _QWEN3_5_PACKED = _DENSE_PACKED + (
@@ -90,6 +93,13 @@ _DSV4_PROCESSOR = "freetoken.mm.processors.deepseek_v4:DSV4MMProcessor"
 _DSV4_ENCODERS = (EncoderSpec("vision", "vision_n_layers", ("image",)),)
 
 _MODEL_REGISTRY: dict[str, ModelSpec] = {
+    # Laguna-S-2.1: alternating full/SWA attention, per-layer Q-head counts, a dense
+    # first MLP block, and sigmoid-routed experts with a shared dense expert.
+    "LagunaForCausalLM": ModelSpec(
+        "freetoken.models.laguna",
+        "LagunaForCausalLM",
+        packed_modules_mapping=_LAGUNA_PACKED,
+    ),
     "LlamaForCausalLM": ModelSpec(
         "freetoken.models.llama",
         "LlamaForCausalLM",
@@ -201,6 +211,14 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         packed_modules_mapping=_QWEN3_5_PACKED,
         unquantized_modules=_QWEN3_5_UNQUANTIZED,
     ),
+    # llama.cpp Laguna-S-2.1 GGUF (text only): verified full/SWA topology and packed routed experts.
+    "LagunaGGUFForCausalLM": ModelSpec(
+        "freetoken.models.laguna",
+        "LagunaForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+        packed_modules_mapping=_LAGUNA_PACKED,
+    ),
     # llama.cpp qwen35 / qwen35moe GGUF (text only): the same model classes with every tensor in its packed ggml type
     "Qwen3_5GGUFForCausalLM": ModelSpec(
         "freetoken.models.qwen3_5_moe",
@@ -210,6 +228,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         checkpoint_roots=_LANGUAGE_MODEL_ROOT,
         packed_modules_mapping=_QWEN3_5_PACKED,
         unquantized_modules=_QWEN3_5_UNQUANTIZED,
+        mtp="QWEN3_5_MTP",
     ),
     "Qwen3_5MoeGGUFForCausalLM": ModelSpec(
         "freetoken.models.qwen3_5_moe",
@@ -219,6 +238,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         checkpoint_roots=_LANGUAGE_MODEL_ROOT,
         packed_modules_mapping=_QWEN3_5_PACKED,
         unquantized_modules=_QWEN3_5_UNQUANTIZED,
+        mtp="QWEN3_5_MTP",
     ),
     # Qwen3.8-Flash-Next (model_type qwen4_exp): multimodal wrapper config (text tower in
     # text_config, weights under model.language_model.). 36 GDN + 12 QSA
@@ -361,9 +381,19 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
 
 def get_model_spec(model_architecture: str) -> ModelSpec:
     try:
-        return _MODEL_REGISTRY[model_architecture]
+        spec = _MODEL_REGISTRY[model_architecture]
     except KeyError as exc:
         raise ValueError(f"Model architecture {model_architecture} not supported") from exc
+    laguna_gates = {
+        "LagunaForCausalLM": "FREETOKEN_ENABLE_LAGUNA_HF",
+        "LagunaGGUFForCausalLM": "FREETOKEN_ENABLE_LAGUNA_GGUF",
+    }
+    if (env_name := laguna_gates.get(model_architecture)) is not None:
+        import os
+
+        if os.environ.get(env_name, "0").strip().lower() not in ("1", "true", "yes", "on"):
+            raise ValueError(f"{model_architecture} support is opt-in; set {env_name}=1 to enable it")
+    return spec
 
 
 def _load_attr(module_path: str, attr_name: str) -> Any:

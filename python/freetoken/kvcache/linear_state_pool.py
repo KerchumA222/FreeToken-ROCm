@@ -52,12 +52,17 @@ class LinearStatePool:
         device: torch.device,
         tp_size: int | None = None,
         slot_states: tuple[SlotStateSpec, ...] = (),
+        spec_slots: int = 0,
     ) -> None:
         if tp_size is None:
             tp_size = get_tp_info().size
 
         self._group = group
         self._num_slots = num_slots
+        # Speculative-verify snapshots (MTP): slots past num_slots, outside the free-list, that
+        # hold each verifying request's state after each draft row so a partial accept rolls back.
+        self.num_spec_slots = spec_slots
+        total = num_slots + spec_slots
         self._device = device
         self._conv_dtype = dtype
 
@@ -65,14 +70,14 @@ class LinearStatePool:
 
         # conv left-context: the last (kernel-1) timesteps of the conv input stream.
         self.conv_states = torch.zeros(
-            (n_layers, num_slots, local_conv_dim, group.conv_kernel_dim - 1),
+            (n_layers, total, local_conv_dim, group.conv_kernel_dim - 1),
             dtype=dtype,
             device=device,
         )
         # SSM recurrent state. fp32 by default (matches HF mamba_ssm_dtype); the dtype is
         # overridable via FREETOKEN_MAMBA_SSM_DTYPE (see ssm_state_dtype).
         self.recurrent_states = torch.zeros(
-            (n_layers, num_slots, local_v_heads, group.key_head_dim, group.value_head_dim),
+            (n_layers, total, local_v_heads, group.key_head_dim, group.value_head_dim),
             dtype=ssm_state_dtype(),
             device=device,
         )
@@ -86,7 +91,7 @@ class LinearStatePool:
             spec.name: {lid: i for i, lid in enumerate(spec.layer_ids)}
             for spec in self._slot_specs
         }
-        self.slot_states: dict[str, torch.Tensor] = self._alloc_slot_states(num_slots)
+        self.slot_states: dict[str, torch.Tensor] = self._alloc_slot_states(total)
 
         # Free-list allocator over slots 1..num_slots-1 (slot 0 reserved as a padding sink,
         # sglang MambaPool convention). Live working slots, ping-pong track slots, and
@@ -118,6 +123,11 @@ class LinearStatePool:
             )
             return t[0]
         return t[self._state_layer_index[name][layer_id]]
+
+    def spec_slot(self, index: int) -> int:
+        """Slot id of speculative snapshot ``index`` (0 <= index < num_spec_slots)."""
+        assert 0 <= index < self.num_spec_slots, (index, self.num_spec_slots)
+        return self._num_slots + index
 
     @property
     def num_free_slots(self) -> int:
@@ -156,15 +166,16 @@ class LinearStatePool:
         if device.type == "cuda":
             torch.cuda.synchronize(device)
             torch.cuda.empty_cache()
+        total = num_slots + self.num_spec_slots
         self.conv_states = torch.zeros(
-            (n_layers, num_slots, local_conv_dim, km1), dtype=conv_dtype, device=device
+            (n_layers, total, local_conv_dim, km1), dtype=conv_dtype, device=device
         )
         self.recurrent_states = torch.zeros(
-            (n_layers, num_slots, local_v_heads, key_head_dim, value_head_dim),
+            (n_layers, total, local_v_heads, key_head_dim, value_head_dim),
             dtype=rec_dtype,
             device=device,
         )
-        self.slot_states = self._alloc_slot_states(num_slots)
+        self.slot_states = self._alloc_slot_states(total)
         self._num_slots = num_slots
         self._free_slots = list(range(1, num_slots))
 
@@ -260,6 +271,13 @@ def linear_state_bytes_per_req(
 __all__ = ["LinearStatePool", "linear_state_bytes_per_req"]
 
 
+def _linear_pool_spec_slots(config) -> int:
+    """Speculative-verify snapshot slots: one per draft row of every running request (MTP), else 0."""
+    if getattr(config, "speculative_algorithm", None) is None:
+        return 0
+    return config.max_running_req * int(config.speculative_num_draft_tokens)
+
+
 def state_pool_bytes(config, num_slots: int | None = None) -> int:
     """Total GDN state-pool bytes at ``num_slots`` PHYSICAL slots (default: the startup
     slot count). The engine adds this to the KV family's fixed cost when budgeting --
@@ -271,6 +289,7 @@ def state_pool_bytes(config, num_slots: int | None = None) -> int:
             raise ValueError("slot_states ride the linear-state slots; model has no linear group")
         return 0
     slots = num_slots if num_slots is not None else _linear_pool_num_slots(config)
+    slots += _linear_pool_spec_slots(config)
     per_req = linear_state_bytes_per_req(
         linear_group, config.tp_info.size, config.dtype, slot_states
     )

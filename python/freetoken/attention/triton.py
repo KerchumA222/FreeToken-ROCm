@@ -151,10 +151,18 @@ class TritonAttentionBackend(BaseAttnBackend):
 
         k_raw = self.kvcache.k_cache(layer_id)
         v_raw = self.kvcache.v_cache(layer_id)
-        kv_heads, head_dim = k_raw.shape[-2], k_raw.shape[-1]
-        assert head_dim == q.shape[-1]
-        k_cache = k_raw.view(-1, kv_heads, head_dim)
-        v_cache = v_raw.view(-1, kv_heads, head_dim)
+        kv_dtype = getattr(self.kvcache, "kv_cache_dtype", "model")
+        q8_0 = kv_dtype == "q8_0"
+        k_scale_cache = self.kvcache.k_scale_cache(layer_id) if q8_0 else None
+        v_scale_cache = self.kvcache.v_scale_cache(layer_id) if q8_0 else None
+        kv_heads = k_raw.shape[-2]
+        head_dim = q.shape[-1] if kv_dtype == "turboquant_4bit_nc" else k_raw.shape[-1]
+        if kv_dtype == "turboquant_4bit_nc":
+            assert k_raw.shape[-1] * 2 == head_dim
+        else:
+            assert head_dim == q.shape[-1]
+        k_cache = k_raw.view(-1, kv_heads, k_raw.shape[-1])
+        v_cache = v_raw.view(-1, kv_heads, v_raw.shape[-1])
 
         spec = attn_spec or AttentionSpec()
         block_ends = batch.mm_block_ends if spec.bidirectional_mm_blocks else None
@@ -162,6 +170,39 @@ class TritonAttentionBackend(BaseAttnBackend):
         if spec.sliding_window is not None and metadata.swa_indices is not None:
             indices = metadata.swa_indices
         scale = spec.sm_scale if spec.sm_scale is not None else q.shape[-1] ** -0.5
+        if getattr(self.kvcache, "kv_cache_dtype", "model") == "turboquant_4bit_nc":
+            from freetoken.kernel.triton.turboquant import turboquant_4bit_nc_attention
+
+            k_norms = self.kvcache.k_norm_cache(layer_id)
+            v_scales = self.kvcache.v_scale_cache(layer_id)
+            v_zeros = self.kvcache.v_zero_cache(layer_id)
+            rotation = self.kvcache.turboquant_rotation
+            centroids = self.kvcache.turboquant_centroids
+            assert (
+                k_norms is not None
+                and v_scales is not None
+                and v_zeros is not None
+                and rotation is not None
+                and centroids is not None
+            )
+            return turboquant_4bit_nc_attention(
+                q=q,
+                k_cache=k_raw.view(-1, kv_heads, head_dim // 2),
+                v_cache=v_raw.view(-1, kv_heads, head_dim // 2),
+                k_norms=k_norms,
+                v_scales=v_scales,
+                v_zeros=v_zeros,
+                centroids=centroids,
+                indptr=metadata.indptr,
+                indices=indices,
+                q_to_req=metadata.q_to_req,
+                q_positions=metadata.q_positions,
+                sm_scale=scale,
+                rotation=rotation,
+                sliding_window=spec.sliding_window,
+                sinks=spec.sinks,
+                block_ends=block_ends,
+            )
         if metadata.is_decode and q.dtype in (torch.float16, torch.bfloat16):
             bs = metadata.indptr.numel() - 1
             self._ensure_decode_scratch(metadata, bs, q.shape[1], q.shape[-1])
@@ -182,6 +223,8 @@ class TritonAttentionBackend(BaseAttnBackend):
                 sm_scale=scale,
                 sliding_window=spec.sliding_window,
                 sinks=spec.sinks,
+                k_scale_cache=k_scale_cache,
+                v_scale_cache=v_scale_cache,
             )
         if (
             (not metadata.is_decode)
@@ -200,9 +243,11 @@ class TritonAttentionBackend(BaseAttnBackend):
                 sm_scale=scale,
                 sliding_window=spec.sliding_window,
                 sinks=spec.sinks,
-                k_extend=k.view(q.shape[0], kv_heads, head_dim),
-                v_extend=v.view(q.shape[0], kv_heads, head_dim),
+                k_extend=None if q8_0 else k.view(q.shape[0], kv_heads, head_dim),
+                v_extend=None if q8_0 else v.view(q.shape[0], kv_heads, head_dim),
                 block_ends=block_ends,
+                k_scale_cache=k_scale_cache,
+                v_scale_cache=v_scale_cache,
             )
         if block_ends is not None:
             raise NotImplementedError("bidirectional multimodal blocks need the extend kernel path")
@@ -217,6 +262,8 @@ class TritonAttentionBackend(BaseAttnBackend):
             sm_scale=scale,
             sliding_window=spec.sliding_window,
             sinks=spec.sinks,
+            k_scale_cache=k_scale_cache,
+            v_scale_cache=v_scale_cache,
         )
 
     def prepare_metadata(self, batch: Batch) -> None:

@@ -13,14 +13,18 @@ def _torch_fused_topk(
     topk: int,
     renormalize: bool,
     num_token_non_padded: torch.Tensor | None,
+    selection_bias: torch.Tensor | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Pure-torch reference for the fused softmax router; tests compare the kernel against it.
 
     Softmax over all experts, select the top-k, and (when ``renormalize``) rescale the
     selected weights to sum to 1 -- the standard fused-MoE routing convention.
     """
-    probs = torch.softmax(gating_output.float(), dim=-1)
-    topk_weights, topk_ids = torch.topk(probs, topk, dim=-1)
+    logits = gating_output.float()
+    probs = torch.softmax(logits, dim=-1)
+    selection_scores = logits if selection_bias is None else logits + selection_bias.float()
+    topk_ids = torch.topk(selection_scores, topk, dim=-1).indices
+    topk_weights = probs.gather(-1, topk_ids)
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
     topk_ids = topk_ids.to(torch.int32)
@@ -36,12 +40,15 @@ def fused_topk(
     topk: int,
     renormalize: bool,
     num_token_non_padded: torch.Tensor | None = None,
+    selection_bias: torch.Tensor | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
     from freetoken.kernel.triton.moe_router import fused_topk_softmax
 
-    return fused_topk_softmax(gating_output, topk, renormalize, num_token_non_padded)
+    return fused_topk_softmax(
+        gating_output, topk, renormalize, num_token_non_padded, selection_bias
+    )
 
 
 def moe_align_block_size(

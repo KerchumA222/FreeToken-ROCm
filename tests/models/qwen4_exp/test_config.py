@@ -110,6 +110,76 @@ def test_moe_dims():
     assert cfg.moe_enabled
 
 
+def test_gguf_config_reconstructs_verified_qwen38_geometry():
+    from freetoken.models.qwen4_exp.gguf import parse_gguf_config
+
+    metadata = {
+        "qwen4exp.block_count": 49,
+        "qwen4exp.nextn_predict_layers": 1,
+        "qwen4exp.embedding_length": 2560,
+        "qwen4exp.attention.key_length": 256,
+        "qwen4exp.attention.head_count": 24,
+        "qwen4exp.attention.head_count_kv": 2,
+        "qwen4exp.rope.dimension_sections": [11, 11, 10],
+        "qwen4exp.rope.freq_base": 10_000_000,
+        "qwen4exp.rope.dimension_count": 64,
+        "qwen4exp.context_length": 262144,
+        "qwen4exp.full_attention_interval": 4,
+        "qwen4exp.attention.layer_norm_rms_epsilon": 1e-6,
+        "qwen4exp.expert_count": 512,
+        "qwen4exp.expert_used_count": 10,
+        "qwen4exp.expert_feed_forward_length": 640,
+        "qwen4exp.expert_shared_feed_forward_length": 640,
+        "qwen4exp.ssm.group_count": 16,
+        "qwen4exp.ssm.time_step_rank": 48,
+        "qwen4exp.ssm.state_size": 128,
+        "qwen4exp.ssm.inner_size": 6144,
+        "qwen4exp.ssm.conv_kernel": 4,
+        "qwen4exp.attention.compress_ratios": [4],
+        "qwen4exp.hyper_connection.count": 4,
+        "qwen4exp.hyper_connection.low_rank": 320,
+        "qwen4exp.attention.indexer.head_count": 4,
+        "qwen4exp.attention.indexer.key_length": 128,
+        "qwen4exp.attention.indexer.top_k": 2048,
+        "qwen4exp.ple.layers": [1],
+        "qwen4exp.embedding_length_per_layer_input": 160,
+        "qwen4exp.ple.ngram_size": 3,
+        "qwen4exp.ple.heads_per_ngram": 8,
+        "qwen4exp.ple.conv_kernel": 4,
+        "qwen4exp.ple.eos_token_id": 248044,
+    }
+    shim = SimpleNamespace(
+        metadata=metadata,
+        vocab_size=248320,
+        tie_word_embeddings=False,
+        architectures=["Qwen4ExpGGUFForCausalLM"],
+    )
+
+    cfg = parse_gguf_config(shim)
+
+    assert cfg.num_layers == 48  # 49 GGUF blocks include one nextn/MTP block.
+    full = next(
+        group for group in cfg.attention_groups if isinstance(group, FullAttentionGroupConfig)
+    )
+    assert full.layer_ids == tuple(range(3, 48, 4))
+    assert (full.index_head_dim, full.num_index_layers, full.index_ratio) == (128, 12, 4)
+    linear = cfg.linear_attention_group()
+    assert len(linear.layer_ids) == 36
+    assert (
+        linear.num_key_heads,
+        linear.num_value_heads,
+        linear.key_head_dim,
+        linear.value_head_dim,
+    ) == (16, 48, 128, 128)
+    args = cfg.qwen4_args
+    assert args.ple_layer_ids == (1,)
+    assert args.ple_embed_dim == 2560 and args.ple_conv_kernel_size == 4
+    assert args.num_ngram_heads == 16 and args.ngram_head_dim == 160
+    assert args.index_n_heads == 4 and args.index_head_dim == 128
+    assert args.index_budget == 2048 and args.index_ratio == 4
+    assert args.gdn_out_heads_tiled
+
+
 @pytest.mark.parametrize(
     "quantization_config, expert_quant",
     [

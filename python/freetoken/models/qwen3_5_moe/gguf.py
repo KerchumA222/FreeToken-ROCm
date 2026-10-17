@@ -57,6 +57,12 @@ def to_gguf(name: str, tensors: dict[str, int]) -> tuple[str, ...]:
     """Checkpoint module name -> the GGUF tensors (without ``.weight``) that store it; empty for modules the GGUF has no matrix for."""
     if name in _TOP_LEAVES:
         return _TOP_LEAVES[name]
+    if name in ("mtp.embed_tokens", "mtp.shared_head_head"):
+        n = nextn_block(tensors)
+        if n is None:
+            return ()
+        leaf = "embed_tokens" if name == "mtp.embed_tokens" else "shared_head_head"
+        return (f"blk.{n}.nextn.{leaf}",)
     if name.startswith(_MTP_PREFIX):
         # the nextn draft head (Qwen3_5MTPHead under "mtp."): its block is blk.<nextn>, its projection nextn.eh_proj
         n = nextn_block(tensors)
@@ -247,14 +253,38 @@ def nextn_block(tensors) -> int | None:
     return min(blocks) if blocks else None
 
 
-def iter_gguf_mtp_weights(model_path: str, prefix: str = "mtp") -> Iterator[tuple[str, torch.Tensor]]:
+def iter_gguf_mtp_token_weights(
+    model_path: str, prefix: str = "mtp", config: ModelConfig | None = None
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Yield optional nextn embedding/output weights; omitted tensors borrow the target module."""
+    from freetoken.utils import cached_load_hf_config
+
+    if config is None:
+        config = parse_gguf_config(cached_load_hf_config(model_path))
+    index = gguf_tensor_index(model_path)
+    n = nextn_block(index)
+    if n is None:
+        raise ValueError(f"{model_path}: no nextn (MTP draft) block")
+    for leaf, module in (
+        ("embed_tokens", "embed_tokens"),
+        ("shared_head_head", "shared_head_head"),
+    ):
+        info = index.get(f"blk.{n}.nextn.{leaf}.weight")
+        if info is not None:
+            yield from fused(
+                f"{prefix}.{module}", [info], [matrix(info)], config.hidden_size
+            )
+
+
+def iter_gguf_mtp_weights(model_path: str, prefix: str = "mtp", config: ModelConfig | None = None) -> Iterator[tuple[str, torch.Tensor]]:
     """The ``nextn`` draft block's dense tensors under ``prefix`` (``Qwen3_5MTPHead``'s naming), in the same packed form as the decoder's.
 
     The block is always full attention; its routed experts load with ``load_gguf_expert_banks(path, 1, first_layer=nextn_block(...))``.
     A head that borrows the target's embedding and lm_head (no ``nextn.embed_tokens`` / ``nextn.shared_head_head``) gets neither here."""
     from freetoken.utils import cached_load_hf_config
 
-    config = parse_gguf_config(cached_load_hf_config(model_path))
+    if config is None:  # a draft-head-only file is read with the target's config instead
+        config = parse_gguf_config(cached_load_hf_config(model_path))
     index = gguf_tensor_index(model_path)
     n = nextn_block(index)
     if n is None:
@@ -267,4 +297,11 @@ def iter_gguf_mtp_weights(model_path: str, prefix: str = "mtp") -> Iterator[tupl
     yield from _iter_layer(index, config, blk, f"{prefix}.layer", linear=False)
 
 
-__all__ = ["iter_gguf_mtp_weights", "iter_gguf_weights", "nextn_block", "parse_gguf_config", "to_gguf"]
+__all__ = [
+    "iter_gguf_mtp_token_weights",
+    "iter_gguf_mtp_weights",
+    "iter_gguf_weights",
+    "nextn_block",
+    "parse_gguf_config",
+    "to_gguf",
+]

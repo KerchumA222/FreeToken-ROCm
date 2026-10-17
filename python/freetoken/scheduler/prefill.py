@@ -55,6 +55,8 @@ class PrefillAdder:
     # allocated only in allocate_paged (after the pass), so swa_available_size does not decrement
     # across the admission loop -- without this, successive admits all see the full pool.
     reserved_swa: int = 0
+    # MTP: also write the prompt token after a chunk, which the draft head reads at the chunk's last row
+    write_next_token: bool = False
 
     def __post_init__(self) -> None:
         if not self.pass_budget:
@@ -204,7 +206,7 @@ class PrefillAdder:
             pending_req.input_len + pending_req.output_len, cached_len
         )
         # NOTE: update the tokens ids only; new pages will be allocated in the scheduler
-        _slice = slice(cached_len, cached_len + chunk_size)
+        _slice = slice(cached_len, cached_len + chunk_size + (1 if self.write_next_token and is_chunked else 0))
         device_ids = self.table_manager.token_pool[table_idx, _slice]
         device_ids.copy_(_maybe_pinned(pending_req.input_ids[_slice]), non_blocking=True)
         req = CLS(
@@ -278,6 +280,7 @@ class PrefillManager:
     encoder_cache: EncoderCache | None = None
     keep_images_whole: bool = False
     pending_list: List[PendingReq] = field(default_factory=list)
+    write_next_token: bool = False
 
     def add_one_req(self, req: UserMsg) -> None:
         self.pending_list.append(
@@ -303,6 +306,7 @@ class PrefillManager:
             table_manager=self.table_manager,
             encoder_cache=self.encoder_cache,
             keep_images_whole=self.keep_images_whole,
+            write_next_token=self.write_next_token,
         )
         reqs: List[Req] = []
         chunked_list: List[PendingReq] = []

@@ -80,6 +80,7 @@ class EngineConfig:
     cuda_graph_bs: List[int] | None = None
     cuda_graph_max_bs: int | None = None
     page_size: int = 1
+    kv_cache_dtype: str = "model"
     memory_ratio: float = 0.9
     # Hybrid GDN models default to the HybridRadixCache (cross-request GDN-state prefix reuse);
     # `--cache-type naive` opts out. linear_state_cache_ratio sizes the GDN snapshot cache as
@@ -105,8 +106,19 @@ class EngineConfig:
     num_token_override: int | None = None
     # Runtime knobs of the multimodal path; the architecture side (vision_config, mrope) lives in ModelConfig.
     mm: MultimodalConfig = field(default_factory=MultimodalConfig)
+    # Speculative decoding (--speculative-algorithm): "mtp" drafts with the checkpoint's nextn
+    # head, speculative_num_draft_tokens per step; the head may ship in its own GGUF
+    # (speculative_draft_model_path). None = off.
+    speculative_algorithm: str | None = None
+    speculative_num_draft_tokens: int = 1
+    speculative_draft_model_path: str | None = None
 
     def __post_init__(self):
+        if self.speculative_algorithm is not None:
+            if self.speculative_algorithm != "mtp":
+                raise ValueError(f"--speculative-algorithm {self.speculative_algorithm!r}: only 'mtp' is supported")
+            if self.speculative_num_draft_tokens < 1:
+                raise ValueError("--speculative-num-draft-tokens must be >= 1")
         if self.moe_backend is None:
             return
         if self.moe_strategy != "auto":
@@ -150,7 +162,21 @@ class EngineConfig:
         quant = checkpoint_quant_config(self.model_path, hf_config, spec)
         set_quant_config(quant)
         model_config = _load_attr(spec.module, spec.parse_config)(hf_config)
-        return replace(model_config, quant=quant)
+        model_config = replace(model_config, quant=quant)
+        if self.speculative_algorithm is not None:
+            from freetoken.speculative.mtp import with_draft_layer
+
+            model_config = with_draft_layer(model_config)
+        return model_config
+
+    @cached_property
+    def mtp_source(self):
+        """Where the MTP draft head's weights live (``speculative.mtp.MtpSource``), None when speculation is off."""
+        if self.speculative_algorithm is None:
+            return None
+        from freetoken.speculative.mtp import locate_mtp_head
+
+        return locate_mtp_head(self)
 
     @property
     def max_seq_len(self) -> int:
