@@ -304,6 +304,7 @@ def _turboquant_decode_split_kernel(
     m_i = tl.full((BLOCK_G,), -float("inf"), tl.float32)
     l_i = tl.zeros((BLOCK_G,), tl.float32)
     acc = tl.zeros((BLOCK_G, D), tl.float32)
+    q = q.to(tl.bfloat16)
     for start in range(lo, hi, BLOCK_N):
         rows = start + tl.arange(0, BLOCK_N)
         active = (rows < hi) & (rows <= qpos)
@@ -316,7 +317,8 @@ def _turboquant_decode_split_kernel(
         k = tl.load(centroids + kc)
         knorm = tl.load(k_norms + meta, active, 0).to(tl.float32)
         k = k * (knorm / tl.maximum(tl.sqrt(tl.sum(k * k, axis=1)), 1.0e-12))[:, None]
-        scores = tl.sum(q[:, None, :] * k[None, :, :], axis=2) * sm_scale
+        # [BLOCK_G, D] x [D, BLOCK_N]: the query group scores the block in one product
+        scores = tl.dot(q, tl.trans(k.to(tl.bfloat16))) * sm_scale
         scores = tl.where(active[None, :], scores, -float("inf"))
         m_new = tl.maximum(m_i, tl.max(scores, axis=1))
         m_safe = tl.where(m_new == -float("inf"), 0.0, m_new)
@@ -324,7 +326,7 @@ def _turboquant_decode_split_kernel(
         p = tl.exp(scores - m_safe[:, None])
         vc = ((tl.load(v_codes + packed, active[:, None], 0).to(tl.uint32) >> shifts[None, :]) & 15).to(tl.float32)
         v = vc * tl.load(v_scales + meta, active, 0).to(tl.float32)[:, None] + tl.load(v_zeros + meta, active, 0).to(tl.float32)[:, None]
-        acc = acc * alpha[:, None] + tl.sum(p[:, :, None] * v[None, :, :], axis=1)
+        acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v.to(tl.bfloat16))
         l_i = l_i * alpha + tl.sum(p, axis=1)
         m_i = m_new
     out_row = (req * KV_HEADS * GROUP + q_heads) * SPLITS + split
@@ -350,7 +352,7 @@ def turboquant_4bit_nc_decode(
     rotation: torch.Tensor,
     sliding_window: int | None = None,
     splits: int | None = None,
-    block_n: int = 32,
+    block_n: int = 16,
 ) -> torch.Tensor:
     """Split-k TurboQuant decode for one query per request (no sinks)."""
     batch, q_heads, dim = q.shape
