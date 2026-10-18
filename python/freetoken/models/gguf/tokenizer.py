@@ -41,7 +41,14 @@ _FLINT_SPLITS = (
     r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
 )
 
-_CUSTOM_SPLITS = {"joyai-llm": _JOYAI_LLM_SPLITS, "flint": _FLINT_SPLITS}
+# laguna (llama.cpp llama_vocab::impl::load) glues one leading symbol to the word after it ("/home", ".yml"); the GPT-2
+# split turns paths and code into token sequences the model never saw
+_LAGUNA_SPLITS = (
+    r"[^\n]+|[\n]+",
+    r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+)
+_CUSTOM_SPLITS = {"joyai-llm": _JOYAI_LLM_SPLITS, "flint": _FLINT_SPLITS, "laguna": _LAGUNA_SPLITS}
 
 
 def _add_bos(meta: dict) -> bool:

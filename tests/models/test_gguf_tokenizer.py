@@ -52,3 +52,21 @@ def test_tokenizer_that_already_resolves_every_control_token_is_unchanged():
     tok = _converted(tokens)
     fixed = _fix_added_tokens(tok, {"tokenizer.ggml.model": "gpt2", "tokenizer.ggml.tokens": tokens, "tokenizer.ggml.token_type": [1, 1, 3]})
     assert fixed is tok
+
+
+def _pre_split(pre: str):
+    """The pre-tokenizer load_gguf_tokenizer builds for a ``_CUSTOM_SPLITS`` type."""
+    from tokenizers import Regex, pre_tokenizers
+
+    from freetoken.models.gguf.tokenizer import _CUSTOM_SPLITS
+
+    seq = pre_tokenizers.Sequence(
+        [pre_tokenizers.Split(Regex(r), behavior="isolated") for r in _CUSTOM_SPLITS[pre]]
+        + [pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False)]
+    )
+    return [piece for piece, _ in seq.pre_tokenize_str("/home/user/ci.yml 12 it's")]
+
+
+def test_laguna_pre_tokenizer_glues_a_leading_symbol_to_the_word():
+    # llama.cpp's laguna split; the GPT-2 default would give "/", "home", ..., ".", "yml"
+    assert _pre_split("laguna") == [_byte_level(p) for p in ["/home", "/user", "/ci", ".yml", " ", "1", "2", " it", "'s"]]
