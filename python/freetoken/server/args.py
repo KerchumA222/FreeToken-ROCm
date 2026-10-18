@@ -484,8 +484,18 @@ def parse_args(
         choices=("model", "q8_0", "turboquant_4bit_nc"),
         default=ServerArgs.kv_cache_dtype,
         help=(
-            "KV storage format; q8_0 and turboquant_4bit_nc are opt-in and currently "
-            "use the Triton FULL-attention path."
+            "KV storage format; q8_0 and turboquant_4bit_nc are opt-in and use the Triton path. "
+            "turboquant_4bit_nc also covers mixed full/SWA models, whose SWA layers keep the model dtype."
+        ),
+    )
+
+    parser.add_argument(
+        "--swa-full-tokens-ratio",
+        type=float,
+        default=ServerArgs.swa_full_tokens_ratio,
+        help=(
+            "Size of the hybrid models' sliding-window KV pool as a fraction of the full-attention pool "
+            "(radix cache). Lower values free memory for context or experts but keep fewer windows for prefix reuse."
         ),
     )
 
