@@ -33,11 +33,13 @@ def _laguna_route(
     top_k: int,
     normalize: bool,
     scale: float,
+    selection_bias: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     scores = logits.float().sigmoid()
-    selected = torch.topk(
-        scores + correction_bias.float(), top_k, dim=-1
-    ).indices
+    selection = scores + correction_bias.float()
+    if selection_bias is not None:
+        selection = selection + selection_bias
+    selected = torch.topk(selection, top_k, dim=-1).indices
     weights = scores.gather(-1, selected)
     if normalize:
         weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
@@ -91,6 +93,8 @@ class LagunaMoE(BaseOP):
         )
 
     def _route(self, hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        from freetoken.moe.route_bias import selection_bias
+
         logits = F.linear(hidden.float(), self.gate.weight.float())
         return _laguna_route(
             logits,
@@ -98,6 +102,7 @@ class LagunaMoE(BaseOP):
             top_k=self.top_k,
             normalize=self.norm_topk_prob,
             scale=self.routed_scaling_factor,
+            selection_bias=selection_bias(self.experts, hidden.shape[0], logits.device),
         )
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:

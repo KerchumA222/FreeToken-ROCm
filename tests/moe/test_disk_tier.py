@@ -247,6 +247,30 @@ def test_host_tier_prefill_stages_misses_without_evicting(expert_gguf):
         tier.close()
 
 
+def test_host_tier_resident_mask_tracks_the_pools(expert_gguf):
+    path, layers = expert_gguf
+    tier = _tier(path, layers, [TOP_K + 1, TOP_K + 1])
+    rng = np.random.default_rng(2)
+
+    def check():
+        for layer in range(layers):
+            for e in range(E):
+                assert bool(tier.resident[layer, e]) == (tier.slot_of(layer, e) >= 0), (layer, e)
+
+    try:
+        check()
+        for step in range(40):
+            for layer in range(layers):
+                experts = rng.choice(E, TOP_K, replace=False).tolist()
+                if step % 5 == 4:
+                    tier.prefill(layer, experts)
+                else:
+                    tier.ensure(layer, experts)
+                check()
+    finally:
+        tier.close()
+
+
 def test_split_host_capacity_follows_layer_counts():
     from freetoken.moe.disk_tier import split_host_capacity
 

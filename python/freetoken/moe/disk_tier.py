@@ -236,6 +236,9 @@ class HostExpertTier:
         ]
         self._lru: list[OrderedDict[int, int]] = [OrderedDict() for _ in layouts]
         self._free: list[list[int]] = [list(range(cap - 1, -1, -1)) for cap in self.capacities]
+        # [layer, expert] -> held in a pool slot; read by the opt-in host-tier routing bias (moe.route_bias)
+        self.resident = torch.zeros(len(self.layer_layout), num_experts, dtype=torch.bool)
+        self._resident_flat = self.resident.view(-1)
         workers = int(os.environ.get("FREETOKEN_DISK_TIER_READ_WORKERS", "8")) if workers is None else workers
         self._pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ft-disk-tier") if workers > 1 else None
         self.hits = self.misses = self.prefill_reads = 0
@@ -297,6 +300,7 @@ class HostExpertTier:
             else:
                 victim = next(f for f, s in lru.items() if s not in protected)
                 slot = lru.pop(victim)
+                self._resident_flat[victim] = False
             protected.add(slot)
             slots[pos] = slot
             jobs += [(layer, experts[pos], k, self.pools[g][k][slot]) for k in range(len(self.bank_names))]
@@ -307,6 +311,7 @@ class HostExpertTier:
             raise
         for pos in missing:
             lru[self._fid(layer, experts[pos])] = slots[pos]
+            self.resident[layer, experts[pos]] = True
         return slots
 
     def prefill(self, layer: int, experts: list[int]) -> tuple[list[tuple[int, int]], list[int]]:
@@ -336,6 +341,7 @@ class HostExpertTier:
         for e, slot in claimed:
             lru[self._fid(layer, e)] = slot
             lru.move_to_end(self._fid(layer, e), last=False)
+            self.resident[layer, e] = True
         self.prefill_reads += len(claimed) + len(staged)
         return hits + claimed, staged
 
