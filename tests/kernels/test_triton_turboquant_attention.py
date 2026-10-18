@@ -185,7 +185,7 @@ def test_turboquant_store_and_attention_match_decoded_reference(flattened_input)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton attention needs CUDA")
-def test_triton_backend_routes_turboquant_cache_to_quantized_attention(monkeypatch):
+def test_triton_backend_routes_turboquant_decode_to_quantized_attention(monkeypatch):
     from types import SimpleNamespace
 
     from freetoken.attention import AttentionSpec
@@ -237,14 +237,14 @@ def test_triton_backend_routes_turboquant_cache_to_quantized_attention(monkeypat
     backend = TritonAttentionBackend(config)
     batch = SimpleNamespace(
         padded_reqs=[
-            SimpleNamespace(extend_len=2, device_len=2, cached_len=0, table_idx=0)
+            SimpleNamespace(extend_len=1, device_len=2, cached_len=1, table_idx=0)
         ],
-        positions=torch.tensor([0, 1], device=device, dtype=torch.int64),
-        out_loc=torch.tensor([0, 1], device=device, dtype=torch.int32),
+        positions=torch.tensor([1], device=device, dtype=torch.int64),
+        out_loc=torch.tensor([1], device=device, dtype=torch.int32),
     )
     backend.prepare_metadata(batch)
-    q = torch.randn(2, q_heads, dim, device=device, dtype=torch.bfloat16)
-    k = torch.randn(2, kv_heads, dim, device=device, dtype=torch.bfloat16)
+    q = torch.randn(1, q_heads, dim, device=device, dtype=torch.bfloat16)
+    k = torch.randn(1, kv_heads, dim, device=device, dtype=torch.bfloat16)
     v = torch.randn_like(k)
     actual = backend.forward(
         q, k, v, layer_id=0, batch=batch, attn_spec=AttentionSpec()
@@ -256,3 +256,85 @@ def test_triton_backend_routes_turboquant_cache_to_quantized_attention(monkeypat
     assert captured["v_cache"].shape == (8, kv_heads, dim // 2)
     assert captured["q_positions"].equal(batch.attn_metadata.q_positions)
     assert captured["rotation"] is pool.rotation
+
+
+def _dense_path_case(monkeypatch, decode_mode, *, decode):
+    from types import SimpleNamespace
+
+    from freetoken.attention import AttentionSpec
+    from freetoken.attention import triton as triton_backend
+    from freetoken.attention.triton import TritonAttentionBackend
+    from freetoken.kernel.triton.turboquant import turboquant_4bit_nc_attention
+    from freetoken.kvcache.mha_pool import MHAKVCache
+
+    _init_tp()
+    torch.manual_seed(7)
+    device = torch.device("cuda")
+    dim, kv_heads, q_heads, ctx_len = 128, 2, 6, 300
+    pool = MHAKVCache(
+        num_kv_heads=kv_heads, num_layers=1, head_dim=dim, num_pages=ctx_len + 8, page_size=1,
+        dtype=torch.bfloat16, device=device, kv_cache_dtype="turboquant_4bit_nc",
+    )
+    # a scrambled page table: the request's slots are not contiguous
+    slots = torch.randperm(ctx_len + 8, device=device)[:ctx_len].to(torch.int32)
+    new = 1 if decode else 37
+    cached = ctx_len - new
+    k_old = torch.randn(cached, kv_heads * dim, device=device, dtype=torch.bfloat16)
+    pool.store_kv(k_old, torch.randn_like(k_old), slots[:cached], layer_id=0)
+    ctx = SimpleNamespace(kv_cache=pool, page_table=slots[None, :])
+    monkeypatch.setattr("freetoken.attention.triton.get_global_ctx", lambda: ctx)
+    monkeypatch.setattr(triton_backend, "_TURBOQUANT_DECODE", decode_mode)
+    config = SimpleNamespace(num_qo_heads=q_heads, head_dim=dim, kv_cache_group_specs=lambda: [SimpleNamespace(head_dim=dim)])
+    backend = TritonAttentionBackend(config)
+    batch = SimpleNamespace(
+        padded_reqs=[SimpleNamespace(extend_len=new, device_len=ctx_len, cached_len=cached, table_idx=0)],
+        positions=torch.arange(cached, ctx_len, device=device, dtype=torch.int64),
+        out_loc=slots[cached:],
+    )
+    backend.prepare_metadata(batch)
+    q = torch.randn(new, q_heads, dim, device=device, dtype=torch.bfloat16)
+    k = torch.randn(new, kv_heads, dim, device=device, dtype=torch.bfloat16)
+    spec = AttentionSpec(sliding_window=None)
+    actual = backend.forward(q, k, torch.randn_like(k), layer_id=0, batch=batch, attn_spec=spec)
+    meta = batch.attn_metadata
+    expected = turboquant_4bit_nc_attention(
+        q=q, k_cache=pool.k_cache(0).view(-1, kv_heads, dim // 2), v_cache=pool.v_cache(0).view(-1, kv_heads, dim // 2),
+        k_norms=pool.k_norm_cache(0), v_scales=pool.v_scale_cache(0), v_zeros=pool.v_zero_cache(0),
+        centroids=pool.turboquant_centroids, indptr=meta.indptr, indices=meta.indices, q_to_req=meta.q_to_req,
+        q_positions=meta.q_positions, sm_scale=dim**-0.5, rotation=pool.turboquant_rotation,
+    )
+    return actual, expected
+
+
+def test_turboquant_prefill_dense_path_matches_the_fused_kernel(monkeypatch):
+    actual, expected = _dense_path_case(monkeypatch, "native", decode=False)
+    # the dense path rounds the decoded K/V and the rotated query to bf16
+    torch.testing.assert_close(actual.float(), expected.float(), atol=2e-2, rtol=2e-2)
+
+
+def test_turboquant_dequant_decode_matches_the_fused_kernel(monkeypatch):
+    actual, expected = _dense_path_case(monkeypatch, "dequant", decode=True)
+    torch.testing.assert_close(actual.float(), expected.float(), atol=2e-2, rtol=2e-2)
+
+
+def test_dequant_returns_the_rotated_keys_and_affine_values():
+    from freetoken.kernel.triton.turboquant import dequant_turboquant_4bit_nc
+
+    device = torch.device("cuda")
+    gen = torch.Generator(device="cpu").manual_seed(3)
+    codes_k = torch.randint(0, 16, (5, 2, 8), generator=gen).to(device)
+    codes_v = torch.randint(0, 16, (5, 2, 8), generator=gen).to(device)
+    k_norms = torch.rand(5, 2, generator=gen).add(0.5).half().to(device)
+    v_scales = torch.rand(5, 2, generator=gen).half().to(device)
+    v_zeros = torch.randn(5, 2, generator=gen).half().to(device)
+    centroids = torch.linspace(-1.5, 1.5, 16).to(device)
+    idx = torch.tensor([4, 0, 2], device=device, dtype=torch.int32)
+    k, v = dequant_turboquant_4bit_nc(
+        k_cache=_pack_nibbles(codes_k), v_cache=_pack_nibbles(codes_v), k_norms=k_norms, v_scales=v_scales,
+        v_zeros=v_zeros, centroids=centroids, indices=idx, dtype=torch.float32,
+    )
+    ck = centroids[codes_k[idx.long()]]
+    ref_k = ck / ck.norm(dim=-1, keepdim=True) * k_norms[idx.long()].float()[..., None]
+    ref_v = codes_v[idx.long()].float() * v_scales[idx.long()].float()[..., None] + v_zeros[idx.long()].float()[..., None]
+    torch.testing.assert_close(k, ref_k)
+    torch.testing.assert_close(v, ref_v)

@@ -193,6 +193,73 @@ def _turboquant_attention_kernel(
     tl.store(o_ptr + q_tok * stride_ot + q_head * stride_oh + d, out, mask_d)
 
 
+@triton.jit
+def _dequant_turboquant_kernel(
+    k_codes,
+    v_codes,
+    k_norms,
+    v_scales,
+    v_zeros,
+    centroids,
+    indices,
+    k_out,
+    v_out,
+    HEADS: tl.constexpr,
+    D: tl.constexpr,
+    HALF_D: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    row = tl.program_id(0)
+    head = tl.program_id(1)
+    d = tl.arange(0, BLOCK_D)
+    mask = d < D
+    slot = tl.load(indices + row).to(tl.int64)
+    shifts = ((d % 2) * 4).to(tl.uint32)
+    packed = slot * HEADS * HALF_D + head * HALF_D + d // 2
+    meta = slot * HEADS + head
+    kc = ((tl.load(k_codes + packed, mask, 0).to(tl.uint32) >> shifts) & 15).to(tl.int32)
+    k = tl.load(centroids + kc, mask, 0).to(tl.float32)
+    # norm correction: the codebook vector is renormalized, then scaled by the stored K norm
+    k = k / tl.maximum(tl.sqrt(tl.sum(k * k, axis=0)), 1.0e-12) * tl.load(k_norms + meta).to(tl.float32)
+    vc = ((tl.load(v_codes + packed, mask, 0).to(tl.uint32) >> shifts) & 15).to(tl.float32)
+    v = vc * tl.load(v_scales + meta).to(tl.float32) + tl.load(v_zeros + meta).to(tl.float32)
+    out = row * HEADS * D + head * D + d
+    tl.store(k_out + out, k.to(k_out.dtype.element_ty), mask)
+    tl.store(v_out + out, v.to(v_out.dtype.element_ty), mask)
+
+
+def dequant_turboquant_4bit_nc(
+    *,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    k_norms: torch.Tensor,
+    v_scales: torch.Tensor,
+    v_zeros: torch.Tensor,
+    centroids: torch.Tensor,
+    indices: torch.Tensor,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Decode the slots ``indices`` into dense ``[len(indices), heads, head_dim]`` K and V.
+
+    K comes back in the rotated basis the codes live in (pair it with ``q @ rotation.T``); V is in the model basis.
+    """
+    slots, heads, half_dim = k_cache.shape
+    dim = half_dim * 2
+    if v_cache.shape != k_cache.shape or k_cache.dtype != torch.uint8:
+        raise ValueError("TurboQuant K/V code caches must share uint8 [slots, heads, head_dim // 2] storage")
+    if any(t.shape != (slots, heads) for t in (k_norms, v_scales, v_zeros)):
+        raise ValueError(f"TurboQuant metadata must have shape {(slots, heads)}")
+    rows = indices.numel()
+    k = torch.empty((rows, heads, dim), device=k_cache.device, dtype=dtype)
+    v = torch.empty_like(k)
+    if rows:
+        _dequant_turboquant_kernel[(rows, heads)](
+            k_cache, v_cache, k_norms, v_scales, v_zeros, centroids, indices.contiguous(), k, v,
+            HEADS=heads, D=dim, HALF_D=half_dim, BLOCK_D=triton.next_power_of_2(dim), num_warps=1,
+        )
+    return k, v
+
+
 def hadamard_rotation(head_dim: int, device: torch.device) -> torch.Tensor:
     if head_dim < 2 or head_dim & (head_dim - 1):
         raise ValueError(f"TurboQuant requires an even power-of-two head_dim, got {head_dim}")
@@ -422,6 +489,7 @@ def turboquant_4bit_nc_attention(
 
 
 __all__ = [
+    "dequant_turboquant_4bit_nc",
     "gaussian_centroids",
     "hadamard_rotation",
     "store_turboquant_4bit_nc_cache",
