@@ -52,3 +52,29 @@ def test_tokenizer_that_already_resolves_every_control_token_is_unchanged():
     tok = _converted(tokens)
     fixed = _pin_control_tokens(tok, {"tokenizer.ggml.tokens": tokens, "tokenizer.ggml.token_type": [1, 1, 3]})
     assert fixed is tok
+
+
+def _pre_split(meta):
+    from freetoken.models.gguf.tokenizer import _set_pre_tokenizer
+
+    tok = _converted(["a"])
+    _set_pre_tokenizer(tok, meta)
+    return [piece for piece, _ in tok.pre_tokenizer.pre_tokenize_str("/home/user/ci.yml 12 it's")]
+
+
+def test_laguna_pre_tokenizer_glues_a_leading_symbol_to_the_word():
+    # llama.cpp's laguna split; the GPT-2 default would give "/", "home", ..., ".", "yml"
+    pieces = _pre_split({"tokenizer.ggml.pre": "laguna"})
+    assert pieces == [_byte_level(p) for p in ["/home", "/user", "/ci", ".yml", " ", "1", "2", " it", "'s"]]
+
+
+def test_unknown_pre_type_keeps_the_converter_pre_tokenizer():
+    from tokenizers import pre_tokenizers
+
+    tok = _converted(["a"])
+    before = tok.pre_tokenizer.pre_tokenize_str("/home/user")
+    from freetoken.models.gguf.tokenizer import _set_pre_tokenizer
+
+    _set_pre_tokenizer(tok, {"tokenizer.ggml.pre": "qwen2"})
+    assert tok.pre_tokenizer.pre_tokenize_str("/home/user") == before
+    assert isinstance(tok.pre_tokenizer, pre_tokenizers.ByteLevel)

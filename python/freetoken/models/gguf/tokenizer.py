@@ -24,6 +24,7 @@ def load_gguf_tokenizer(model_path: str):
     fast, _ = convert_gguf_tokenizer(arch, tok_dict)
     meta = load_gguf_metadata(model_path)
     fast = _pin_control_tokens(fast, meta)
+    _set_pre_tokenizer(fast, meta)
     # special: bos/eos/unk/pad as the file names them (None when absent) and the chat template
     return PreTrainedTokenizerFast(
         tokenizer_object=fast,
@@ -31,6 +32,30 @@ def load_gguf_tokenizer(model_path: str):
         add_bos_token=bool(meta.get("tokenizer.ggml.add_bos_token")),
         add_eos_token=bool(meta.get("tokenizer.ggml.add_eos_token")),
     )
+
+
+# llama.cpp's pre-tokenizer regexes (llama_vocab::impl::load in src/llama-vocab.cpp), applied in order, for the
+# tokenizer.ggml.pre types the converter's GPT-2 split gets wrong: laguna glues one leading symbol to the word after it
+# ("/home", ".yml"), so the GPT-2 split turns paths and code into token sequences the model never saw
+_PRE_TOKENIZER_REGEXES = {
+    "laguna": (
+        r"[^\n]+|[\n]+",
+        r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}"
+        r"| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+    ),
+}
+
+
+def _set_pre_tokenizer(fast, meta) -> None:
+    regexes = _PRE_TOKENIZER_REGEXES.get(meta.get("tokenizer.ggml.pre"))
+    if regexes is None:
+        return
+    from tokenizers import Regex, pre_tokenizers
+
+    fast.pre_tokenizer = pre_tokenizers.Sequence([
+        *(pre_tokenizers.Split(Regex(r), behavior="isolated") for r in regexes),
+        pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False),
+    ])
 
 
 _CONTROL, _USER_DEFINED = 3, 4  # llama.cpp token types
