@@ -519,3 +519,34 @@ def test_laguna_router_selection_bias_does_not_change_selected_weights():
     expected = logits.sigmoid().gather(-1, ids.long())
     expected = expected / expected.sum(dim=-1, keepdim=True) * 2.5
     torch.testing.assert_close(weights, expected)
+
+
+def test_laguna_router_cache_bias_moves_selection_but_not_weights(monkeypatch):
+    from freetoken.models.laguna.model import LagunaMoE
+    from freetoken.moe import route_bias
+
+    hidden = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+    moe = SimpleNamespace(
+        top_k=2,
+        norm_topk_prob=True,
+        routed_scaling_factor=2.5,
+        gate=SimpleNamespace(weight=torch.tensor([[2.0, 0.0], [1.0, 0.5], [0.9, 1.0], [-1.0, 2.0]])),
+        e_score_correction_bias=torch.zeros(4),
+        experts=SimpleNamespace(
+            layer_id=0,
+            offload_cache=SimpleNamespace(slot_for_id=torch.tensor([[-1, -1, 5, 7]], dtype=torch.int32)),
+        ),
+    )
+    scores = (hidden @ moe.gate.weight.t()).sigmoid()
+
+    monkeypatch.setattr(route_bias, "_ROUTE_BIAS", 0.0)
+    monkeypatch.setattr(route_bias, "_HOST_BIAS", 0.0)
+    _, plain = LagunaMoE._route(moe, hidden)
+    assert [sorted(r) for r in plain.tolist()] == [[0, 1], [2, 3]]
+
+    monkeypatch.setattr(route_bias, "_ROUTE_BIAS", 0.2)
+    weights, ids = LagunaMoE._route(moe, hidden)
+    # row 0: resident 2 overtakes 1 (0.711 + 0.2 > 0.731); row 1 already picks residents
+    assert [sorted(r) for r in ids.tolist()] == [[0, 2], [2, 3]]
+    expected = scores.gather(-1, ids.long())
+    torch.testing.assert_close(weights, expected / expected.sum(-1, keepdim=True) * 2.5)

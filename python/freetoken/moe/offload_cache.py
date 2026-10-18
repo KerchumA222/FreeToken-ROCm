@@ -272,6 +272,9 @@ class OffloadMoeCache:
         # must be enabled before capture — see engine graph setup). The only graph artifact
         # is a one-off warm-up increment at capture time (<0.1% over a session).
         self.collect_stats = False
+        # FT_MOE_STATS_EVERY=N logs the decode hit rates every N steps (turns collect_stats on); 0 = off
+        self.stats_every = int(os.environ.get("FT_MOE_STATS_EVERY", "0") or 0)
+        self._stats_steps = 0
         # [num_layers, N_STATS] -- ensure_experts passes lru_stats[layer_id] straight to
         # the kernel, which accumulates in the same launch. The stat_* tensors below are
         # the hybrid path's: views of one buffer its kernel accumulates into the same way.
@@ -346,6 +349,7 @@ class OffloadMoeCache:
         self.prefill_total_rows = 0
         # disk tier (attach_disk_tier): a bounded pinned host cache over the checkpoint files stands in for the complete host banks
         self.host_tier = None
+        self._tier_seen = (0, 0)
         self._disk_tier_args: tuple | None = None
         self._slice_pools()
 
@@ -1116,6 +1120,23 @@ class OffloadMoeCache:
         ensure_experts(self, layer_id, expert_ids)
         if self.host_tier is not None:
             self._admit_from_disk(layer_id)
+        if self.stats_every and layer_id == 0:
+            self._stats_steps += 1
+            if self._stats_steps % self.stats_every == 0:
+                self._log_decode_stats()
+
+    def _log_decode_stats(self) -> None:
+        """Log and reset the decode hit rates of the last ``stats_every`` steps (``FT_MOE_STATS_EVERY``)."""
+        stats = self.decode_miss_stats()
+        line = f"MoE decode stats over {self.stats_every} steps: GPU miss rate {stats['miss_rate']:.3f} ({stats['missing_per_layer']:.2f}/{stats['active_per_layer']:.2f} per layer)"
+        tier = self.host_tier
+        if tier is not None:
+            seen = tier.hits + tier.misses - self._tier_seen[0]
+            missed = tier.misses - self._tier_seen[1]
+            line += f", host tier miss rate {(missed / seen) if seen else 0.0:.3f} ({missed} disk reads)"
+            self._tier_seen = (tier.hits + tier.misses, tier.misses)
+        logger.info(line)
+        self.reset_stats()
 
     def _admit_from_disk(self, layer_id: int) -> None:
         """Make the GPU misses ``ensure_experts`` staged resident in the host tier and point ``src_indices`` at their pool slots.

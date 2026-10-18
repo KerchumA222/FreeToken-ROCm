@@ -960,7 +960,7 @@ class Engine:
         cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
         # Must be set before CUDA graph capture so the (device-side) accumulation ops are
         # captured and re-run on every decode replay.
-        cache.collect_stats = config.moe_collect_stats
+        cache.collect_stats = config.moe_collect_stats or cache.stats_every > 0
         layers = attach_offload_moe_cache(self.model, cache)
         assert len(layers) == config.model_config.num_moe_layers
         if head_layers:
