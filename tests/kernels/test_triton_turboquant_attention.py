@@ -188,6 +188,8 @@ def test_turboquant_store_and_attention_match_decoded_reference(flattened_input)
 def test_triton_backend_routes_turboquant_decode_to_quantized_attention(monkeypatch):
     from types import SimpleNamespace
 
+    monkeypatch.setattr("freetoken.attention.triton._TURBOQUANT_DECODE", "native")
+
     from freetoken.attention import AttentionSpec
     from freetoken.attention.triton import TritonAttentionBackend
 
@@ -338,3 +340,35 @@ def test_dequant_returns_the_rotated_keys_and_affine_values():
     ref_v = codes_v[idx.long()].float() * v_scales[idx.long()].float()[..., None] + v_zeros[idx.long()].float()[..., None]
     torch.testing.assert_close(k, ref_k)
     torch.testing.assert_close(v, ref_v)
+
+
+def test_turboquant_split_decode_matches_the_fused_kernel(monkeypatch):
+    actual, expected = _dense_path_case(monkeypatch, "split", decode=True)
+    torch.testing.assert_close(actual.float(), expected.float(), atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("splits", [1, 3, 64])
+def test_turboquant_split_decode_is_independent_of_the_split_count(splits):
+    from freetoken.kernel.triton.turboquant import turboquant_4bit_nc_attention, turboquant_4bit_nc_decode
+    from freetoken.kvcache.mha_pool import MHAKVCache
+
+    _init_tp()
+    torch.manual_seed(11)
+    device = torch.device("cuda")
+    dim, kv_heads, q_heads, lens = 128, 2, 6, [50, 130]
+    pool = MHAKVCache(num_kv_heads=kv_heads, num_layers=1, head_dim=dim, num_pages=200, page_size=1,
+                      dtype=torch.bfloat16, device=device, kv_cache_dtype="turboquant_4bit_nc")
+    total = sum(lens)
+    slots = torch.randperm(200, device=device)[:total].to(torch.int32)
+    k = torch.randn(total, kv_heads * dim, device=device, dtype=torch.bfloat16)
+    pool.store_kv(k, torch.randn_like(k), slots, layer_id=0)
+    indptr = torch.tensor([0, lens[0], total], device=device, dtype=torch.int32)
+    q_pos = torch.tensor([lens[0] - 1, lens[1] - 1], device=device, dtype=torch.int64)
+    q = torch.randn(2, q_heads, dim, device=device, dtype=torch.bfloat16)
+    args = dict(q=q, k_cache=pool.k_cache(0).view(-1, kv_heads, dim // 2), v_cache=pool.v_cache(0).view(-1, kv_heads, dim // 2),
+                k_norms=pool.k_norm_cache(0), v_scales=pool.v_scale_cache(0), v_zeros=pool.v_zero_cache(0),
+                centroids=pool.turboquant_centroids, indptr=indptr, indices=slots, q_positions=q_pos,
+                sm_scale=dim**-0.5, rotation=pool.turboquant_rotation, sliding_window=40)
+    actual = turboquant_4bit_nc_decode(**args, splits=splits)
+    expected = turboquant_4bit_nc_attention(**args, q_to_req=torch.arange(2, device=device, dtype=torch.int32))
+    torch.testing.assert_close(actual.float(), expected.float(), atol=1e-2, rtol=1e-2)

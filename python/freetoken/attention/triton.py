@@ -66,9 +66,10 @@ class TritonMetadata(BaseAttnMetadata):
         return self.cu_seqlens_q_gpu[1 : 1 + bs] - 1
 
 
-# TurboQuant decode: "native" runs the fused code-reading kernel; "dequant" decodes the context into dense
-# scratch each step and runs the split-k decode kernel. Prefill always takes the dense path.
-_TURBOQUANT_DECODE = os.environ.get("FT_TURBOQUANT_DECODE", "native")
+# TurboQuant decode: "split" (default) reads the codes in a split-k kernel that serves a KV head's query group at
+# once; "native" runs the per-(query, head) fused kernel; "dequant" decodes the context into dense scratch each step
+# and runs the dense split-k kernel. Prefill always takes the dense path.
+_TURBOQUANT_DECODE = os.environ.get("FT_TURBOQUANT_DECODE", "split")
 
 
 class TritonAttentionBackend(BaseAttnBackend):
@@ -178,6 +179,15 @@ class TritonAttentionBackend(BaseAttnBackend):
                 and rotation is not None
                 and centroids is not None
             )
+            if metadata.is_decode and _TURBOQUANT_DECODE == "split" and spec.sinks is None and block_ends is None:
+                from freetoken.kernel.triton.turboquant import turboquant_4bit_nc_decode
+
+                return turboquant_4bit_nc_decode(
+                    q=q, k_cache=k_raw.view(-1, kv_heads, head_dim // 2), v_cache=v_raw.view(-1, kv_heads, head_dim // 2),
+                    k_norms=k_norms, v_scales=v_scales, v_zeros=v_zeros, centroids=centroids, indptr=metadata.indptr,
+                    indices=indices, q_positions=metadata.q_positions, sm_scale=scale, rotation=rotation,
+                    sliding_window=spec.sliding_window,
+                )
             if not metadata.is_decode or _TURBOQUANT_DECODE == "dequant":
                 return self._turboquant_dense_attention(
                     q, k_raw.view(-1, kv_heads, head_dim // 2), v_raw.view(-1, kv_heads, head_dim // 2),
