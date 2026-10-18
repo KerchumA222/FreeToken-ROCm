@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List
 
@@ -63,6 +64,11 @@ class TritonMetadata(BaseAttnMetadata):
 
     def get_last_indices(self, bs: int) -> torch.Tensor:
         return self.cu_seqlens_q_gpu[1 : 1 + bs] - 1
+
+
+# TurboQuant decode: "native" runs the fused code-reading kernel; "dequant" decodes the context into dense
+# scratch each step and runs the split-k decode kernel. Prefill always takes the dense path.
+_TURBOQUANT_DECODE = os.environ.get("FT_TURBOQUANT_DECODE", "native")
 
 
 class TritonAttentionBackend(BaseAttnBackend):
@@ -172,6 +178,11 @@ class TritonAttentionBackend(BaseAttnBackend):
                 and rotation is not None
                 and centroids is not None
             )
+            if not metadata.is_decode or _TURBOQUANT_DECODE == "dequant":
+                return self._turboquant_dense_attention(
+                    q, k_raw.view(-1, kv_heads, head_dim // 2), v_raw.view(-1, kv_heads, head_dim // 2),
+                    k_norms, v_scales, v_zeros, centroids, rotation, metadata, indices, spec, scale, block_ends,
+                )
             return turboquant_4bit_nc_attention(
                 q=q,
                 k_cache=k_raw.view(-1, kv_heads, head_dim // 2),
@@ -248,6 +259,35 @@ class TritonAttentionBackend(BaseAttnBackend):
             sinks=spec.sinks,
             k_scale_cache=k_scale_cache,
             v_scale_cache=v_scale_cache,
+        )
+
+    def _turboquant_dense_attention(
+        self, q, k_codes, v_codes, k_norms, v_scales, v_zeros, centroids, rotation, metadata, indices, spec, scale, block_ends
+    ) -> torch.Tensor:
+        """TurboQuant through the dense kernels: decode the request's slots once per layer, then run the tiled
+        extend (or split-k decode) kernel on the rotated query. Scores are unchanged by the rotation (orthogonal)."""
+        from freetoken.kernel.triton.attention import decode_paged_attention, extend_paged_attention
+        from freetoken.kernel.triton.turboquant import dequant_turboquant_4bit_nc
+
+        k_dense, v_dense = dequant_turboquant_4bit_nc(
+            k_cache=k_codes, v_cache=v_codes, k_norms=k_norms, v_scales=v_scales, v_zeros=v_zeros,
+            centroids=centroids, indices=indices, dtype=q.dtype,
+        )
+        q_rot = torch.matmul(q.float(), rotation.T).to(q.dtype)
+        rows = torch.arange(indices.numel(), device=indices.device, dtype=torch.int32)
+        if metadata.is_decode:
+            bs = metadata.indptr.numel() - 1
+            self._ensure_decode_scratch(metadata, bs, q.shape[1], q.shape[-1])
+            return decode_paged_attention(
+                q=q_rot, k_cache=k_dense, v_cache=v_dense, indptr=metadata.indptr, indices=rows,
+                q_positions=metadata.q_positions, attn_logits=metadata.attn_logits[:bs], attn_lse=metadata.attn_lse[:bs],
+                num_kv_splits=metadata.num_kv_splits[:bs], max_kv_splits=self.max_kv_splits, sm_scale=scale,
+                sliding_window=spec.sliding_window, sinks=spec.sinks,
+            )
+        return extend_paged_attention(
+            q=q_rot, k_cache=k_dense, v_cache=v_dense, qo_indptr=metadata.cu_seqlens_q_gpu, kv_indptr=metadata.indptr,
+            kv_indices=rows, prefix_lens=metadata.prefix_lens, max_q_len=metadata.max_q_len, sm_scale=scale,
+            sliding_window=spec.sliding_window, sinks=spec.sinks, block_ends=block_ends,
         )
 
     def prepare_metadata(self, batch: Batch) -> None:
