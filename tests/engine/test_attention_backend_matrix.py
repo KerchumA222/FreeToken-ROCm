@@ -179,8 +179,17 @@ def test_turboquant_requires_triton_and_supported_full_attention(monkeypatch):
     config = _config(
         "linear_hybrid", kv_cache_dtype="turboquant_4bit_nc", attention_backend="auto"
     )
-    with pytest.raises(ValueError, match="ordinary FULL attention only"):
+    with pytest.raises(ValueError, match="FULL attention, optionally mixed with SWA"):
         _adjust_config(config)
+
+
+def test_turboquant_accepts_mixed_full_and_swa_attention(monkeypatch):
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_env(monkeypatch)
+    config = _config("swa", kv_cache_dtype="turboquant_4bit_nc", attention_backend="auto")
+    _adjust_config(config)
+    assert config.attention_backend == "triton"
 
 
 def test_turboquant_rejects_non_power_of_two_head_dim(monkeypatch):

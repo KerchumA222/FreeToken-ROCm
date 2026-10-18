@@ -34,7 +34,7 @@ def spec_kv_bytes_per_token(spec, config) -> int:
             * local_kv_heads
             * spec.num_layers
         )
-    elif kv_cache_dtype == "turboquant_4bit_nc":
+    elif kv_cache_dtype == "turboquant_4bit_nc" and not spec.is_swa:  # hybrid pools keep SWA groups in the model dtype
         # Packed K/V codes use one byte per dimension in total; each head also stores
         # an fp16 K norm, V scale, and V zero point.
         per_token = (spec.head_dim + 6) * local_kv_heads * spec.num_layers
