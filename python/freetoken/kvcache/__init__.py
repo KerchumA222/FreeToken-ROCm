@@ -93,12 +93,14 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
     if kv_cache_dtype not in ("model", "q8_0", "turboquant_4bit_nc"):
         raise ValueError(f"unsupported KV cache dtype {kv_cache_dtype!r}")
     if kv_cache_dtype in ("q8_0", "turboquant_4bit_nc"):
+        from .hybrid_swa_pool import HybridSWAKVCache
         from .mha_pool import MHAKVCache
 
+        allowed = (MHAKVCache, HybridSWAKVCache) if kv_cache_dtype == "turboquant_4bit_nc" else (MHAKVCache,)
         if (
-            model_config.has_swa_attention
+            (model_config.has_swa_attention and kv_cache_dtype != "turboquant_4bit_nc")
             or model_config.has_linear_attention
-            or resolve_pool_class(model_config) is not MHAKVCache
+            or resolve_pool_class(model_config) not in allowed
         ):
             raise ValueError(
                 f"{kv_cache_dtype} KV cache currently supports ordinary FULL attention only"
@@ -167,7 +169,8 @@ def create_kvcache_pool(
     if kv_cache_dtype not in ("model", "q8_0", "turboquant_4bit_nc"):
         raise ValueError(f"unsupported KV cache dtype {kv_cache_dtype!r}")
     if kv_cache_dtype in ("q8_0", "turboquant_4bit_nc") and (
-        model_config.has_swa_attention or model_config.has_linear_attention
+        (model_config.has_swa_attention and kv_cache_dtype != "turboquant_4bit_nc")
+        or model_config.has_linear_attention
     ):
         raise ValueError(
             f"{kv_cache_dtype} KV cache currently supports ordinary FULL attention only"
@@ -183,6 +186,7 @@ def create_kvcache_pool(
             num_swa_tokens=num_swa_tokens,
             device=device,
             dtype=dtype,
+            kv_cache_dtype=kv_cache_dtype,
         )
 
     from .mha_pool import MHAKVCache

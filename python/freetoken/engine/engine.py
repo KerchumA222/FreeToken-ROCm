@@ -1958,16 +1958,19 @@ def _adjust_config(config: EngineConfig):
     elif kv_cache_dtype == "turboquant_4bit_nc":
         if config.dtype not in (torch.float16, torch.bfloat16):
             raise ValueError("TurboQuant KV cache requires float16 or bfloat16 model compute")
+        # FULL, or FULL + SWA through the hybrid pool (its SWA group keeps the model dtype)
         if (
-            required_attn_types != frozenset({AttnType.FULL})
+            AttnType.FULL not in required_attn_types
+            or not required_attn_types <= {AttnType.FULL, AttnType.SWA}
             or getattr(model_config, "has_linear_attention", False)
         ):
-            raise ValueError("TurboQuant KV cache currently supports ordinary FULL attention only")
+            raise ValueError("TurboQuant KV cache currently supports FULL attention, optionally mixed with SWA, only")
+        from freetoken.kvcache.hybrid_swa_pool import HybridSWAKVCache
         from freetoken.kvcache.mha_pool import MHAKVCache
 
-        if resolve_pool_class(model_config) is not MHAKVCache:
-            raise ValueError("TurboQuant KV cache currently supports the MHA cache pool only")
-        specs = [spec for spec in model_config.kv_cache_group_specs() if spec.num_layers]
+        if resolve_pool_class(model_config) not in (MHAKVCache, HybridSWAKVCache):
+            raise ValueError("TurboQuant KV cache currently supports the MHA and hybrid SWA cache pools only")
+        specs = [spec for spec in model_config.kv_cache_group_specs() if spec.num_layers and not spec.is_swa]
         if len(specs) != 1:
             raise ValueError("TurboQuant currently requires one uniform FULL-attention KV group")
         head_dim = specs[0].head_dim

@@ -151,7 +151,9 @@ class TritonAttentionBackend(BaseAttnBackend):
 
         k_raw = self.kvcache.k_cache(layer_id)
         v_raw = self.kvcache.v_cache(layer_id)
-        kv_dtype = getattr(self.kvcache, "kv_cache_dtype", "model")
+        # hybrid pools store each group in its own format (TurboQuant full layers, model-dtype SWA layers)
+        layer_kv_dtype = getattr(self.kvcache, "layer_kv_cache_dtype", None)
+        kv_dtype = layer_kv_dtype(layer_id) if layer_kv_dtype is not None else getattr(self.kvcache, "kv_cache_dtype", "model")
         q8_0 = kv_dtype == "q8_0"
         k_scale_cache = self.kvcache.k_scale_cache(layer_id) if q8_0 else None
         v_scale_cache = self.kvcache.v_scale_cache(layer_id) if q8_0 else None
@@ -170,7 +172,7 @@ class TritonAttentionBackend(BaseAttnBackend):
         if spec.sliding_window is not None and metadata.swa_indices is not None:
             indices = metadata.swa_indices
         scale = spec.sm_scale if spec.sm_scale is not None else q.shape[-1] ** -0.5
-        if getattr(self.kvcache, "kv_cache_dtype", "model") == "turboquant_4bit_nc":
+        if kv_dtype == "turboquant_4bit_nc":
             from freetoken.kernel.triton.turboquant import turboquant_4bit_nc_attention
 
             k_norms = self.kvcache.k_norm_cache(layer_id)
