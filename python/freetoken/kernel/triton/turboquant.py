@@ -260,6 +260,124 @@ def dequant_turboquant_4bit_nc(
     return k, v
 
 
+@triton.jit
+def _turboquant_decode_split_kernel(
+    q_ptr,
+    k_codes,
+    v_codes,
+    k_norms,
+    v_scales,
+    v_zeros,
+    centroids,
+    indptr,
+    indices,
+    q_pos,
+    part_o,
+    part_lse,
+    sm_scale,
+    KV_HEADS: tl.constexpr,
+    GROUP: tl.constexpr,
+    BLOCK_G: tl.constexpr,
+    D: tl.constexpr,
+    HALF_D: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    SPLITS: tl.constexpr,
+    SLIDING_WINDOW: tl.constexpr,
+):
+    """One program per (request, KV head, context split): the GROUP query heads of a KV head read its codes once."""
+    req = tl.program_id(0)
+    kv_head = tl.program_id(1)
+    split = tl.program_id(2)
+    kv_start = tl.load(indptr + req)
+    kv_len = tl.load(indptr + req + 1) - kv_start
+    qpos = tl.load(q_pos + req)
+    per_split = tl.cdiv(kv_len, SPLITS)
+    lo = split * per_split
+    hi = tl.minimum(lo + per_split, kv_len)
+    g = tl.arange(0, BLOCK_G)
+    d = tl.arange(0, D)
+    q_heads = kv_head * GROUP + g
+    mask_g = g < GROUP
+    q = tl.load(q_ptr + (req * KV_HEADS * GROUP + q_heads)[:, None] * D + d[None, :], mask=mask_g[:, None], other=0.0)
+    q = q.to(tl.float32)
+    shifts = ((d % 2) * 4).to(tl.uint32)
+    m_i = tl.full((BLOCK_G,), -float("inf"), tl.float32)
+    l_i = tl.zeros((BLOCK_G,), tl.float32)
+    acc = tl.zeros((BLOCK_G, D), tl.float32)
+    for start in range(lo, hi, BLOCK_N):
+        rows = start + tl.arange(0, BLOCK_N)
+        active = (rows < hi) & (rows <= qpos)
+        if SLIDING_WINDOW > 0:
+            active = active & (rows + SLIDING_WINDOW > qpos)
+        slots = tl.load(indices + kv_start + rows, active, 0).to(tl.int64)
+        packed = (slots * KV_HEADS + kv_head)[:, None] * HALF_D + d[None, :] // 2
+        meta = slots * KV_HEADS + kv_head
+        kc = ((tl.load(k_codes + packed, active[:, None], 0).to(tl.uint32) >> shifts[None, :]) & 15).to(tl.int32)
+        k = tl.load(centroids + kc)
+        knorm = tl.load(k_norms + meta, active, 0).to(tl.float32)
+        k = k * (knorm / tl.maximum(tl.sqrt(tl.sum(k * k, axis=1)), 1.0e-12))[:, None]
+        scores = tl.sum(q[:, None, :] * k[None, :, :], axis=2) * sm_scale
+        scores = tl.where(active[None, :], scores, -float("inf"))
+        m_new = tl.maximum(m_i, tl.max(scores, axis=1))
+        m_safe = tl.where(m_new == -float("inf"), 0.0, m_new)
+        alpha = tl.exp(m_i - m_safe)
+        p = tl.exp(scores - m_safe[:, None])
+        vc = ((tl.load(v_codes + packed, active[:, None], 0).to(tl.uint32) >> shifts[None, :]) & 15).to(tl.float32)
+        v = vc * tl.load(v_scales + meta, active, 0).to(tl.float32)[:, None] + tl.load(v_zeros + meta, active, 0).to(tl.float32)[:, None]
+        acc = acc * alpha[:, None] + tl.sum(p[:, :, None] * v[None, :, :], axis=1)
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        m_i = m_new
+    out_row = (req * KV_HEADS * GROUP + q_heads) * SPLITS + split
+    tl.store(part_o + out_row[:, None] * D + d[None, :], acc / tl.maximum(l_i, 1.0e-30)[:, None], mask=mask_g[:, None])
+    # an empty split carries -inf and drops out of the combine
+    lse = tl.where(l_i > 0, m_i + tl.log(tl.maximum(l_i, 1.0e-30)), -float("inf"))
+    tl.store(part_lse + out_row, lse, mask=mask_g)
+
+
+def turboquant_4bit_nc_decode(
+    *,
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    k_norms: torch.Tensor,
+    v_scales: torch.Tensor,
+    v_zeros: torch.Tensor,
+    centroids: torch.Tensor,
+    indptr: torch.Tensor,
+    indices: torch.Tensor,
+    q_positions: torch.Tensor,
+    sm_scale: float,
+    rotation: torch.Tensor,
+    sliding_window: int | None = None,
+    splits: int | None = None,
+    block_n: int = 32,
+) -> torch.Tensor:
+    """Split-k TurboQuant decode for one query per request (no sinks)."""
+    batch, q_heads, dim = q.shape
+    kv_heads = k_cache.shape[1]
+    if indptr.numel() != batch + 1 or q_positions.numel() != batch:
+        raise ValueError("TurboQuant decode expects one query per request")
+    if q_heads % kv_heads or k_cache.shape[-1] * 2 != dim or dim & (dim - 1):
+        raise ValueError("TurboQuant decode needs grouped heads and a packed power-of-two head_dim")
+    if splits is None:
+        # the host knows the total context without a sync; aim for ~1k keys per split
+        splits = max(1, min(64, indices.numel() // max(batch, 1) // 1024))
+    group = q_heads // kv_heads
+    q_rot = torch.matmul(q.float(), rotation.T).contiguous()
+    part_o = torch.empty((batch, q_heads, splits, dim), device=q.device, dtype=torch.float32)
+    part_lse = torch.empty((batch, q_heads, splits), device=q.device, dtype=torch.float32)
+    _turboquant_decode_split_kernel[(batch, kv_heads, splits)](
+        q_rot, k_cache, v_cache, k_norms, v_scales, v_zeros, centroids, indptr, indices.contiguous(),
+        q_positions.contiguous(), part_o, part_lse, sm_scale,
+        KV_HEADS=kv_heads, GROUP=group, BLOCK_G=triton.next_power_of_2(group), D=dim, HALF_D=dim // 2,
+        BLOCK_N=block_n, SPLITS=splits, SLIDING_WINDOW=sliding_window or 0, num_warps=4,
+    )
+    lse_max = part_lse.amax(dim=-1, keepdim=True)
+    weights = torch.exp(part_lse - torch.where(torch.isinf(lse_max), 0.0, lse_max))
+    out = (part_o * weights.unsqueeze(-1)).sum(dim=2) / weights.sum(dim=-1, keepdim=True).clamp_min(1.0e-30)
+    return out.to(q.dtype)
+
+
 def hadamard_rotation(head_dim: int, device: torch.device) -> torch.Tensor:
     if head_dim < 2 or head_dim & (head_dim - 1):
         raise ValueError(f"TurboQuant requires an even power-of-two head_dim, got {head_dim}")
@@ -490,6 +608,7 @@ def turboquant_4bit_nc_attention(
 
 __all__ = [
     "dequant_turboquant_4bit_nc",
+    "turboquant_4bit_nc_decode",
     "gaussian_centroids",
     "hadamard_rotation",
     "store_turboquant_4bit_nc_cache",
