@@ -395,7 +395,7 @@ def test_disk_tier_config_turns_off_graphs_and_prefill_overlap(expert_gguf):
             _adjust_disk_tier_config(bad, override(bad))
 
 
-_QWEN36 = os.path.expanduser("~/models/Qwen3.6-35B-A3B/Qwen3.6-35B-A3B-Q4_0exp.gguf")
+_QWEN36 = os.path.expanduser("~/models/Qwen3.6-35B-A3B-MTP-GGUF/Qwen3.6-35B-A3B-MTP-Q4exp.gguf")
 
 _RUN = r"""
 import json, sys, torch
