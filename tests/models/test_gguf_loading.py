@@ -168,7 +168,7 @@ def _model(pattern: str) -> str:
 
 _QWEN36 = os.environ.get(
     "FT_GGUF_QWEN36",
-    "Qwen3.6-35B-A3B-MTP-GGUF/Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf",
+    "Qwen3.6-35B-A3B-MTP-GGUF/Qwen3.6-35B-A3B-MTP-Q4exp.gguf",
 )
 _FLASH_NEXT = [
     "Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF/IQ1_M/*-00001-of-*.gguf",
