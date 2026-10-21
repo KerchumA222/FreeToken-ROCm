@@ -84,6 +84,11 @@ class TritonMetadata(BaseAttnMetadata):
 # once; "native" runs the per-(query, head) fused kernel; "dequant" decodes the context into dense scratch each step
 # and runs the dense split-k kernel. Prefill always takes the dense path.
 _TURBOQUANT_DECODE = os.environ.get("FT_TURBOQUANT_DECODE", "split")
+# Dense split-k decode: a fixed split count (default 8), or "auto" = per row about one split per
+# _KEYS_PER_SPLIT keys, up to _MAX_AUTO_SPLITS (as the TurboQuant split decode sizes its splits).
+_DECODE_KV_SPLITS = os.environ.get("FT_DECODE_KV_SPLITS", "8")
+_KEYS_PER_SPLIT = 1024
+_MAX_AUTO_SPLITS = 64
 
 
 class TritonAttentionBackend(BaseAttnBackend):
@@ -94,7 +99,8 @@ class TritonAttentionBackend(BaseAttnBackend):
         self.capture: TritonCaptureData | None = None
         self.capture_bs: List[int] = []
         self.max_graph_bs = 0
-        self.max_kv_splits = 8
+        self.auto_kv_splits = _DECODE_KV_SPLITS == "auto"
+        self.max_kv_splits = _MAX_AUTO_SPLITS if self.auto_kv_splits else int(_DECODE_KV_SPLITS)
         self.prefill_tile_min_q = 128
         self.num_q_heads = int(getattr(config, "num_qo_heads", 1))
         kv_groups = getattr(config, "kv_cache_group_specs", lambda: ())()
@@ -130,12 +136,13 @@ class TritonAttentionBackend(BaseAttnBackend):
             dtype=torch.float32,
             device=self.device,
         )
-        metadata.num_kv_splits = torch.full(
-            (bs,),
-            self.max_kv_splits,
-            dtype=torch.int32,
-            device=self.device,
-        )
+        if metadata.num_kv_splits is None:
+            metadata.num_kv_splits = torch.full(
+                (bs,),
+                self.max_kv_splits,
+                dtype=torch.int32,
+                device=self.device,
+            )
 
     def forward(
         self,
@@ -369,7 +376,13 @@ class TritonAttentionBackend(BaseAttnBackend):
             prefix_lens=prefix_lens,
             max_q_len=max(seqlens_q),
             swa_indices=swa_indices,
+            num_kv_splits=self._auto_kv_splits(seqlens_k) if is_decode and self.auto_kv_splits else None,
         )
+
+    def _auto_kv_splits(self, seqlens_k: List[int]) -> torch.Tensor:
+        """Per decode row, about one split per _KEYS_PER_SPLIT keys (the kernel's grid stays max_kv_splits wide)."""
+        splits = [min(self.max_kv_splits, max(1, -(-k // _KEYS_PER_SPLIT))) for k in seqlens_k]
+        return torch.tensor(splits, dtype=torch.int32, device=self.device)
 
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
         assert self.capture is None, "Capture already initialized."
@@ -426,6 +439,8 @@ class TritonAttentionBackend(BaseAttnBackend):
         metadata.q_positions = self.capture.positions[:q_tokens]
         metadata.attn_logits = self.capture.attn_logits[:bs]
         metadata.attn_lse = self.capture.attn_lse[:bs]
+        if metadata.num_kv_splits is not None:
+            self.capture.num_kv_splits[:bs].copy_(metadata.num_kv_splits)
         metadata.num_kv_splits = self.capture.num_kv_splits[:bs]
 
     def prepare_for_capture(self, batch: Batch) -> None:

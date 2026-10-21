@@ -884,3 +884,90 @@ def test_triton_metadata_keeps_full_indices_and_optional_swa_indices(monkeypatch
     assert metadata.indices.tolist() == [10, 11, 20, 21, 22]
     assert metadata.swa_indices is not None
     assert metadata.swa_indices.tolist() == [110, 111, 120, 121, 122]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton attention needs CUDA")
+def test_auto_decode_kv_splits_match_the_fixed_split_count(monkeypatch):
+    from freetoken.attention import AttentionSpec
+    from freetoken.attention import triton as triton_backend
+    from freetoken.attention.triton import TritonAttentionBackend
+
+    class FakeKVCache:
+        def __init__(self, k, v):
+            self.device, self.dtype, self.k, self.v = k.device, k.dtype, k, v
+
+        def store_kv(self, k, v, out_loc, layer_id):
+            self.k[out_loc.to(torch.long)] = k.view(k.shape[0], self.k.shape[1], -1)
+            self.v[out_loc.to(torch.long)] = v.view(v.shape[0], self.v.shape[1], -1)
+
+        def k_cache(self, layer_id):
+            return self.k
+
+        def v_cache(self, layer_id):
+            return self.v
+
+    torch.manual_seed(5)
+    device = torch.device("cuda")
+    q_heads, kv_heads, dim = 32, 2, 256
+    lens = [5000, 300, 1]  # 5, 1 and 1 auto splits under a 64-wide grid
+    pool = 6000
+    page_table = torch.zeros(len(lens), max(lens), dtype=torch.int32, device=device)
+    perm = torch.randperm(pool, device=device).to(torch.int32)
+    start = 0
+    for i, n in enumerate(lens):
+        page_table[i, :n] = perm[start : start + n]
+        start += n
+    reqs = [SimpleNamespace(extend_len=1, device_len=n, cached_len=n - 1, table_idx=i) for i, n in enumerate(lens)]
+    positions = torch.tensor([n - 1 for n in lens], device=device)
+    out_loc = torch.stack([page_table[i, n - 1] for i, n in enumerate(lens)])
+    q = torch.randn(len(lens), q_heads, dim, device=device, dtype=torch.bfloat16)
+    k_new = torch.randn(len(lens), kv_heads * dim, device=device, dtype=torch.bfloat16)
+    v_new = torch.randn_like(k_new)
+    gen = torch.Generator().manual_seed(9)
+    k0 = torch.randn(pool, kv_heads, dim, generator=gen).to(device, torch.bfloat16)
+    v0 = torch.randn(pool, kv_heads, dim, generator=gen).to(device, torch.bfloat16)
+
+    def run(mode):
+        kv = FakeKVCache(k0.clone(), v0.clone())
+        monkeypatch.setattr("freetoken.attention.triton.get_global_ctx", lambda: SimpleNamespace(kv_cache=kv, page_table=page_table))
+        monkeypatch.setattr(triton_backend, "_DECODE_KV_SPLITS", mode)
+        backend = TritonAttentionBackend(SimpleNamespace(num_qo_heads=q_heads, head_dim=dim))
+        batch = SimpleNamespace(padded_reqs=reqs, positions=positions, out_loc=out_loc)
+        backend.prepare_metadata(batch)
+        out = backend.forward(q, k_new, v_new, layer_id=0, batch=batch, attn_spec=AttentionSpec(sm_scale=dim**-0.5))
+        return out, batch.attn_metadata, kv
+
+    fixed, md_fixed, kv = run("8")
+    auto, md_auto, _ = run("auto")
+    assert md_fixed.num_kv_splits.tolist() == [8, 8, 8]
+    assert md_auto.num_kv_splits.tolist() == [5, 1, 1]
+    expected = _reference_paged_attention(
+        q, kv.k, kv.v, md_auto.indptr, md_auto.indices, md_auto.q_to_req, md_auto.q_positions, dim**-0.5, None
+    )
+    torch.testing.assert_close(auto.float(), expected.float(), atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(auto.float(), fixed.float(), atol=2e-2, rtol=2e-2)
+
+
+def test_auto_decode_kv_splits_reach_the_graph_capture_buffer(monkeypatch):
+    from freetoken.attention import triton as triton_backend
+    from freetoken.attention.triton import TritonAttentionBackend, TritonCaptureData
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    page_table = torch.arange(4 * 3000, dtype=torch.int32, device=device).view(4, 3000)
+    monkeypatch.setattr(
+        "freetoken.attention.triton.get_global_ctx",
+        lambda: SimpleNamespace(kv_cache=SimpleNamespace(device=device), page_table=page_table),
+    )
+    monkeypatch.setattr(triton_backend, "_DECODE_KV_SPLITS", "auto")
+    backend = TritonAttentionBackend(SimpleNamespace(num_qo_heads=2, head_dim=8))
+    backend.capture = TritonCaptureData.create(4, 3000, device, num_q_heads=2, max_head_dim=8, max_kv_splits=backend.max_kv_splits)
+    backend.capture_bs = [2]
+    batch = SimpleNamespace(
+        padded_reqs=[SimpleNamespace(extend_len=1, device_len=n, cached_len=n - 1, table_idx=i) for i, n in enumerate((2500, 9))],
+        positions=torch.tensor([2499, 8], device=device),
+        padded_size=2,
+    )
+    backend.prepare_metadata(batch)
+    backend.prepare_for_replay(batch)
+    assert batch.attn_metadata.num_kv_splits.tolist() == [3, 1]
+    assert batch.attn_metadata.num_kv_splits.data_ptr() == backend.capture.num_kv_splits.data_ptr()
