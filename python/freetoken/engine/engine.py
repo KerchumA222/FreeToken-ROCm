@@ -1964,11 +1964,11 @@ def _adjust_config(config: EngineConfig):
     elif kv_cache_dtype == "turboquant_4bit_nc":
         if config.dtype not in (torch.float16, torch.bfloat16):
             raise ValueError("TurboQuant KV cache requires float16 or bfloat16 model compute")
-        # FULL, or FULL + SWA through the hybrid pool (its SWA group keeps the model dtype)
+        # FULL, or FULL + SWA through the hybrid pool (its SWA group keeps the model dtype); hybrid-linear models
+        # page only their FULL layers, so their recurrent layers need no KV format
         if (
             AttnType.FULL not in required_attn_types
             or not required_attn_types <= {AttnType.FULL, AttnType.SWA}
-            or getattr(model_config, "has_linear_attention", False)
         ):
             raise ValueError("TurboQuant KV cache currently supports FULL attention, optionally mixed with SWA, only")
         from freetoken.kvcache.hybrid_swa_pool import HybridSWAKVCache

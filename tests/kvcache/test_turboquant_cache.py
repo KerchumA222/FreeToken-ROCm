@@ -171,3 +171,33 @@ def test_turboquant_pool_factory_passes_opt_in_format():
     )
     assert engine_pool.kv_cache_dtype == "turboquant_4bit_nc"
     assert engine_pool.k_cache(0).dtype == torch.uint8
+
+
+def test_turboquant_pool_covers_the_full_layers_of_a_hybrid_linear_model():
+    from freetoken.attention import AttnType
+    from freetoken.kvcache import create_kv_pool
+
+    _init_tp()
+    # Qwen3.5-style: linear-attention layers keep no paged KV, every fourth layer is FULL
+    spec = SimpleNamespace(
+        name="full", num_kv_heads=2, head_dim=64, num_layers=2, layer_ids=(3, 7), sliding_window=None, mla=False,
+        index_head_dim=0, num_index_layers=0, index_ratio=1, attn_type=AttnType.FULL, is_swa=False,
+    )
+    config = SimpleNamespace(
+        has_swa_attention=False, has_linear_attention=True, num_kv_layers=8, num_layers=8, num_kv_heads=2,
+        head_dim=64, kv_cache_group_specs=lambda: [spec],
+    )
+
+    def make(kv_cache_dtype):
+        engine_config = SimpleNamespace(
+            model_config=config, page_size=4, max_running_req=2, cache_type="naive", kv_cache_dtype=kv_cache_dtype
+        )
+        return create_kv_pool(engine_config, num_pages=3, dtype=torch.bfloat16, device=torch.device("cpu"))
+
+    pool = make("turboquant_4bit_nc")
+    assert pool.kv_cache_dtype == "turboquant_4bit_nc"
+    assert pool.k_cache(7).dtype == torch.uint8 and pool.k_norm_cache(3) is not None
+    with pytest.raises(KeyError):
+        pool.k_cache(0)
+    with pytest.raises(ValueError, match="ordinary FULL attention only"):
+        make("q8_0")

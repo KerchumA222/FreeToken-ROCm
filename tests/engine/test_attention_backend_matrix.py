@@ -176,11 +176,12 @@ def test_turboquant_requires_triton_and_supported_full_attention(monkeypatch):
     with pytest.raises(ValueError, match="requires --attention-backend triton"):
         _adjust_config(config)
 
+    # hybrid-linear models page only their FULL layers, which TurboQuant covers
     config = _config(
         "linear_hybrid", kv_cache_dtype="turboquant_4bit_nc", attention_backend="auto"
     )
-    with pytest.raises(ValueError, match="FULL attention, optionally mixed with SWA"):
-        _adjust_config(config)
+    _adjust_config(config)
+    assert config.attention_backend == "triton"
 
 
 def test_turboquant_accepts_mixed_full_and_swa_attention(monkeypatch):
