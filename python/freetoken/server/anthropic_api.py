@@ -137,7 +137,7 @@ async def handle_anthropic_messages(
         return StreamingResponse(events, media_type="text/event-stream")
 
     try:
-        result = await generate_full(uid, spec, state, source="/v1/messages")
+        result = await generate_full(uid, spec, state, source="/v1/messages", request=request)
     except GenerationError as exc:
         return _anthropic_error_response(400, "invalid_request_error", str(exc))
     response = anthropic_full_response(result, req.model, uid, cache_report=cache_report)
