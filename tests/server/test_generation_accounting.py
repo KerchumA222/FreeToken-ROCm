@@ -206,3 +206,49 @@ def test_ttft_mean_is_zero_without_samples():
     request_ring.reset()
     request_ring.record_request(_row(ttft_ms=None))
     assert request_ring.requests_ttft_mean_ms() == 0
+
+
+class _Request:
+    """`is_disconnected` turns True on its ``after``-th poll (never with None)."""
+
+    def __init__(self, after: int | None) -> None:
+        self.after, self.polls = after, 0
+
+    async def is_disconnected(self) -> bool:
+        self.polls += 1
+        return self.after is not None and self.polls >= self.after
+
+
+class _StalledState(FakeState):
+    """The first ack arrives, then the scheduler goes quiet (a long decode the client gave up on)."""
+
+    def __init__(self) -> None:
+        super().__init__([_ack(prompt=5, completion=1, out="a")])
+        self.aborted: list[int] = []
+
+    async def wait_for_ack(self, uid: int):
+        async for reply in super().wait_for_ack(uid):
+            yield reply
+        await asyncio.sleep(3600)
+
+    async def abort_user(self, uid: int) -> None:
+        self.aborted.append(uid)
+
+
+def test_non_stream_aborts_the_generation_when_the_client_disconnects(monkeypatch):
+    from freetoken.server import generation
+
+    monkeypatch.setattr(generation, "_DISCONNECT_POLL_S", 0.01)
+    st, req = _StalledState(), _Request(after=3)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(generate_full(42, _spec(), st, source="/v1/messages", request=req))
+    assert st.aborted == [42] and req.polls == 3
+
+
+def test_non_stream_with_a_connected_client_returns_the_result(monkeypatch):
+    from freetoken.server import generation
+
+    monkeypatch.setattr(generation, "_DISCONNECT_POLL_S", 0.01)
+    st = FakeState([_ack(prompt=5, completion=1, out="a"), _ack(completion=2, out="bc", finished=True)])
+    result = asyncio.run(generate_full(42, _spec(), st, source="/v1/messages", request=_Request(after=None)))
+    assert (result.prompt_tokens, result.completion_tokens) == (5, 3)

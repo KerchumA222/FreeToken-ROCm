@@ -572,16 +572,23 @@ async def generate_events(
         )
 
 
+_DISCONNECT_POLL_S = 1.0
+
+
 async def generate_full(
-    uid: int, spec: GenSpec, state: Any, *, source: str | None = None
+    uid: int, spec: GenSpec, state: Any, *, source: str | None = None, request: Any = None
 ) -> GenResult:
     """Wraps `_generate_full_impl` to log the request with its totals; the `finally` also records
-    a `GenerationError` as a failed row."""
+    a `GenerationError` as a failed row. With ``request``, a client that disconnects aborts the
+    generation (as `stream_with_cancellation` does for streams) instead of leaving it running."""
     start = time.monotonic()
     result: GenResult | None = None
     error: str | None = None
     try:
-        result = await _generate_full_impl(uid, spec, state)
+        if request is None:
+            result = await _generate_full_impl(uid, spec, state)
+        else:
+            result = await _await_unless_disconnected(_generate_full_impl(uid, spec, state), request, uid, state)
         return result
     except GenerationError as exc:
         error = str(exc)
@@ -593,6 +600,22 @@ async def generate_full(
             completion_tokens=result.completion_tokens if result else 0,
             error=error,
         )
+
+
+async def _await_unless_disconnected(coro, request: Any, uid: int, state: Any):
+    task = asyncio.ensure_future(coro)
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=_DISCONNECT_POLL_S)
+            if done:
+                return task.result()
+            if await request.is_disconnected():
+                break
+    except asyncio.CancelledError:
+        pass
+    task.cancel()
+    await state.abort_user(uid)
+    raise asyncio.CancelledError
 
 
 async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIterator[GenEvent]:
