@@ -573,3 +573,25 @@ def test_moe_pool_flags_and_decode_batch_clamp():
     )
     _clamp_decode_batch_to_pools(config, [12, 16, 9])
     assert (config.max_running_req, config.cuda_graph_max_bs, config.cuda_graph_bs) == (2, 2, [1, 2])
+
+    # an MTP verify step routes 1 + drafts tokens per request; a pool that cannot hold one step is an error, not a batch of 0
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(num_experts=16, num_experts_per_tok=4),
+        max_running_req=1, cuda_graph_max_bs=None, cuda_graph_bs=None,
+    )
+    _clamp_decode_batch_to_pools(config, [12, 16], rows_per_req=3)
+    assert config.max_running_req == 1
+    with pytest.raises(ValueError, match="smallest MoE slot pool has 9 slots"):
+        _clamp_decode_batch_to_pools(config, [12, 16, 9], rows_per_req=3)
+
+
+def test_moe_pool_minimum_covers_an_mtp_step():
+    from freetoken.engine.engine import _decode_rows_per_req
+    from freetoken.moe.pool_policy import make_pools, split_slots
+
+    # a one-layer pool beside a ten-layer pool still gets a full MTP step (top_k 8 x 4 rows), not its equal share
+    pools = make_pools([list(range(10)), [10]], num_experts=256, min_num_slots=8 * 4, slot_limit=None)
+    assert split_slots(300, pools) == [268, 32]
+    plain = SimpleNamespace(speculative_algorithm=None, speculative_num_draft_tokens=3)
+    mtp = SimpleNamespace(speculative_algorithm="mtp", speculative_num_draft_tokens=3)
+    assert (_decode_rows_per_req(plain), _decode_rows_per_req(mtp)) == (1, 4)

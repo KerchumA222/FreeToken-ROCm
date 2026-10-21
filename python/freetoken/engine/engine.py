@@ -62,6 +62,12 @@ def _clamp_decode_batch_to_pools(config: EngineConfig, pool_sizes: list[int], ro
     if not small:
         return
     limit = min(small) // (config.model_config.num_experts_per_tok * rows_per_req)
+    if limit < 1:
+        raise ValueError(
+            f"the smallest MoE slot pool has {min(small)} slots, below the "
+            f"{config.model_config.num_experts_per_tok * rows_per_req} one decode step routes to; "
+            f"raise the MoE cache or lower --speculative-num-draft-tokens"
+        )
     if config.max_running_req > limit:
         logger.warning_rank0(
             f"the smallest MoE slot pool has {min(small)} slots; lowering max_running_req "
@@ -870,8 +876,8 @@ class Engine:
                 f"(--moe-cache-scope per-layer gives each layer its own)"
             )
         self._moe_slot_limit = _slot_limit(layer_methods) if layer_methods is not None else (method.slot_limit() if method is not None else None)
-        # with GPU decode, a pool below num_experts slots bounds the batch; the startup split keeps room for one token per step
-        pools = self._moe_pools(1)
+        # with GPU decode, a pool below num_experts slots bounds the batch; the startup split keeps room for one request's step (1 + MTP drafts)
+        pools = self._moe_pools(_decode_rows_per_req(config))
         size_cap = sum(p.max_num_slots for p in pools)
         if config.moe_cache_auto:
             size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks, method, max_slots=size_cap)
@@ -1256,7 +1262,7 @@ class Engine:
                 )
             try:
                 # a rebuild does not lower max_running_req again, so with GPU decode every pool must hold a full batch; hybrid caps its fetches instead
-                batch = config.max_running_req if self.moe_offload_cache.decode_target == "gpu" else 1
+                batch = config.max_running_req * _decode_rows_per_req(config) if self.moe_offload_cache.decode_target == "gpu" else 1
                 moe_pool_sizes = split_slots(moe_cache_size, self._moe_pools(batch), self._moe_expert_counts)
                 self.moe_offload_cache.validate_rebuild(moe_cache_size, moe_pool_sizes)
             except ValueError as e:
