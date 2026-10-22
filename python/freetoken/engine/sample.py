@@ -52,6 +52,23 @@ def sample_impl(
     return sampling.top_k_top_p_sampling_from_probs(probs, top_k, top_p)
 
 
+def keep_likely_drafts(
+    tokens: torch.Tensor, logits: torch.Tensor, input_ids: torch.Tensor, args: BatchSamplingArgs,
+    num_reqs: int, k: int, min_p: float,
+) -> torch.Tensor:
+    """FREETOKEN_SPEC_ACCEPT_MIN_P: in a step-major verify, row ``s`` scores draft ``s``, which is row ``s + 1``'s
+    input; where the target gives that draft at least ``min_p`` (at the row's temperature) the row takes the draft."""
+    n = k * num_reqs
+    scaled = logits[:n].float()
+    if args.temperatures is not None:
+        scaled = scaled / args.temperatures[:n, None]
+    drafts = input_ids[num_reqs : n + num_reqs].long()
+    p_draft = torch.softmax(scaled, dim=-1).gather(1, drafts[:, None]).squeeze(1)
+    out = tokens.clone()
+    out[:n] = torch.where(p_draft >= min_p, drafts.to(tokens.dtype), tokens[:n])
+    return out
+
+
 @dataclass
 class Sampler:
     device: torch.device
