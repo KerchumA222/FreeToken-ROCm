@@ -78,6 +78,11 @@ class EnvClassSingleton:
     # MTP verification controls used for correctness checks.
     SPEC_SEQUENTIAL_VERIFY = EnvBool(False)
     SPEC_FORCE_REJECT = EnvBool(False)
+    # Speculate on sampled (non-greedy) requests too: each verify row samples on its own, so a draft
+    # survives with the target's probability for it and a rejection draws from the rest (lossless).
+    SPEC_SAMPLED = EnvBool(False)
+    # Lossy, opt-in: a verify row keeps the draft whenever the target gives it at least this probability.
+    SPEC_ACCEPT_MIN_P = EnvFloat(None)
     # Resolve simultaneous stop-string matches by earliest output position; off preserves upstream list order.
     EARLIEST_STOP_MATCH = EnvBool(False)
     QWEN35_ROUTER_GEMV = EnvBool(False)

@@ -260,6 +260,26 @@ def test_a_batch_that_cannot_speculate_stays_a_plain_step():
     assert short.remain_len == 1 and s2._stage_speculation(batch) is batch
 
 
+def test_sampled_requests_speculate_only_with_the_flag_and_never_with_penalties(monkeypatch):
+    from freetoken.env import ENV
+
+    monkeypatch.setattr(ENV.SPEC_SAMPLED, "value", True)
+    s, _ = _scheduler(1, 2)
+    greedy, sampled = _decoding_req(s, 4, uid=0), _decoding_req(s, 4, uid=1)
+    sampled.sampling_params = SamplingParams(temperature=0.7, top_p=0.95, top_k=20, max_tokens=16)
+    for r in (greedy, sampled):
+        r.pending_draft = 5
+    verify = s._stage_speculation(Batch(reqs=[greedy, sampled], phase="decode"))
+    assert verify.spec is not None and verify.spec.k == 2
+
+    s2, _ = _scheduler(1, 2)
+    penalised = _decoding_req(s2, 4)
+    penalised.sampling_params = SamplingParams(temperature=0.7, presence_penalty=1.5, max_tokens=16)
+    penalised.pending_draft = 5
+    batch = Batch(reqs=[penalised], phase="decode")
+    assert s2._stage_speculation(batch) is batch
+
+
 def test_depth_is_capped_by_the_remaining_budget():
     s, _ = _scheduler(1, 3)
     req = _decoding_req(s, 4, output_len=3)
