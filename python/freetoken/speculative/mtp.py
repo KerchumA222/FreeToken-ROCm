@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Iterator
 
 import torch
 
+from freetoken.env import ENV
 from freetoken.utils import init_logger
 
 if TYPE_CHECKING:
@@ -218,6 +219,15 @@ class MtpDrafter:
             return lm.tied_embedding.quant_method.logits(lm.tied_embedding, x, lm.bias)
         return lm.quant_method.apply(lm, x)
 
+    def _draft(self, out: torch.Tensor, with_conf: bool) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """The head's greedy draft at each row and, when asked, its softmax probability at temperature 1."""
+        logits = self.logits(out)
+        token = logits.argmax(dim=-1).to(torch.int32)
+        if not with_conf:
+            return token, None
+        logits = logits.float()
+        return token, torch.exp(logits.max(dim=-1).values - torch.logsumexp(logits, dim=-1))
+
     def _head(self, hidden: torch.Tensor, tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """(LM-head input, state for the next chained step) at every row."""
         embed = self.embed.forward(tokens.to(torch.int64))
@@ -250,15 +260,20 @@ class MtpDrafter:
         if self.store is None:
             self.alloc_store(self._page_table().shape[0], state.shape[-1], state.dtype)
         self.store.index_copy_(0, plan.store_idx, state.to(self.store.dtype))
-        return self.logits(out).argmax(dim=-1).to(torch.int32)
+        token, batch.draft_conf = self._draft(out, ENV.SPEC_DRAFT_MIN_P.value is not None)
+        return token
 
     def draft_chain(self, batch: "Batch", token_pool: torch.Tensor, ctx, attn_backend, mrope: bool) -> torch.Tensor | None:
         """Drafts ``2..k`` of a verify step, chained from each request's stored head state.
 
         Step ``j`` runs the head at position ``cached_len + j - 2`` on the previous step's state and the
         previous draft, writing a provisional head-KV row there that the verify's own head pass
-        overwrites. The drafts go into the token pool where the verify reads them; returns ``[B, k - 1]``."""
+        overwrites. The drafts go into the token pool where the verify reads them; returns ``[B, k - 1]``.
+
+        With FREETOKEN_SPEC_DRAFT_MIN_P the chain stops once no request would verify a further draft,
+        and returns ``[B, depth - 1]`` for the deepest request's depth (None if that is 1)."""
         from freetoken.core import Batch, VerifyRow
+        from freetoken.speculative.accept import batch_draft_depth
 
         spec = batch.spec
         assert spec is not None and self.store is not None
@@ -275,7 +290,11 @@ class MtpDrafter:
         token = tensor(spec.first_drafts, torch.int32)
         page_table = self._page_table()
         drafts = []
+        min_p = ENV.SPEC_DRAFT_MIN_P.value
+        confs = [[c] for c in (spec.first_conf or [1.0] * len(reqs))] if min_p is not None else None
         for j in range(2, spec.k + 1):
+            if min_p is not None and batch_draft_depth(confs, min_p, spec.k) < j:
+                break
             rows = [VerifyRow(r, j - 2) for r in reqs]
             step = Batch(reqs=rows, phase="decode")
             step.padded_reqs = rows
@@ -291,10 +310,13 @@ class MtpDrafter:
             attn_backend.prepare_metadata(step)
             with ctx.forward_batch(step):
                 out, state = self._head(state, token)
-                token = self.logits(out).argmax(dim=-1).to(torch.int32)
+                token, conf = self._draft(out, min_p is not None)
             token_pool[tbl, pos64 + 2] = token
             drafts.append(token)
-        return torch.stack(drafts, dim=1)
+            if min_p is not None:
+                for row, c in zip(confs, conf.tolist()):
+                    row.append(c)
+        return torch.stack(drafts, dim=1) if drafts else None
 
 
 __all__ = ["MtpAdapter", "MtpDrafter", "MtpSource", "head_quant_config", "locate_mtp_head", "mtp_adapter", "with_draft_layer"]
