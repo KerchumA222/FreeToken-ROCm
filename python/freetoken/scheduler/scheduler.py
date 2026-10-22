@@ -561,7 +561,7 @@ class Scheduler(SchedulerIOMixin):
     def _stage_speculation(self, batch: Batch) -> Batch:
         """Turn a decode batch into a verify of ``k`` drafts per request, or return it unchanged.
 
-        Every request must be greedy with a draft in hand and room for ``k + 1`` more tokens; one
+        Every request must be greedy (or sampled, with FREETOKEN_SPEC_SAMPLED) and penalty-free with a draft in hand and room for ``k + 1`` more tokens; one
         that cannot speculate keeps the whole batch on a plain step. The verify lists ``k + 1``
         rows per request (``VerifyRow``), step-major; the first draft is written to the token pool
         here and the rest by the engine's chained draft steps."""
@@ -571,7 +571,9 @@ class Scheduler(SchedulerIOMixin):
         k = int(self.config.speculative_num_draft_tokens)
         for req in reqs:
             p = req.sampling_params
-            if req.pending_draft is None or not p.is_greedy or p.presence_penalty or p.frequency_penalty:
+            if req.pending_draft is None or p.presence_penalty or p.frequency_penalty:
+                return batch
+            if not p.is_greedy and not ENV.SPEC_SAMPLED:
                 return batch
             k = min(k, req.remain_len - 1)
         if k < 1:
