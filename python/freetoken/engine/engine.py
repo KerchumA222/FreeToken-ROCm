@@ -1259,14 +1259,14 @@ class Engine:
         if batch.spec is not None and ENV.SPEC_SEQUENTIAL_VERIFY:
             logits = self._verify_sequential(batch)
             with self.ctx.forward_batch(batch):
-                next_tokens_gpu = self.sampler.sample(logits[: batch.size], args).to(torch.int32)
+                next_tokens_gpu = self._sample_verify(batch, logits[: batch.size], args)
                 draft_tokens_gpu = self.mtp.head_pass(batch, next_tokens_gpu)
         else:
             with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, use_graph):
                 logits = self.graph_runner.replay(batch) if use_graph else self.model.forward()
                 if batch.capture_hidden:
                     # the draft head runs in this batch context: it is a decoder block on these rows
-                    next_tokens_gpu = self.sampler.sample(logits[: batch.size], args).to(torch.int32)
+                    next_tokens_gpu = self._sample_verify(batch, logits[: batch.size], args)
                     draft_tokens_gpu = self.mtp.head_pass(batch, next_tokens_gpu)
         if self.cpu_moe_executor is not None:
             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
@@ -1287,6 +1287,16 @@ class Engine:
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event, draft_tokens_cpu, chain_tokens_cpu)
+
+    def _sample_verify(self, batch: Batch, logits: torch.Tensor, args: BatchSamplingArgs) -> torch.Tensor:
+        """Sample a forward the draft head follows; a verify can keep likely drafts (FREETOKEN_SPEC_ACCEPT_MIN_P)."""
+        tokens = self.sampler.sample(logits, args).to(torch.int32)
+        min_p = ENV.SPEC_ACCEPT_MIN_P.value
+        if batch.spec is not None and min_p:
+            from freetoken.engine.sample import keep_likely_drafts
+
+            tokens = keep_likely_drafts(tokens, logits, batch.input_ids, args, batch.spec.num_reqs, batch.spec.k, min_p)
+        return tokens
 
     def _verify_sequential(self, batch: Batch) -> torch.Tensor:
         """A verify run as ``k + 1`` forwards of one row per request (FREETOKEN_SPEC_SEQUENTIAL_VERIFY).
