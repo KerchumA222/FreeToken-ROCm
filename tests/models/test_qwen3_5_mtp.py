@@ -461,3 +461,119 @@ def test_mtp_head_combines_embedding_then_hidden_and_returns_chained_state(monke
 
     torch.testing.assert_close(out, expected)
     torch.testing.assert_close(next_state, expected)
+
+
+def test_mtp_head_pass_reports_draft_confidence_only_with_the_flag(monkeypatch):
+    from freetoken.core import MtpPlan
+    from freetoken.env import ENV
+    from freetoken.speculative.mtp import MtpDrafter
+
+    class Embedding:
+        def forward(self, tokens):
+            return tokens.to(torch.float32).unsqueeze(-1)
+
+    class Head:
+        def forward_chain(self, hidden, token_embed):
+            return hidden, hidden
+
+    drafter = object.__new__(MtpDrafter)
+    drafter.embed = Embedding()
+    drafter.head = Head()
+    drafter.depth = 1
+    drafter.device = torch.device("cpu")
+    drafter.store = None
+    drafter._page_table = lambda: torch.empty((2, 1), dtype=torch.int32)
+    logits = torch.tensor([[2.0, 0.0, 1.0], [0.0, 0.0, 3.0]])
+    drafter.logits = lambda out: logits
+
+    def run():
+        plan = MtpPlan(store_idx=torch.tensor([0, 1]))
+        batch = SimpleNamespace(mtp_plan=plan, hidden_states=torch.zeros(2, 1), draft_conf=None)
+        tokens = drafter.head_pass(batch, torch.tensor([5, 6], dtype=torch.int32))
+        return tokens, batch.draft_conf
+
+    monkeypatch.setattr(ENV.SPEC_DRAFT_MIN_P, "value", None)
+    tokens, conf = run()
+    assert tokens.tolist() == [0, 2] and conf is None
+
+    monkeypatch.setattr(ENV.SPEC_DRAFT_MIN_P, "value", 0.5)
+    tokens, conf = run()
+    assert tokens.tolist() == [0, 2]
+    torch.testing.assert_close(conf, torch.softmax(logits, dim=-1).max(dim=-1).values)
+
+
+def _chain_drafter(monkeypatch, logits_by_step):
+    """A drafter whose head step ``j - 1`` returns ``logits_by_step[j - 1]`` ([B, vocab]); returns it with the visited steps."""
+    from contextlib import nullcontext
+
+    from freetoken import core
+    from freetoken.speculative.mtp import MtpDrafter
+
+    steps = []
+
+    class FakeBatch:
+        def __init__(self, reqs, phase):
+            self.reqs = reqs
+            steps.append(self)
+
+    class Head:
+        def forward_chain(self, hidden, token_embed):
+            return hidden, hidden
+
+    drafter = object.__new__(MtpDrafter)
+    drafter.depth = 4
+    drafter.device = torch.device("cpu")
+    drafter.store = torch.zeros(4, 1)
+    drafter.embed = SimpleNamespace(forward=lambda tokens: tokens.to(torch.float32).unsqueeze(-1))
+    drafter.head = Head()
+    calls = iter(logits_by_step)
+    drafter.logits = lambda out: next(calls)
+    drafter._page_table = lambda: torch.arange(20, dtype=torch.int32).reshape(1, 20)
+    original_tensor = torch.tensor
+    monkeypatch.setattr(core, "Batch", FakeBatch)
+    monkeypatch.setattr(
+        torch, "tensor", lambda *a, **kw: original_tensor(*a, **{k: v for k, v in kw.items() if k != "pin_memory"})
+    )
+    context = SimpleNamespace(forward_batch=lambda _batch: nullcontext())
+    backend = SimpleNamespace(prepare_metadata=lambda batch: None)
+    return drafter, steps, context, backend
+
+
+@pytest.mark.parametrize(
+    "first_conf, step_conf, steps_run",
+    [
+        (0.2, 0.9, 0),   # the first draft is unsure: no further draft is verified, so none is computed
+        (0.9, 0.2, 1),   # draft 2 is computed (it is verified) but draft 3 is not
+        (0.9, 0.9, 2),   # confident all the way: the full chain
+    ],
+)
+def test_mtp_draft_chain_stops_when_no_request_can_extend(monkeypatch, first_conf, step_conf, steps_run):
+    from freetoken.env import ENV
+
+    unsure, sure = [1.0, 1.0, 1.0], [0.0, 8.0, 0.0]  # softmax max 1/3 and ~0.997
+    logits = [torch.tensor([sure if step_conf > 0.5 else unsure])] * 2
+    drafter, steps, context, backend = _chain_drafter(monkeypatch, logits)
+    monkeypatch.setattr(ENV.SPEC_DRAFT_MIN_P, "value", 0.5)
+    req = SimpleNamespace(table_idx=0, pending_slot=0, cached_len=5)
+    spec = SimpleNamespace(k=3, reqs=[req], first_drafts=[2], first_conf=[first_conf])
+    token_pool = torch.zeros((1, 12), dtype=torch.int32)
+
+    drafts = drafter.draft_chain(SimpleNamespace(spec=spec), token_pool, context, backend, mrope=False)
+
+    assert len(steps) == steps_run
+    assert (drafts is None) if steps_run == 0 else drafts.shape == (1, steps_run)
+
+
+def test_mtp_draft_chain_confidence_is_the_softmax_max_and_a_mixed_batch_runs_on(monkeypatch):
+    from freetoken.env import ENV
+
+    # request 0 is unsure of draft 2 (flat logits), request 1 is sure: step 3 still runs for request 1
+    flat, sharp = [0.0, 0.0, 0.0, 0.0], [0.0, 9.0, 0.0, 0.0]
+    drafter, steps, context, backend = _chain_drafter(monkeypatch, [torch.tensor([flat, sharp])] * 2)
+    drafter.store = torch.zeros(10, 1)
+    monkeypatch.setattr(ENV.SPEC_DRAFT_MIN_P, "value", 0.5)
+    reqs = [SimpleNamespace(table_idx=i, pending_slot=0, cached_len=5) for i in range(2)]
+    spec = SimpleNamespace(k=3, reqs=reqs, first_drafts=[2, 2], first_conf=[0.9, 0.9])
+    drafter._page_table = lambda: torch.arange(40, dtype=torch.int32).reshape(2, 20)
+    drafts = drafter.draft_chain(SimpleNamespace(spec=spec), torch.zeros((2, 12), dtype=torch.int32), context, backend, mrope=False)
+    assert len(steps) == 2 and drafts.shape == (2, 2)

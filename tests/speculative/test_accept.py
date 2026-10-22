@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from freetoken.speculative import accept_length, committed_tokens
+from freetoken.speculative import accept_length, batch_draft_depth, committed_tokens, draft_depth
 
 
 @pytest.mark.parametrize(
@@ -43,3 +43,26 @@ def test_targets_must_cover_every_draft_plus_one():
         accept_length([1, 2], [1, 2])
     with pytest.raises(ValueError):
         committed_tokens([1, 2], [1, 2], force_reject=True)
+
+
+@pytest.mark.parametrize(
+    "confidences, min_p, depth",
+    [
+        ([0.9, 0.9, 0.9], 0.5, 4),   # every draft before the last is confident: full depth
+        ([0.1, 0.9, 0.9], 0.5, 1),   # the first draft is unsure: it alone is verified
+        ([0.9, 0.2, 0.9], 0.5, 2),   # the chain stops at (and verifies) the first unsure draft
+        ([0.9, 0.9, 0.2], 0.5, 3),
+        ([0.5, 0.9, 0.9], 0.5, 4),   # exactly the threshold counts as confident
+        ([0.9], 0.5, 4),             # confidences not yet known count as confident
+        ([0.1, 0.1, 0.1], None, 4),  # flag unset: always the full depth
+    ],
+)
+def test_draft_depth_stops_at_the_first_unsure_draft(confidences, min_p, depth):
+    assert draft_depth(confidences, min_p, k=4) == depth
+
+
+def test_batch_draft_depth_is_the_deepest_request():
+    assert batch_draft_depth([[0.9, 0.2], [0.1, 0.9]], 0.5, k=3) == 2
+    assert batch_draft_depth([[0.1, 0.9], [0.1, 0.9]], 0.5, k=3) == 1
+    assert batch_draft_depth([[0.9, 0.9], [0.1, 0.9]], 0.5, k=3) == 3
+    assert batch_draft_depth([[0.1], [0.1]], None, k=3) == 3

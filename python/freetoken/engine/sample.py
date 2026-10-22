@@ -18,6 +18,14 @@ class BatchSamplingArgs:
     greedy_mask: torch.Tensor | None = None
     penalties: list[tuple[int, torch.Tensor, float, float]] = field(default_factory=list)
 
+    def first_rows(self, n: int) -> "BatchSamplingArgs":
+        """The args of the first ``n`` rows of the batch."""
+        cut = lambda t: None if t is None else t[:n]
+        return BatchSamplingArgs(
+            cut(self.temperatures), cut(self.top_k), cut(self.top_p), cut(self.greedy_mask),
+            [p for p in self.penalties if p[0] < n],
+        )
+
 
 def make_device_tensor(data: List, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
     return torch.tensor(data, dtype=dtype, pin_memory=True).to(device, non_blocking=True)

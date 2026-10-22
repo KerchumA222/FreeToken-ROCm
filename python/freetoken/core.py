@@ -73,6 +73,8 @@ class Req:
     # device_len, and which slot of the engine's hidden store holds the head state it came from.
     pending_draft: int | None = field(default=None, init=False, repr=False)
     pending_slot: int = field(default=0, init=False, repr=False)
+    # the head's probability for pending_draft (only tracked under FREETOKEN_SPEC_DRAFT_MIN_P)
+    pending_conf: float | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
@@ -159,6 +161,14 @@ class SpecVerify:
     snap_slots: List[torch.Tensor] | None = None
     # set by the engine when it runs the verify one step per forward (FREETOKEN_SPEC_SEQUENTIAL_VERIFY)
     step: int | None = None
+    # the head's probability for each first draft (FREETOKEN_SPEC_DRAFT_MIN_P only)
+    first_conf: List[float] | None = None
+    # the k pages and device length were staged for; k shrinks if the chain stops early
+    staged_k: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.staged_k is None:
+            self.staged_k = self.k
 
     @property
     def num_reqs(self) -> int:
@@ -237,6 +247,8 @@ class Batch:
     capture_hidden: bool = field(default=False, init=False)
     hidden_states: torch.Tensor | None = field(default=None, init=False)
     mtp_plan: MtpPlan | None = field(default=None, init=False)
+    # the draft head's probability for the token it drafted at each draft row (FREETOKEN_SPEC_DRAFT_MIN_P only)
+    draft_conf: torch.Tensor | None = field(default=None, init=False)
 
     @property
     def is_prefill(self) -> bool:

@@ -31,4 +31,23 @@ def committed_tokens(drafts: Sequence[int], targets: Sequence[int], *, force_rej
     return [int(t) for t in drafts[:n]] + [int(targets[n])]
 
 
-__all__ = ["accept_length", "committed_tokens"]
+def draft_depth(confidences: Sequence[float], min_p: float | None, k: int) -> int:
+    """How many drafts (at most ``k``) one request verifies under FREETOKEN_SPEC_DRAFT_MIN_P.
+
+    ``confidences[j]`` is the head's probability for draft ``j + 1``. Draft 1 is always verified;
+    draft ``j`` joins only while drafts ``1..j-1`` were all at least ``min_p``, so the chain stops
+    at (and still verifies) the first unsure draft. Unknown confidences count as confident."""
+    if min_p is None:
+        return k
+    for depth, conf in enumerate(confidences[: k - 1], start=1):
+        if conf < min_p:
+            return depth
+    return k
+
+
+def batch_draft_depth(confidences: Sequence[Sequence[float]], min_p: float | None, k: int) -> int:
+    """The verify depth of a batch: rows are step-major, so every request runs the deepest one's."""
+    return max((draft_depth(c, min_p, k) for c in confidences), default=k)
+
+
+__all__ = ["accept_length", "batch_draft_depth", "committed_tokens", "draft_depth"]

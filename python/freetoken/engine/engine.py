@@ -409,6 +409,8 @@ class ForwardOutput(NamedTuple):
     # MTP: the draft head's token at each draft row of MtpPlan, and a verify's chained drafts [B, k-1]
     draft_tokens_cpu: torch.Tensor | None = None
     chain_tokens_cpu: torch.Tensor | None = None
+    # the head's probability for each draft_tokens_cpu entry (FREETOKEN_SPEC_DRAFT_MIN_P only)
+    draft_conf_cpu: torch.Tensor | None = None
 
 
 class Engine:
@@ -1284,9 +1286,10 @@ class Engine:
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         draft_tokens_cpu = draft_tokens_gpu.to("cpu", non_blocking=True) if draft_tokens_gpu is not None else None
         chain_tokens_cpu = chain_tokens.to("cpu", non_blocking=True) if chain_tokens is not None else None
+        draft_conf_cpu = batch.draft_conf.to("cpu", non_blocking=True) if batch.draft_conf is not None else None
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
-        return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event, draft_tokens_cpu, chain_tokens_cpu)
+        return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event, draft_tokens_cpu, chain_tokens_cpu, draft_conf_cpu)
 
     def _sample_verify(self, batch: Batch, logits: torch.Tensor, args: BatchSamplingArgs) -> torch.Tensor:
         """Sample a forward the draft head follows; a verify can keep likely drafts (FREETOKEN_SPEC_ACCEPT_MIN_P)."""

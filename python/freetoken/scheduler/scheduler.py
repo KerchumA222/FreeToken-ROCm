@@ -364,6 +364,8 @@ class Scheduler(SchedulerIOMixin):
                 next_token = int(next_token.item())
                 if draft_tokens_cpu is not None:
                     req.pending_draft, req.pending_slot = int(draft_tokens_cpu[i]), 0
+                    if getattr(output, "draft_conf_cpu", None) is not None:
+                        req.pending_conf = float(output.draft_conf_cpu[i])
                 # EOS / stop-string -> "stop", output budget exhausted -> "length";
                 # EOS and stop strings win over length.
                 # Overlap can advance device_len one token ahead of this host reply.
@@ -530,6 +532,8 @@ class Scheduler(SchedulerIOMixin):
         m = len(judged)
         self._rollback_verified(req, i, spec, m)
         req.pending_draft, req.pending_slot = int(output.draft_tokens_cpu[(m - 1) * B + i]), m - 1
+        if getattr(output, "draft_conf_cpu", None) is not None:
+            req.pending_conf = float(output.draft_conf_cpu[(m - 1) * B + i])
         stats = self.spec_stats
         stats["rounds"] += 1
         stats["drafted"] += k
@@ -538,13 +542,14 @@ class Scheduler(SchedulerIOMixin):
             logger.info_rank0(
                 f"MTP: {stats['rounds']} verify steps, {stats['accepted'] / stats['drafted']:.3f} of drafts accepted, "
                 f"{1 + stats['accepted'] / stats['rounds']:.2f} tokens per step"
+                + (f", mean depth {stats['drafted'] / stats['rounds']:.2f}" if ENV.SPEC_DRAFT_MIN_P.value is not None else "")
             )
         for token, j in judged:
             self._settle_token(batch, req, token, j, reply, new_finished_reqs)
 
     def _rollback_verified(self, req: Req, i: int, spec: SpecVerify, m: int) -> None:
         """Keep ``m`` of a verify's ``k + 1`` rows: lengths, KV pages and GDN state."""
-        staged = req.cached_len + 1 + spec.k
+        staged = req.cached_len + 1 + spec.staged_k
         req.cached_len += m
         req.device_len = req.cached_len + 1
         # the last committed token is the next step's input (the drafts before it are in place already)
@@ -589,12 +594,49 @@ class Scheduler(SchedulerIOMixin):
                 _to_device([pool.spec_slot(self._spec_snap_index(i, s)) for i in range(len(reqs))], self.device)
                 for s in range(k)
             ]
+        first_conf = None
+        if ENV.SPEC_DRAFT_MIN_P.value is not None:
+            first_conf = [1.0 if req.pending_conf is None else req.pending_conf for req in reqs]
         for req in reqs:
             req.device_len += k
             req.pending_draft = None
         verify = Batch(reqs=[VerifyRow(r, s) for s in range(k + 1) for r in reqs], phase="decode")
-        verify.spec = SpecVerify(reqs=list(reqs), k=k, first_drafts=first, snap_slots=snap)
+        verify.spec = SpecVerify(reqs=list(reqs), k=k, first_drafts=first, snap_slots=snap, first_conf=first_conf)
         return verify
+
+    def _truncate_verify(self, batch: Batch, sample_args, input_mapping, write_mapping, k: int):
+        """Cut a staged verify to its first ``k + 1`` steps (a prefix of its step-major rows).
+
+        The pages and snapshot slots staged for the deeper verify stay allocated; rollback frees
+        the pages from ``spec.staged_k``. Returns the sample args and mappings for the shorter batch."""
+        from freetoken.attention.linear import FLAMetadata
+
+        spec = batch.spec
+        n = (k + 1) * spec.num_reqs
+        for req in spec.reqs:
+            req.device_len -= spec.k - k
+        spec.k = k
+        if spec.snap_slots is not None:
+            spec.snap_slots = spec.snap_slots[:k]
+        batch.reqs = batch.reqs[:n]
+        batch.padded_reqs = batch.padded_reqs[:n]
+        batch.positions = batch.positions[:n]
+        if batch.mrope_positions is not None:
+            batch.mrope_positions = batch.mrope_positions[:, :n]
+        batch.out_loc = batch.out_loc[:n]
+        if batch.linear_table_idx is not None:
+            batch.linear_table_idx = batch.linear_table_idx[:n]
+        if batch.fla_metadata is not None:
+            batch.fla_metadata = FLAMetadata(
+                cu_seqlens=batch.fla_metadata.cu_seqlens[: n + 1], cache_indices=batch.fla_metadata.cache_indices[:n]
+            )
+        if batch.active_table_idx is not None:
+            batch.active_table_idx = batch.active_table_idx[:n]
+        plan = batch.mtp_plan
+        plan.store_idx = plan.store_idx[:n]
+        self.engine.attn_backend.prepare_metadata(batch)
+        cut = lambda pair: tuple(t[:n] for t in pair)
+        return sample_args.first_rows(n), cut(input_mapping), cut(write_mapping)
 
     def _mtp_plan(self, batch: Batch, input_mapping: Indice2D) -> MtpPlan:
         """Where the draft head drafts after this forward and which hidden-store rows it fills."""
@@ -1117,6 +1159,12 @@ class Scheduler(SchedulerIOMixin):
                 self.cache_manager.snapshot_toolcall_anchor(batch.spec.reqs)
             # drafts 2..k land in the token pool before the verify reads its rows
             chain = self.engine.draft_chain(batch, self.token_pool)
+            if ENV.SPEC_DRAFT_MIN_P.value is not None:
+                k = 1 if chain is None else 1 + chain.shape[1]
+                if k < batch.spec.k:
+                    sample_args, input_mapping, output_mapping = self._truncate_verify(
+                        batch, sample_args, input_mapping, output_mapping, k
+                    )
             batch.input_ids = self.token_pool[input_mapping]
             forward_output = self.engine.forward_batch(batch, sample_args, chain)
             self.decode_manager.filter_reqs(batch.spec.reqs)

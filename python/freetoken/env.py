@@ -83,6 +83,8 @@ class EnvClassSingleton:
     SPEC_SAMPLED = EnvBool(False)
     # Lossy, opt-in: a verify row keeps the draft whenever the target gives it at least this probability.
     SPEC_ACCEPT_MIN_P = EnvFloat(None)
+    # Opt-in adaptive draft depth: a chain stops growing after the first draft the head gave less than this probability.
+    SPEC_DRAFT_MIN_P = EnvFloat(None)
     # Resolve simultaneous stop-string matches by earliest output position; off preserves upstream list order.
     EARLIEST_STOP_MATCH = EnvBool(False)
     QWEN35_ROUTER_GEMV = EnvBool(False)
