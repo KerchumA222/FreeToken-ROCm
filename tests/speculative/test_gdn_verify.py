@@ -141,3 +141,54 @@ def test_one_step_of_a_sequential_verify_is_a_decode_step(family, monkeypatch):
     assert torch.equal(pool.recurrent_states[:, 1:3], after[0][:, 1:3])
     assert torch.equal(pool.recurrent_states[:, pool.spec_slot(0)], after[0][:, 1])
     assert torch.equal(pool.recurrent_states[:, pool.spec_slot(k)], after[0][:, 2])
+
+
+@pytest.mark.parametrize("k", [1, 2, 3])
+def test_fused_single_request_verify_matches_the_stepwise_verify(family, k, monkeypatch):
+    """FREETOKEN_GDN_FUSED_VERIFY: one conv update and one recurrent kernel writing the snapshots must
+    give the stepwise verify's outputs, live state, snapshots, and rollbacks."""
+    from freetoken.env import ENV
+
+    op, pool = _op_and_pool(1, k, family)
+    live = torch.tensor([1], dtype=torch.int32, device="cuda")
+    rows = k + 1
+    torch.manual_seed(2)
+    conv_in = torch.randn(rows, op.conv_dim, device="cuda", dtype=torch.bfloat16)
+    a = torch.randn(rows, NV, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(rows, NV, device="cuda", dtype=torch.bfloat16)
+    start = _states(pool)
+
+    def run(fused: bool):
+        monkeypatch.setattr(ENV.GDN_FUSED_VERIFY, "value", fused)
+        pool.recurrent_states.copy_(start[0])
+        pool.conv_states.copy_(start[1])
+        out = op._verify(conv_in, a, b, pool, 0, _fla(rows, live.repeat(rows)), _spec(pool, 1, k), torch.bfloat16)
+        return out, _states(pool)
+
+    ref_out, (ref_rec, ref_conv) = run(False)
+    out, (rec, conv) = run(True)
+    torch.testing.assert_close(out, ref_out, atol=2e-3, rtol=2e-3)
+    torch.testing.assert_close(rec[:, 1], ref_rec[:, 1], atol=1e-3, rtol=1e-3)
+    assert torch.equal(conv[:, 1], ref_conv[:, 1])
+    for s in range(k):
+        snap = pool.spec_slot(s)
+        torch.testing.assert_close(rec[:, snap], ref_rec[:, snap], atol=1e-3, rtol=1e-3)
+        assert torch.equal(conv[:, snap], ref_conv[:, snap]), s
+    # untouched: the other live slot and the spare snapshot slots
+    assert torch.equal(rec[:, 2], start[0][:, 2]) and torch.equal(conv[:, 2], start[1][:, 2])
+
+
+def test_fused_verify_leaves_multi_request_verifies_stepwise(family, monkeypatch):
+    from freetoken.env import ENV
+
+    calls = []
+    monkeypatch.setattr(ENV.GDN_FUSED_VERIFY, "value", True)
+    num_reqs, k = 3, 2
+    op2, pool = _op_and_pool(num_reqs, k, family)
+    monkeypatch.setattr(op2, "_verify_fused", lambda *a, **kw: calls.append(1))
+    live = torch.arange(1, num_reqs + 1, dtype=torch.int32, device="cuda")
+    rows = num_reqs * (k + 1)
+    x = torch.randn(rows, op2.conv_dim, device="cuda", dtype=torch.bfloat16)
+    ab = torch.randn(rows, NV, device="cuda", dtype=torch.bfloat16)
+    op2._verify(x, ab, ab, pool, 0, _fla(rows, live.repeat(k + 1)), _spec(pool, num_reqs, k), torch.bfloat16)
+    assert calls == []

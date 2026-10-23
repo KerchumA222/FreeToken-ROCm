@@ -94,6 +94,9 @@ class EnvClassSingleton:
     QWEN35_ROUTER_GEMV = EnvBool(False)
     # Opt-in: on HIP, decode-sized (<= 4 rows) Qwen3.5/3.6 and Flash-Next MoE layers compute the router logits and the shared-expert gate in one Triton GEMV launch.
     FUSED_ROUTER = EnvBool(False)
+    # Opt-in: a single-request MTP verify runs each GDN layer's rows through one multi-token conv update and one
+    # recurrent kernel that writes the rollback snapshots itself, instead of a decode step and two copies per row.
+    GDN_FUSED_VERIFY = EnvBool(False)
 
     def __new__(cls):
         # single instance

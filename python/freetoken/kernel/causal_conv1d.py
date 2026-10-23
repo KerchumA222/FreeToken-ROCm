@@ -49,7 +49,7 @@ def causal_conv1d_varlen(
 
 
 def causal_conv1d_decode(
-    x: torch.Tensor,                # [batch, conv_dim] (one token per request)
+    x: torch.Tensor,                # [batch, conv_dim] (one token per request), or [batch, conv_dim, seqlen]
     conv_state: torch.Tensor,       # [num_slots, conv_dim, state_len>=kernel-1] (in place)
     weight: torch.Tensor,           # [conv_dim, kernel]
     conv_state_indices: torch.Tensor,  # [batch] int32 slot id per request
@@ -67,9 +67,10 @@ def causal_conv1d_decode(
 
     from sgl_kernel import causal_conv1d_update
 
-    x = x.unsqueeze(-1)
+    multi = x.dim() == 3
+    x = x.contiguous() if multi else x.unsqueeze(-1)
     causal_conv1d_update(
         x, conv_state, weight, None, True, None,
         conv_state_indices.to(torch.int32), _PAD_SLOT_ID,
     )
-    return x.squeeze(-1)
+    return x if multi else x.squeeze(-1)

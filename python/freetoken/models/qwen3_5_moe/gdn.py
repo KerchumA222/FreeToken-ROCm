@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 from freetoken.core import get_global_ctx
+from freetoken.env import ENV
 from freetoken.kernel.causal_conv1d import causal_conv1d_decode, causal_conv1d_varlen
 from freetoken.layers import BaseOP, GatedRMSNorm, LinearColParallelMerged, LinearReplicated
 from freetoken.layers.quantization import QuantConfig
@@ -141,6 +142,8 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         decode kernels exactly as a plain decode step would run it. The state after each of the first
         ``k`` steps is copied to that step's snapshot slots, so a partial accept restores it."""
         B = spec.num_reqs
+        if ENV.GDN_FUSED_VERIFY and B == 1 and spec.step is None and spec.k >= 1:
+            return self._verify_fused(conv_in, a, b, pool, li, fla, spec, dtype)
         steps = range(spec.k + 1) if spec.step is None else (spec.step,)
         cu = fla.cu_seqlens[: B + 1]
         rec, conv = pool.recurrent_states[li], pool.conv_states[li]
@@ -154,6 +157,45 @@ class Qwen3_5GatedDeltaNet(BaseOP):
                 rec.index_copy_(0, dst, rec.index_select(0, idx))
                 conv.index_copy_(0, dst, conv.index_select(0, idx))
         return outs[0] if len(outs) == 1 else torch.cat(outs, dim=0)
+
+    def _verify_fused(self, conv_in, a, b, pool, li, fla, spec, dtype) -> torch.Tensor:
+        """``_verify`` for one request (FREETOKEN_GDN_FUSED_VERIFY): its ``k + 1`` rows through one conv
+        update, the recurrence over rows ``0..k-1`` in one kernel that writes the state after each row
+        straight into the snapshot slots (``spec_slot(0..k-1)``, contiguous for request 0), then row ``k``
+        as a decode step. The conv snapshots are the window before the verify shifted by ``s + 1`` rows."""
+        from freetoken.kernel.fla import fused_sigmoid_gating_delta_rule_update
+
+        k = spec.k
+        rows = k + 1
+        idx = fla.cache_indices[:1]
+        rec, conv = pool.recurrent_states[li], pool.conv_states[li]
+        base = pool.spec_slot(0)
+        state_len = self._conv_weight().shape[-1] - 1
+        prior = conv.index_select(0, idx)[..., :state_len]  # the window before this verify (the kernel keeps it first)
+        x = conv_in.view(1, rows, self.conv_dim).transpose(1, 2)  # [1, conv_dim, rows], strided
+        mixed = self._conv_decode(x, idx, pool).transpose(1, 2).reshape(rows, self.conv_dim)
+        window = torch.cat([prior, x], dim=-1)
+        conv[base : base + k, :, :state_len] = torch.stack(
+            [window[0, :, s + 1 : s + 1 + state_len] for s in range(k)]
+        )
+        qf, kf, vf = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
+        q = qf.reshape(1, rows, self.num_k_heads, self.head_k_dim).to(dtype)
+        kk = kf.reshape(1, rows, self.num_k_heads, self.head_k_dim).to(dtype)
+        v = vf.reshape(1, rows, self.num_v_heads, self.head_v_dim).to(dtype)
+        snaps = rec[base : base + k].unsqueeze(0)  # [1, k, ...]: step s's state -> spec_slot(s)
+        head = fused_sigmoid_gating_delta_rule_update(
+            A_log=self.A_log, a=a[:k], dt_bias=self.dt_bias, softplus_beta=1.0, softplus_threshold=20.0,
+            q=q[:, :k], k=kk[:, :k], v=v[:, :k], b=b[:k],
+            initial_state_source=rec, initial_state_indices=idx,
+            scale=self.head_k_dim ** -0.5, use_qk_l2norm_in_kernel=True,
+            cu_seqlens=fla.cu_seqlens[:2] * k,  # a verify's rows are decode rows: [0, 1] -> [0, k], no host copy
+            intermediate_states_buffer=snaps, intermediate_state_indices=idx.new_zeros(1),
+        )[0]
+        tail = gdn_decode_fla(
+            q[:, k:], kk[:, k:], v[:, k:], a[k:], b[k:], A_log=self.A_log, dt_bias=self.dt_bias,
+            state_source=rec, indices=idx, cu_seqlens=fla.cu_seqlens[:2], scale=self.head_k_dim ** -0.5,
+        )
+        return torch.cat([head.reshape(k, *tail.shape[1:]), tail], dim=0)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         ctx = get_global_ctx()
