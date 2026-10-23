@@ -37,7 +37,7 @@ def _tp(monkeypatch):
     )
 
 
-def _pool(num_pages=4, page_size=64, index_ratio=4, num_req_slots=4, ring_capacity=None):
+def _pool(num_pages=4, page_size=64, index_ratio=4, num_req_slots=4, ring_capacity=None, kv_cache_dtype="model"):
     return QSAKVCache(
         num_kv_heads=2,
         num_layers=8,
@@ -52,6 +52,7 @@ def _pool(num_pages=4, page_size=64, index_ratio=4, num_req_slots=4, ring_capaci
         num_req_slots=num_req_slots,
         ring_capacity=ring_capacity,
         layer_ids=(1, 3, 5, 7),
+        kv_cache_dtype=kv_cache_dtype,
     )
 
 
@@ -217,3 +218,70 @@ def test_resolve_pool_class_and_factory():
 
     with pytest.raises(ValueError, match="num_req_slots"):
         create_kvcache_pool(mc, num_pages=4, page_size=64, dtype=torch.bfloat16, device=DEV)
+
+
+# ------------------------------------------------------------------------------ TurboQuant
+
+
+def test_turboquant_pool_stores_codes_and_metadata_and_keeps_index_tiers_in_model_dtype():
+    pool = _pool(num_pages=4, kv_cache_dtype="turboquant_4bit_nc")
+    assert pool.k_cache(1).shape == (4, 64, 2, 32) and pool.k_cache(1).dtype == torch.uint8
+    assert pool.v_cache(7).shape == (4, 64, 2, 32)
+    for meta in (pool.k_norm_cache(3), pool.v_scale_cache(3), pool.v_zero_cache(3)):
+        assert meta.shape == (4 * 64, 2) and meta.dtype == torch.float16
+    assert pool.turboquant_rotation.shape == (64, 64)
+    assert pool.cmp_k_cache(0).dtype == torch.bfloat16 and pool.pending_ring(0).dtype == torch.bfloat16
+    assert pool.cmp_k_cache(0).shape == (64 + 4, 32)
+    assert pool._compute_dtype == torch.bfloat16
+    with pytest.raises(KeyError):
+        pool.k_cache(0)
+    # zeroed like the model-dtype slab, so no read can see recycled bit patterns
+    assert not pool.k_cache(1).any() and not pool.v_scale_cache(1).any() and not pool.v_zero_cache(1).any()
+
+
+def test_turboquant_unit_bytes_and_kv_cost_match_and_shrink_the_slider():
+    spec = _spec()
+    config = _config(spec)
+    config.kv_cache_dtype = "turboquant_4bit_nc"
+    pool = _pool(kv_cache_dtype="turboquant_4bit_nc")
+    kv_bytes, swa_bytes = pool.unit_bytes()
+    # codes (head_dim bytes in total) + fp16 K norm, V scale and V zero per head, over the 4 sparse layers, plus the slab
+    expected = (64 + 6) * 2 * 4 + 32 * 4 * 2 // 4
+    assert (kv_bytes, swa_bytes) == (expected, 0)
+    assert spec_kv_bytes_per_token(spec, config) == expected
+    per_page, fixed, page_tokens, reserve = QSAKVCache.kv_cost(config)
+    assert per_page == expected * 64 and page_tokens == 64 and reserve == 0
+    ring = 4 * (32 * 4 * 2) * (QSAKVCache.ring_capacity_for(4) + 1)
+    assert fixed == ring + (64 * 64 + 16 + 15) * 4
+    config.kv_cache_dtype = "model"
+    assert QSAKVCache.kv_cost(config)[0] > per_page and QSAKVCache.kv_cost(config)[1] == ring
+
+
+def test_turboquant_rebuild_resizes_codes_metadata_and_index_tiers():
+    pool = _pool(num_pages=4, kv_cache_dtype="turboquant_4bit_nc")
+    pool.rebuild(16)
+    assert pool.k_cache(1).shape == (16, 64, 2, 32)
+    assert pool.k_norm_cache(1).shape == (16 * 64, 2)
+    assert pool.cmp_k_cache(0).shape == (16 * 64 // 4 + 4, 32)
+    assert pool.unit_bytes()[0] == (64 + 6) * 2 * 4 + 32 * 4 * 2 // 4
+
+
+def test_qsa_pool_rejects_q8_0():
+    with pytest.raises(ValueError, match="turboquant_4bit_nc"):
+        _pool(kv_cache_dtype="q8_0")
+
+
+def test_factory_builds_a_turboquant_qsa_pool(monkeypatch):
+    from freetoken.kvcache import create_kvcache_pool
+
+    mc = SimpleNamespace(
+        model_is_mrope=False,
+        num_layers=8, has_swa_attention=False, has_linear_attention=True,
+        num_kv_heads=2, head_dim=64, dsv4_args=None,
+    )
+    mc.kv_cache_group_specs = lambda: (_spec(),)
+    pool = create_kvcache_pool(
+        mc, num_pages=4, page_size=64, dtype=torch.bfloat16, device=DEV, num_req_slots=4,
+        kv_cache_dtype="turboquant_4bit_nc",
+    )
+    assert isinstance(pool, QSAKVCache) and pool.kv_cache_dtype == "turboquant_4bit_nc"

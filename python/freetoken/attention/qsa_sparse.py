@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING, Callable, List
 
 import torch
 from freetoken.core import Batch, get_global_ctx
+from freetoken.env import ENV
 from freetoken.utils import init_logger
 
 from .base import AttentionSpec, BaseAttnBackend, BaseAttnMetadata
@@ -50,6 +51,8 @@ _CPU_PINNED = {"device": "cpu", "dtype": torch.int32, "pin_memory": True}
 # Block-score transient budget (vLLM's number): the fp32 [rows, n_blocks] logits tile is
 # 256 KB per row at a 1M-token context, so a long prefill must be scored in row chunks.
 _LOGITS_WORKSPACE_BYTES = 128 << 20
+# Shorter prefills (and verify rows) stay on the per-row kernel: the tile setup costs more than it saves.
+_GEMM_MIN_ROWS = 256
 
 
 TORCH_TOPK_ENV = "FREETOKEN_QSA_TORCH_TOPK"
@@ -114,7 +117,8 @@ class QSASparseAttnBackend(BaseAttnBackend):
             f"qsa_sparse backend needs a QSA pool, got {type(self.kvcache).__name__}"
         )
         self.device = self.kvcache.device
-        self.dtype = self.kvcache.dtype
+        self.dtype = self.kvcache._compute_dtype  # the pool's own dtype is uint8 under TurboQuant
+        self.turboquant = self.kvcache.kv_cache_dtype == "turboquant_4bit_nc"
         self.index_head_dim = self.kvcache.index_head_dim
         self.ratio = self.kvcache.index_ratio
         self.ring_capacity = self.kvcache.ring_capacity
@@ -301,14 +305,31 @@ class QSASparseAttnBackend(BaseAttnBackend):
         spec = getattr(batch, "spec", None)
         self._update_index_cache(index, md, slot, 1 if spec is None else q.shape[0] // spec.num_reqs)
         indices = self._select(index, md, slot)
+        k_cache, v_cache = self.kvcache.k_cache(layer_id), self.kvcache.v_cache(layer_id)
+        quant = {}
+        if self.turboquant:
+            quant = dict(
+                k_norms=self.kvcache.k_norm_cache(layer_id),
+                v_scales=self.kvcache.v_scale_cache(layer_id),
+                v_zeros=self.kvcache.v_zero_cache(layer_id),
+                centroids=self.kvcache.turboquant_centroids,
+                rotation=self.kvcache.turboquant_rotation,
+            )
+        if (
+            ENV.QSA_GEMM_PREFILL.value
+            and not md.is_decode
+            and spec is None
+            and q.shape[0] >= _GEMM_MIN_ROWS
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            from freetoken.kernel.triton.qsa import qsa_gemm_attention
+
+            return qsa_gemm_attention(
+                q, k_cache, v_cache, indices, md.block_table, md.token_to_req,
+                md.qo_indptr_cpu.tolist(), torch.empty_like(q), **quant,
+            )
         return qsa_sparse_paged_attention(
-            q,
-            self.kvcache.k_cache(layer_id),
-            self.kvcache.v_cache(layer_id),
-            indices,
-            md.block_table,
-            md.token_to_req,
-            torch.empty_like(q),
+            q, k_cache, v_cache, indices, md.block_table, md.token_to_req, torch.empty_like(q), **quant,
         )
 
     def _plan_index_writes(self, md: QSASparseMetadata, batch: Batch) -> None:

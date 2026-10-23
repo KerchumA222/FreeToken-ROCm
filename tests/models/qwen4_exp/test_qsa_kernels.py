@@ -504,3 +504,189 @@ def test_capture_graph_provisions_the_block_topk_scratch():
     assert backend._scratch("topk_scratch", 2, width, dtype=torch.int32).data_ptr() == (
         static.data_ptr()
     )
+
+
+# --------------------------------------------------------------------------------------
+# TurboQuant K/V pages and the tiled prefill
+# --------------------------------------------------------------------------------------
+
+KV_HEADS, Q_HEADS, HEAD_DIM = 2, 4, 256
+
+
+def _kv_pool(kv_cache_dtype: str, num_pages: int):
+    from freetoken.distributed import set_tp_info, try_get_tp_info
+    from freetoken.kvcache.mha_pool import MHAKVCache
+
+    if try_get_tp_info() is None:
+        set_tp_info(rank=0, size=1)
+    return MHAKVCache(
+        num_kv_heads=KV_HEADS, num_layers=1, head_dim=HEAD_DIM, num_pages=num_pages,
+        page_size=PAGE_SIZE, dtype=torch.float16, device=torch.device("cuda"),
+        kv_cache_dtype=kv_cache_dtype,
+    )
+
+
+def _filled_pool(kv_cache_dtype: str, num_pages: int, seed: int = 5):
+    """A pool whose every slot holds random K/V; returns it with the unquantized K/V."""
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    pool = _kv_pool(kv_cache_dtype, num_pages)
+    n = num_pages * PAGE_SIZE
+    k = torch.randn(n, KV_HEADS * HEAD_DIM, device="cuda", dtype=torch.float16, generator=gen)
+    v = torch.randn(n, KV_HEADS * HEAD_DIM, device="cuda", dtype=torch.float16, generator=gen)
+    pool.store_kv(k, v, torch.arange(n, dtype=torch.int32, device="cuda"), 0)
+    return pool, k, v
+
+
+def _quant_meta(pool):
+    return dict(
+        k_norms=pool.k_norm_cache(0), v_scales=pool.v_scale_cache(0), v_zeros=pool.v_zero_cache(0),
+        centroids=pool.turboquant_centroids, rotation=pool.turboquant_rotation,
+    )
+
+
+def _selection(rows, width, seed=3):
+    """Random causal selections: row ``(req, position)`` picks up to ``width`` distinct tokens of
+    its request's logical prefix, -1 padded."""
+    gen = torch.Generator().manual_seed(seed)
+    indices = torch.full((len(rows), width), -1, dtype=torch.int32)
+    for i, (_, position) in enumerate(rows):
+        pick = torch.randperm(position + 1, generator=gen)[:width]
+        indices[i, : pick.numel()] = pick.to(torch.int32)
+    return indices.cuda()
+
+
+def _paged_batch(rows, pages_per_req, num_pages, seed=9):
+    """Physical pages are a shuffled assignment, so logical -> physical translation matters."""
+    gen = torch.Generator().manual_seed(seed)
+    order = torch.randperm(num_pages, generator=gen)
+    num_reqs = max(r for r, _ in rows) + 1
+    table = order[: num_reqs * pages_per_req].view(num_reqs, pages_per_req).to(torch.int32).cuda()
+    token_to_req = torch.tensor([r for r, _ in rows], dtype=torch.int32).cuda()
+    return table, token_to_req
+
+
+def _dense_reference(q, pool, kv_cache_dtype, indices, table, token_to_req):
+    """fp32 attention over each row's selected tokens, K/V read back through the pool's own
+    dequantization (K in the rotated basis, paired with the rotated query)."""
+    from freetoken.kernel.triton.turboquant import dequant_turboquant_4bit_nc
+
+    n = pool.k_cache(0).shape[0] * PAGE_SIZE
+    if kv_cache_dtype == "turboquant_4bit_nc":
+        meta = _quant_meta(pool)
+        k, v = dequant_turboquant_4bit_nc(
+            k_cache=pool.k_cache(0).view(-1, KV_HEADS, HEAD_DIM // 2),
+            v_cache=pool.v_cache(0).view(-1, KV_HEADS, HEAD_DIM // 2),
+            k_norms=meta["k_norms"], v_scales=meta["v_scales"], v_zeros=meta["v_zeros"],
+            centroids=meta["centroids"], indices=torch.arange(n, dtype=torch.int32, device="cuda"),
+            dtype=torch.float32,
+        )
+        q = q.float() @ meta["rotation"].T
+    else:
+        k = pool.k_cache(0).reshape(n, KV_HEADS, HEAD_DIM).float()
+        v = pool.v_cache(0).reshape(n, KV_HEADS, HEAD_DIM).float()
+        q = q.float()
+    out = torch.zeros(q.shape, dtype=torch.float32, device=q.device)
+    group = q.shape[1] // KV_HEADS
+    for row in range(q.shape[0]):
+        logical = indices[row][indices[row] >= 0].long()
+        slots = table[token_to_req[row].long(), logical // PAGE_SIZE].long() * PAGE_SIZE + logical % PAGE_SIZE
+        for head in range(q.shape[1]):
+            kv = head // group
+            weights = torch.softmax(k[slots, kv] @ q[row, head] * HEAD_DIM**-0.5, dim=0)
+            out[row, head] = weights @ v[slots, kv]
+    return out
+
+
+def _row_sets():
+    decode = [(0, 700), (1, 130), (2, 1999), (3, 0)]  # one row per request
+    verify = [(0, 500 + i) for i in range(4)]  # 1 + depth rows of one request
+    prefill = [(0, 40 + i) for i in range(150)] + [(1, 10 + i) for i in range(70)]
+    return {"decode": decode, "verify": verify, "prefill": prefill}
+
+
+@requires_cuda
+@pytest.mark.parametrize("kv_cache_dtype", ["model", "turboquant_4bit_nc"])
+@pytest.mark.parametrize("case", ["decode", "verify", "prefill"])
+@pytest.mark.parametrize("width", [100, 2051])
+def test_sparse_attention_matches_dense_reference(kv_cache_dtype, case, width):
+    """The per-row sparse kernel over model-dtype and TurboQuant pages equals fp32 attention over
+    the same (dequantized) K/V, for decode rows, MTP verify rows and prefill rows."""
+    from freetoken.kernel.triton.qsa import qsa_sparse_paged_attention
+
+    rows = _row_sets()[case]
+    pages_per_req, num_pages = 32, 160
+    pool, _, _ = _filled_pool(kv_cache_dtype, num_pages)
+    gen = torch.Generator(device="cuda").manual_seed(1)
+    q = torch.randn(len(rows), Q_HEADS, HEAD_DIM, device="cuda", dtype=torch.float16, generator=gen)
+    indices = _selection(rows, width)
+    table, token_to_req = _paged_batch(rows, pages_per_req, num_pages)
+    meta = _quant_meta(pool) if kv_cache_dtype == "turboquant_4bit_nc" else {}
+    got = qsa_sparse_paged_attention(
+        q, pool.k_cache(0), pool.v_cache(0), indices, table, token_to_req, **meta
+    )
+    reference = _dense_reference(q, pool, kv_cache_dtype, indices, table, token_to_req)
+    torch.testing.assert_close(got.float(), reference, rtol=2e-2, atol=2e-3)
+
+
+@requires_cuda
+@pytest.mark.parametrize("tuning", [(16, 1, 4), (16, 8, 2), (32, 64, 4)])
+def test_turboquant_sparse_attention_is_independent_of_the_split_profile(tuning):
+    from freetoken.kernel.triton.qsa import qsa_sparse_paged_attention
+
+    rows = _row_sets()["verify"]
+    pool, _, _ = _filled_pool("turboquant_4bit_nc", 64)
+    q = torch.randn(len(rows), Q_HEADS, HEAD_DIM, device="cuda", dtype=torch.float16)
+    indices = _selection(rows, 400)
+    table, token_to_req = _paged_batch(rows, 8, 64)
+    run = lambda **kw: qsa_sparse_paged_attention(
+        q, pool.k_cache(0), pool.v_cache(0), indices, table, token_to_req, **_quant_meta(pool), **kw
+    )
+    torch.testing.assert_close(run(tuning=tuning).float(), run().float(), rtol=1e-2, atol=2e-3)
+
+
+@requires_cuda
+@pytest.mark.parametrize("kv_cache_dtype", ["model", "turboquant_4bit_nc"])
+@pytest.mark.parametrize("budget", ["default", "batched", "fallback"])
+def test_tiled_prefill_matches_the_sparse_kernel(kv_cache_dtype, budget, monkeypatch):
+    """GEMM prefill is the same attention as the per-row kernel, and its scratch obeys the byte
+    cap: tiles batch to fit it, and a tile whose union does not fit runs through the sparse kernel."""
+    import freetoken.kernel.triton.qsa.attend_tiled as tiled
+    from freetoken.kernel.triton.qsa import qsa_gemm_attention, qsa_sparse_paged_attention
+
+    rows = [(0, 2300 + i) for i in range(200)] + [(1, 900 + i) for i in range(45)]
+    pages_per_req, num_pages = 48, 120
+    pool, _, _ = _filled_pool(kv_cache_dtype, num_pages)
+    gen = torch.Generator(device="cuda").manual_seed(2)
+    q = torch.randn(len(rows), Q_HEADS, HEAD_DIM, device="cuda", dtype=torch.float16, generator=gen)
+    indices = _selection(rows, 300)
+    table, token_to_req = _paged_batch(rows, pages_per_req, num_pages)
+    meta = _quant_meta(pool) if kv_cache_dtype == "turboquant_4bit_nc" else {}
+    turbo = bool(meta)
+    group = Q_HEADS // KV_HEADS
+    one_tile = tiled._tile_bytes(41 * PAGE_SIZE, group, HEAD_DIM, 2, turbo)
+    limit = {"default": None, "batched": 3 * one_tile, "fallback": 1}[budget]
+
+    calls = []
+    original = tiled._gemm_tiles
+
+    def spy(q_, k_cache, v_cache, out, pages, mask, row_ids, kvh, group_, length, dim, **kw):
+        calls.append((row_ids.shape[0], length))
+        return original(q_, k_cache, v_cache, out, pages, mask, row_ids, kvh, group_, length, dim, **kw)
+
+    monkeypatch.setattr(tiled, "_gemm_tiles", spy)
+    got = qsa_gemm_attention(
+        q, pool.k_cache(0), pool.v_cache(0), indices, table, token_to_req, [0, 200, 245],
+        gemm_bytes=limit, **meta,
+    )
+    expected = qsa_sparse_paged_attention(
+        q, pool.k_cache(0), pool.v_cache(0), indices, table, token_to_req, **meta
+    )
+    torch.testing.assert_close(got.float(), expected.float(), rtol=3e-2, atol=3e-3)
+    if budget == "fallback":
+        assert not calls
+    else:
+        assert calls
+    if limit is not None and budget != "fallback":
+        assert len(calls) > 1
+        for tiles, length in calls:
+            assert tiles * tiled._tile_bytes(length, group, HEAD_DIM, 2, turbo) <= limit
