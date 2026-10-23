@@ -112,6 +112,10 @@ class Qwen4ExpModel(BaseOP):
         return list(self._ple)
 
     def forward(self, input_ids: torch.Tensor, batch: Batch) -> torch.Tensor:
+        return self.hyper_connection_mixer.mix(self.forward_wide(input_ids, batch))[0]
+
+    def forward_wide(self, input_ids: torch.Tensor, batch: Batch) -> torch.Tensor:
+        """The residual streams ``R [T, hc_count*hidden]`` after the last layer, before the top-level mixer."""
         hidden = embed_input_ids(self.embed_tokens, input_ids, batch)
         hidden = hidden.repeat(1, self.hc_count)
         meta = None
@@ -127,7 +131,7 @@ class Qwen4ExpModel(BaseOP):
             # single writer: the layers only read the context, so a second PLE layer's
             # prefetch sees the un-rolled window
             commit_ngram_context(meta, getattr(batch, "fla_metadata", None))
-        return self.hyper_connection_mixer.mix(hidden)[0]
+        return hidden
 
 
 class Qwen4ExpForCausalLM(BaseLLMModel):
@@ -210,7 +214,12 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
 
     def forward(self) -> torch.Tensor:
         batch = get_global_ctx().batch
-        return self.lm_head.forward(self.model.forward(batch.input_ids, batch))
+        wide = self.model.forward_wide(batch.input_ids, batch)
+        logits = self.lm_head.forward(self.model.hyper_connection_mixer.mix(wide)[0])
+        if getattr(batch, "capture_hidden", False):
+            # the MTP draft head reads the wide residual, not the mixed LM-head input the head captured
+            batch.hidden_states = wide
+        return logits
 
 
 class Qwen4ExpForConditionalGeneration(QwenVLVisionMixin, Qwen4ExpForCausalLM):

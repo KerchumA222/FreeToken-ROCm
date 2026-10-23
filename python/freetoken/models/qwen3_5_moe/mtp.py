@@ -133,6 +133,9 @@ class Qwen3_5MTP:
     """``--speculative-algorithm mtp`` for qwen35 / qwen35moe GGUFs: the nextn block of the checkpoint
     itself, or of a draft-head-only GGUF (``mtp-*.gguf``, ``<arch>.mtp.draft_only``) beside it."""
 
+    def draft_layer(self, path: str) -> int | None:
+        return mtp_draft_layer(path)
+
     def locate(self, model_path: str, draft_path: str | None):
         from freetoken.models.gguf.reader import gguf_architecture, gguf_config_source
         from freetoken.speculative.mtp import MtpSource
@@ -150,7 +153,7 @@ class Qwen3_5MTP:
                 raise ValueError(
                     f"draft head {draft_path} is {draft_arch!r}, the checkpoint {model_arch!r}"
                 )
-        block = mtp_draft_layer(path)
+        block = self.draft_layer(path)
         if block is None:
             hint = "" if draft_path else "; pass the draft head's GGUF with --speculative-draft-model-path"
             raise ValueError(f"{path} carries no nextn (MTP) block{hint}")

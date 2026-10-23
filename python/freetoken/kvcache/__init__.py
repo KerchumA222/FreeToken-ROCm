@@ -154,7 +154,15 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
         dtype=dtype,
         num_req_slots=config.max_running_req + 1,  # + 1 for the dummy request row
         kv_cache_dtype=getattr(config, "kv_cache_dtype", "model"),
+        num_speculative_tokens=_speculative_tokens(config),
     )
+
+
+def _speculative_tokens(config) -> int:
+    """Draft rows a verify step adds to one request's forward (0 without speculation)."""
+    if getattr(config, "speculative_algorithm", None) is None:
+        return 0
+    return int(config.speculative_num_draft_tokens)
 
 
 def create_kvcache_pool(
@@ -166,6 +174,7 @@ def create_kvcache_pool(
     num_swa_tokens: int | None = None,
     num_req_slots: int | None = None,
     kv_cache_dtype: str = "model",
+    num_speculative_tokens: int = 0,
 ) -> BaseKVCachePool:
     if kv_cache_dtype not in ("model", "q8_0", "turboquant_4bit_nc"):
         raise ValueError(f"unsupported KV cache dtype {kv_cache_dtype!r}")
@@ -264,6 +273,7 @@ def create_kvcache_pool(
             num_index_layers=spec.num_index_layers,
             index_ratio=spec.index_ratio,
             num_req_slots=num_req_slots,
+            ring_capacity=QSAKVCache.ring_capacity_for(spec.index_ratio, num_speculative_tokens),
             layer_ids=spec.layer_ids,
             mrope=model_config.model_is_mrope,
         )

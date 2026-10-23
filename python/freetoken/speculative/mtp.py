@@ -45,6 +45,11 @@ class MtpAdapter:
     def locate(self, model_path: str, draft_path: str | None) -> MtpSource:
         raise NotImplementedError
 
+    def head_config(self, config: "ModelConfig", source: MtpSource) -> "ModelConfig":
+        """The config the head is built from: the target's, unless the draft file declares a different MoE
+        (a base model's head beside a pruned fine-tune)."""
+        return config
+
     def build_head(self, config: "ModelConfig", layer_id: int):
         raise NotImplementedError
 
@@ -70,6 +75,15 @@ class MtpAdapter:
         return iter(())
 
 
+def replace_config(config: "ModelConfig", **changes) -> "ModelConfig":
+    """``dataclasses.replace`` that keeps the attributes stashed outside the dataclass fields (the GGUF readers' expert bank types)."""
+    out = replace(config, **changes)
+    for key, value in config.__dict__.items():
+        if key not in out.__dict__:
+            object.__setattr__(out, key, value)
+    return out
+
+
 def with_draft_layer(config: "ModelConfig") -> "ModelConfig":
     """``config`` with one draft block at layer id ``num_layers``, in the full-attention group.
 
@@ -81,18 +95,18 @@ def with_draft_layer(config: "ModelConfig") -> "ModelConfig":
     groups = []
     for group in config.attention_groups or ():
         ids = set(group.layer_ids)
+        extra = {}
         if isinstance(group, FullAttentionGroupConfig):
+            # an indexer on every layer of the group (QSA) gets one for the draft block too
+            if group.num_index_layers and group.num_index_layers == len(ids) and layer_id not in ids:
+                extra["num_index_layers"] = group.num_index_layers + 1
             ids.add(layer_id)
         else:
             ids.discard(layer_id)
-        groups.append(replace(group, layer_ids=tuple(sorted(ids))))
+        groups.append(replace(group, layer_ids=tuple(sorted(ids)), **extra))
     if not any(isinstance(g, FullAttentionGroupConfig) for g in groups):
         raise NotImplementedError("an MTP draft block needs a full-attention group to give it a KV layer")
-    out = replace(config, attention_groups=tuple(groups), num_draft_layers=1)
-    for key, value in config.__dict__.items():
-        if key not in out.__dict__:
-            object.__setattr__(out, key, value)
-    return out
+    return replace_config(config, attention_groups=tuple(groups), num_draft_layers=1)
 
 
 def mtp_adapter(spec: "ModelSpec") -> MtpAdapter:
@@ -138,15 +152,18 @@ class MtpDrafter:
         self.depth = int(config.speculative_num_draft_tokens)
         mc = config.model_config
         self.layer_id = mc.num_layers
-        head_config = replace(mc, quant=head_quant_config(self.source, config.model_spec))
-        for key, value in mc.__dict__.items():
-            if key not in head_config.__dict__:
-                object.__setattr__(head_config, key, value)
+        head_config = replace_config(
+            self.adapter.head_config(mc, self.source), quant=head_quant_config(self.source, config.model_spec)
+        )
+        self.head_config = head_config
+        # the head's routed experts share the decoder's offload cache only when a cache layer can hold either
+        self.shares_experts = getattr(head_config, "num_experts", None) == getattr(mc, "num_experts", None)
+        self.expert_cache = None
         with torch.device("meta"), torch_dtype(config.dtype):
             self.head = self.adapter.build_head(head_config, self.layer_id)
         reference = self.head.state_dict()
         state = {}
-        for key, tensor in self.adapter.iter_weights(self.source, mc):
+        for key, tensor in self.adapter.iter_weights(self.source, head_config):
             expected = reference.get(key)
             if expected is None:
                 raise ValueError(f"{self.source.path}: draft head tensor {key!r} has no place in the head module")
@@ -319,4 +336,4 @@ class MtpDrafter:
         return torch.stack(drafts, dim=1) if drafts else None
 
 
-__all__ = ["MtpAdapter", "MtpDrafter", "MtpSource", "head_quant_config", "locate_mtp_head", "mtp_adapter", "with_draft_layer"]
+__all__ = ["MtpAdapter", "MtpDrafter", "MtpSource", "head_quant_config", "locate_mtp_head", "mtp_adapter", "replace_config", "with_draft_layer"]

@@ -73,12 +73,30 @@ _TOP_LEAVES: dict[str, tuple[str, ...]] = {
     "model.language_model.hyper_connection_mixer.input_mix_weight_up": ("output_hc_up",),
 }
 _LAYER_RE = re.compile(r"^model\.language_model\.layers\.(\d+)\.(.+)$")
+# the draft head's own modules (models/qwen4_exp/mtp.py), under "mtp."
+_NEXTN_LEAVES: dict[str, tuple[str, ...]] = {
+    "eh_proj": ("nextn.eh_proj",),
+    "hyper_connection_mixer.input_mix_weight_down": ("nextn.hc_head_down",),
+    "hyper_connection_mixer.input_mix_weight_up": ("nextn.hc_head_up",),
+}
 
 
 def to_gguf(name: str, tensors: dict[str, int]) -> tuple[str, ...]:
     """Checkpoint module name -> the GGUF tensors (without ``.weight``) that store it; empty for modules the GGUF has no matrix for."""
     if name in _TOP_LEAVES:
         return _TOP_LEAVES[name]
+    if name.startswith("mtp."):
+        from freetoken.models.qwen3_5_moe.gguf import nextn_block
+
+        n = nextn_block(tensors)
+        rest = name.removeprefix("mtp.")
+        if n is None:
+            return ()
+        if rest in _NEXTN_LEAVES:
+            return tuple(f"blk.{n}.{leaf}" for leaf in _NEXTN_LEAVES[rest])
+        if not rest.startswith("layer."):
+            return ()
+        return tuple(f"blk.{n}.{leaf}" for leaf in _LAYER_LEAVES.get(rest.removeprefix("layer."), ()))
     m = _LAYER_RE.match(name)
     if m is None:
         return ()
@@ -171,26 +189,9 @@ def _untile(t: torch.Tensor, num_k_heads: int, head_dim: int, dim: int = 0) -> t
     return t.index_select(dim, idx)
 
 
-def iter_gguf_weights(
-    model_path: str,
-    device: torch.device,
-    *,
-    include_moe_experts: bool,
-    include_non_moe: bool,
-    include_vision: bool = True,
-) -> Iterator[tuple[str, torch.Tensor]]:
-    """The dense state dict from the GGUF; the routed experts load as offload banks (``freetoken.models.gguf.experts``)."""
-    if not include_non_moe:
-        return
-    from freetoken.utils import cached_load_hf_config
-
-    config = parse_gguf_config(cached_load_hf_config(model_path))
-    vision = include_vision and config.is_multimodal
-    log_mmproj(model_path, vision)
-    index = gguf_tensor_index(model_path)
-    md = cached_load_hf_config(model_path).metadata
-    g = config.linear_attention_group()
-    hidden = config.hidden_size
+def _reader(index: dict[str, GgufTensorInfo], config: ModelConfig):
+    """``(t, norm, hc)`` over one GGUF's tensor index: tensor lookup, a stored ``w + 1`` norm back to ``w``, and one hyper-connection's fused modules."""
+    hidden, streams, lowrank = config.hidden_size, config.qwen4_args.hc_count, config.qwen4_args.hc_lowrank
 
     def t(name: str) -> GgufTensorInfo:
         return index[name if name in index else f"{name}.weight"]
@@ -201,9 +202,100 @@ def iter_gguf_weights(
     def hc(prefix: str, src: str) -> Iterator[tuple[str, torch.Tensor]]:
         down, inject, up = (t(f"{src}_{p}") for p in ("down", "inject", "up"))
         yield from fused(f"{prefix}.input_mix_weight_down_block_inject", [down, inject], [matrix(down), matrix(inject)],
-                         hidden * config.qwen4_args.hc_count, pad_to=16)
-        yield from fused(f"{prefix}.input_mix_weight_up", [up], [matrix(up)], config.qwen4_args.hc_lowrank)
+                         hidden * streams, pad_to=16)
+        yield from fused(f"{prefix}.input_mix_weight_up", [up], [matrix(up)], lowrank)
         yield f"{prefix}.hc_norm.weight", norm(f"{src}_norm")
+
+    return t, norm, hc
+
+
+def _iter_layer(
+    index: dict[str, GgufTensorInfo], config: ModelConfig, md: dict | None, layer: int, pre: str, *, linear: bool
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """One decoder block ``blk.<layer>`` of ``index`` under the module prefix ``pre``; ``md`` (the GGUF metadata) is read for PLE layers only."""
+    hidden = config.hidden_size
+    g = config.linear_attention_group()
+    t, norm, hc = _reader(index, config)
+    blk = f"blk.{layer}"
+    if linear:
+        la = f"{pre}.linear_attn"
+        nk, dk = g.num_key_heads, g.key_head_dim
+        qkv, gate = t(f"{blk}.attn_qkv"), t(f"{blk}.attn_gate")
+        qkv_rows = matrix(qkv)
+        v_start = 2 * nk * dk
+        qkv_rows = torch.cat([qkv_rows[:v_start], _untile(qkv_rows[v_start:], nk, g.value_head_dim)])
+        z_rows = _untile(matrix(gate), nk, g.value_head_dim)
+        beta_info, alpha_info = t(f"{blk}.ssm_beta"), t(f"{blk}.ssm_alpha")
+        beta, alpha = (_untile(matrix(i), nk, 1) for i in (beta_info, alpha_info))
+        if is_quantized(qkv.ggml_type) or is_quantized(gate.ggml_type):
+            yield from fused(f"{la}.in_proj_qkvz", [qkv, gate], [qkv_rows, z_rows], hidden)
+            yield from fused(f"{la}.in_proj_ba", [beta_info, alpha_info], [beta, alpha], hidden)
+        else:
+            yield from fused(f"{la}.in_proj", [qkv, gate, beta_info, alpha_info], [qkv_rows, z_rows, beta, alpha], hidden)
+        conv = float_tensor(t(f"{blk}.ssm_conv1d")).float()
+        conv = torch.cat([conv[:v_start], _untile(conv[v_start:], nk, g.value_head_dim)])
+        yield f"{la}.conv1d.weight", conv.unsqueeze(1)
+        yield f"{la}.dt_bias", _untile(float_tensor(t(f"{blk}.ssm_dt.bias")).float(), nk, 1)
+        yield f"{la}.A_log", _untile(torch.log(-float_tensor(t(f"{blk}.ssm_a")).float()), nk, 1)
+        yield f"{la}.norm.weight", float_tensor(t(f"{blk}.ssm_norm"))
+        yield from fused(f"{la}.out_proj", [t(f"{blk}.ssm_out")], [matrix(t(f"{blk}.ssm_out"))], g.num_value_heads * g.value_head_dim)
+    else:
+        sa = f"{pre}.self_attn"
+        parts = [t(f"{blk}.attn_{p}") for p in ("q", "k", "v")]
+        yield from fused(f"{sa}.qkv_proj", parts, [matrix(p) for p in parts], hidden)
+        out = t(f"{blk}.attn_output")
+        yield from fused(f"{sa}.o_proj", [out], [matrix(out)], int(out.ne[0]))
+        yield f"{sa}.q_norm.weight", norm(f"{blk}.attn_q_norm")
+        yield f"{sa}.k_norm.weight", norm(f"{blk}.attn_k_norm")
+        iq, ik = t(f"{blk}.indexer.q_proj"), t(f"{blk}.indexer.k_proj")
+        yield from fused(f"{sa}.indexer.index_qk_proj", [iq, ik], [matrix(iq), matrix(ik)], hidden)
+        yield f"{sa}.indexer.q_layernorm.weight", norm(f"{blk}.indexer.q_norm")
+        yield f"{sa}.indexer.k_layernorm.weight", norm(f"{blk}.indexer.k_norm")
+
+    mlp = f"{pre}.mlp"
+    yield f"{mlp}.gate.weight", float_tensor(t(f"{blk}.ffn_gate_inp"))
+    sg, su, sd = (t(f"{blk}.ffn_{p}_shexp") for p in ("gate", "up", "down"))
+    yield from fused(f"{mlp}.shared_expert.gate_up_proj", [sg, su], [matrix(sg), matrix(su)], hidden)
+    yield from fused(f"{mlp}.shared_expert.down_proj", [sd], [matrix(sd)], config.shared_expert_intermediate_size)
+    yield f"{mlp}.shared_expert_gate.weight", float_tensor(t(f"{blk}.ffn_gate_inp_shexp")).reshape(1, -1)
+    yield from hc(f"{pre}.attn_hyper_connection", f"{blk}.hc_attn")
+    yield from hc(f"{pre}.mlp_hyper_connection", f"{blk}.hc_ffn")
+
+    if layer in config.qwen4_args.ple_layer_ids:
+        ple = f"{pre}.ple"
+        for proj in ("key", "value"):
+            info = t(f"{blk}.ple_{proj}")
+            yield from fused(f"{ple}.{proj}_proj", [info], [matrix(info)], config.qwen4_args.ple_embed_dim)
+        for n in ("key", "query", "conv"):
+            yield f"{ple}.norm_{n}.weight", norm(f"{blk}.ple_norm_{n}")
+        yield f"{ple}.conv1d.weight", float_tensor(t(f"{blk}.ple_conv1d")).float().unsqueeze(1)
+        yield f"{ple}.ple_embedding.layer_multipliers", torch.tensor([int(x) for x in md[f"{_ARCH}.ple.layer_multipliers"]], dtype=torch.int64)
+        yield f"{ple}.ple_embedding.ngram_heads_vocab_sizes", torch.tensor([int(x) for x in md[f"{_ARCH}.ple.head_vocab_sizes"]], dtype=torch.int64)
+        yield f"{ple}.ple_embedding.ngram_heads_offsets", torch.tensor([int(x) for x in md[f"{_ARCH}.ple.head_offsets"]], dtype=torch.int64)
+
+
+def iter_gguf_weights(
+    model_path: str,
+    device: torch.device,
+    *,
+    include_moe_experts: bool,
+    include_non_moe: bool,
+    include_vision: bool = True,
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """The dense state dict from the GGUF; the routed experts load as offload banks (``freetoken.models.gguf.experts``).
+
+    A ``nextn`` (MTP) block after the decoder is skipped here; ``mtp.iter_gguf_mtp_weights`` loads it when a draft head asks."""
+    if not include_non_moe:
+        return
+    from freetoken.utils import cached_load_hf_config
+
+    config = parse_gguf_config(cached_load_hf_config(model_path))
+    vision = include_vision and config.is_multimodal
+    log_mmproj(model_path, vision)
+    index = gguf_tensor_index(model_path)
+    md = cached_load_hf_config(model_path).metadata
+    hidden = config.hidden_size
+    t, norm, _ = _reader(index, config)
 
     yield from fused("model.embed_tokens", [t("token_embd")], [matrix(t("token_embd"))], hidden)
     yield from fused("lm_head", [t("output")], [matrix(t("output"))], hidden)
@@ -213,62 +305,7 @@ def iter_gguf_weights(
     yield "model.hyper_connection_mixer.hc_norm.weight", norm("output_hc_norm")
 
     for layer in range(config.num_layers):
-        blk, pre = f"blk.{layer}", f"model.layers.{layer}"
-        if config.is_linear_layer(layer):
-            la = f"{pre}.linear_attn"
-            nk, dk = g.num_key_heads, g.key_head_dim
-            qkv, gate = t(f"{blk}.attn_qkv"), t(f"{blk}.attn_gate")
-            qkv_rows = matrix(qkv)
-            v_start = 2 * nk * dk
-            qkv_rows = torch.cat([qkv_rows[:v_start], _untile(qkv_rows[v_start:], nk, g.value_head_dim)])
-            z_rows = _untile(matrix(gate), nk, g.value_head_dim)
-            beta_info, alpha_info = t(f"{blk}.ssm_beta"), t(f"{blk}.ssm_alpha")
-            beta, alpha = (_untile(matrix(i), nk, 1) for i in (beta_info, alpha_info))
-            if is_quantized(qkv.ggml_type) or is_quantized(gate.ggml_type):
-                yield from fused(f"{la}.in_proj_qkvz", [qkv, gate], [qkv_rows, z_rows], hidden)
-                yield from fused(f"{la}.in_proj_ba", [beta_info, alpha_info], [beta, alpha], hidden)
-            else:
-                yield from fused(f"{la}.in_proj", [qkv, gate, beta_info, alpha_info], [qkv_rows, z_rows, beta, alpha], hidden)
-            conv = float_tensor(t(f"{blk}.ssm_conv1d")).float()
-            conv = torch.cat([conv[:v_start], _untile(conv[v_start:], nk, g.value_head_dim)])
-            yield f"{la}.conv1d.weight", conv.unsqueeze(1)
-            yield f"{la}.dt_bias", _untile(float_tensor(t(f"{blk}.ssm_dt.bias")).float(), nk, 1)
-            yield f"{la}.A_log", _untile(torch.log(-float_tensor(t(f"{blk}.ssm_a")).float()), nk, 1)
-            yield f"{la}.norm.weight", float_tensor(t(f"{blk}.ssm_norm"))
-            yield from fused(f"{la}.out_proj", [t(f"{blk}.ssm_out")], [matrix(t(f"{blk}.ssm_out"))], g.num_value_heads * g.value_head_dim)
-        else:
-            sa = f"{pre}.self_attn"
-            parts = [t(f"{blk}.attn_{p}") for p in ("q", "k", "v")]
-            yield from fused(f"{sa}.qkv_proj", parts, [matrix(p) for p in parts], hidden)
-            out = t(f"{blk}.attn_output")
-            yield from fused(f"{sa}.o_proj", [out], [matrix(out)], int(out.ne[0]))
-            yield f"{sa}.q_norm.weight", norm(f"{blk}.attn_q_norm")
-            yield f"{sa}.k_norm.weight", norm(f"{blk}.attn_k_norm")
-            iq, ik = t(f"{blk}.indexer.q_proj"), t(f"{blk}.indexer.k_proj")
-            yield from fused(f"{sa}.indexer.index_qk_proj", [iq, ik], [matrix(iq), matrix(ik)], hidden)
-            yield f"{sa}.indexer.q_layernorm.weight", norm(f"{blk}.indexer.q_norm")
-            yield f"{sa}.indexer.k_layernorm.weight", norm(f"{blk}.indexer.k_norm")
-
-        mlp = f"{pre}.mlp"
-        yield f"{mlp}.gate.weight", float_tensor(t(f"{blk}.ffn_gate_inp"))
-        sg, su, sd = (t(f"{blk}.ffn_{p}_shexp") for p in ("gate", "up", "down"))
-        yield from fused(f"{mlp}.shared_expert.gate_up_proj", [sg, su], [matrix(sg), matrix(su)], hidden)
-        yield from fused(f"{mlp}.shared_expert.down_proj", [sd], [matrix(sd)], config.shared_expert_intermediate_size)
-        yield f"{mlp}.shared_expert_gate.weight", float_tensor(t(f"{blk}.ffn_gate_inp_shexp")).reshape(1, -1)
-        yield from hc(f"{pre}.attn_hyper_connection", f"{blk}.hc_attn")
-        yield from hc(f"{pre}.mlp_hyper_connection", f"{blk}.hc_ffn")
-
-        if layer in config.qwen4_args.ple_layer_ids:
-            ple = f"{pre}.ple"
-            for proj in ("key", "value"):
-                info = t(f"{blk}.ple_{proj}")
-                yield from fused(f"{ple}.{proj}_proj", [info], [matrix(info)], config.qwen4_args.ple_embed_dim)
-            for n in ("key", "query", "conv"):
-                yield f"{ple}.norm_{n}.weight", norm(f"{blk}.ple_norm_{n}")
-            yield f"{ple}.conv1d.weight", float_tensor(t(f"{blk}.ple_conv1d")).float().unsqueeze(1)
-            yield f"{ple}.ple_embedding.layer_multipliers", torch.tensor([int(x) for x in md[f"{_ARCH}.ple.layer_multipliers"]], dtype=torch.int64)
-            yield f"{ple}.ple_embedding.ngram_heads_vocab_sizes", torch.tensor([int(x) for x in md[f"{_ARCH}.ple.head_vocab_sizes"]], dtype=torch.int64)
-            yield f"{ple}.ple_embedding.ngram_heads_offsets", torch.tensor([int(x) for x in md[f"{_ARCH}.ple.head_offsets"]], dtype=torch.int64)
+        yield from _iter_layer(index, config, md, layer, f"model.layers.{layer}", linear=config.is_linear_layer(layer))
 
     if vision:
         yield from iter_mmproj_weights(find_mmproj(model_path))

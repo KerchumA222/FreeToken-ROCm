@@ -290,6 +290,10 @@ class DiskRowTable:
             if self._failed:
                 raise RuntimeError("PLE disk table failed; recreate the engine before dispatch")
         eos = self.eos_token_id
+        if batch.is_decode and getattr(batch, "spec", None) is not None:
+            # a verify's drafts sit on the device only, and the committed context rides the n-gram state slot
+            self.fill(self._verify_runs(batch), graph=False)
+            return None
         if batch.is_decode:
             reqs = list(batch.reqs)
             if use_graph and self._wait_sync:
@@ -320,6 +324,21 @@ class DiskRowTable:
         ]
         self.fill(runs, graph=False)
         return None
+
+    def _verify_runs(self, batch: Batch) -> list[torch.Tensor]:
+        """Token runs of a step-major verify: each row's two preceding ids, then its own token."""
+        from freetoken.core import get_global_ctx
+
+        from .ple import PLE_NGRAM_STATE, _state_slot
+
+        spec = batch.spec
+        num_reqs = spec.num_reqs
+        pool = get_global_ctx().linear_state_pool
+        slots = torch.tensor([_state_slot(r) for r in spec.reqs], dtype=torch.int64, device=batch.input_ids.device)
+        context = pool.slot_state(PLE_NGRAM_STATE).index_select(0, slots).cpu().to(torch.int64)
+        tokens = batch.input_ids.to("cpu").to(torch.int64).view(-1, num_reqs)
+        window = torch.cat([context, tokens.t()], dim=1)
+        return [window[i, s : s + 3] for s in range(tokens.shape[0]) for i in range(num_reqs)]
 
     @contextmanager
     def forward_host_ctx(self, batch: Batch, use_graph: bool):

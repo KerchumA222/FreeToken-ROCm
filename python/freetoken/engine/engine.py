@@ -780,7 +780,10 @@ class Engine:
         method = shared_offload_method(self.model)
         num_moe_layers = config.model_config.num_moe_layers
         # an MTP draft head's routed experts ride the same cache as one more layer after the decoder's
-        head_layers = list(iter_offload_moe_layers(self.mtp.head)) if self.mtp is not None else []
+        shared_head = self.mtp is not None and self.mtp.shares_experts
+        head_layers = list(iter_offload_moe_layers(self.mtp.head)) if shared_head else []
+        if self.mtp is not None and not shared_head:
+            self.mtp.expert_cache = self._init_head_moe_cache(config, method)
         cache_layers = num_moe_layers + len(head_layers)
         # experts of several formats: one method per MoE layer, one slot pool per format
         layer_methods = offload_layer_methods(self.model)
@@ -981,6 +984,46 @@ class Engine:
             attach_locked_fetch(cache, config, staging, self._profile_layer_rows)
         self.ctx.moe_offload_cache = cache
         self.moe_offload_cache = cache
+        return cache
+
+    def _init_head_moe_cache(self, config: EngineConfig, method) -> OffloadMoeCache:
+        """A draft head whose experts differ in count from the decoder's (a base model's head beside a
+        pruned fine-tune) cannot be one more layer of the decoder's cache, which holds ``num_experts``
+        per layer. It gets a cache of its own with a slot per expert, so once warm it never fetches."""
+        from freetoken.engine.cache_budget import layer_slot_bytes
+        from freetoken.models.gguf.experts import load_gguf_expert_banks
+
+        head_layers = list(iter_offload_moe_layers(self.mtp.head))
+        experts, src = self.mtp.head_config.num_experts, self.mtp.source
+        if method is None or method.kind is not QuantKind.GGUF:
+            raise NotImplementedError("an MTP draft head's routed experts load from GGUF checkpoints only")
+        with _weight_load_context():
+            banks = load_gguf_expert_banks(src.path, len(head_layers), first_layer=src.block, dummy=config.use_dummy_weight)
+        slot_bytes = layer_slot_bytes(banks.sources)
+        pools = make_pools(group_layers("unified", bank_layouts(banks.sources, banks.layer_tags), slot_bytes), experts, experts, method.slot_limit())
+        sizes = [p.max_num_slots for p in pools]
+        cache = OffloadMoeCache(
+            num_layers=len(head_layers),
+            num_experts=experts,
+            cache_size=sum(sizes),
+            device=self.device,
+            cache_policy=config.moe_cache_policy,
+            prefill_overlap=False,
+            quant_format=banks.quant_format,
+            layout=None,
+            max_slots=method.slot_limit(),
+            pool_of_layer=pool_of_layer(pools, len(head_layers)),
+            pool_sizes=sizes,
+        )
+        cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency, layer_tags=banks.layer_tags, row_tail_bytes=banks.row_tail_bytes)
+        cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
+        # the layers index their own cache from 0
+        for i, layer in enumerate(head_layers):
+            layer.layer_id = i
+        attach_offload_moe_cache(self.mtp.head, cache)
+        # the budget of the decoder's cache and the KV pool is what the head's slots leave
+        self._weights_bytes += sum(t.numel() * t.element_size() for t in cache.bank_caches.values())
+        logger.info_rank0(f"MTP draft head: {experts} experts of its own, {sum(sizes)} slots resident")
         return cache
 
     def _attach_disk_tier(self, config: EngineConfig, cache: OffloadMoeCache) -> None:
