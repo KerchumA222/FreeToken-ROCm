@@ -89,6 +89,7 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
     # Same kernels and state layout as Qwen3.5's, so the same decode step and speculative verify
     _decode_rows = Qwen3_5GatedDeltaNet._decode_rows
     _verify = Qwen3_5GatedDeltaNet._verify
+    _verify_fused = Qwen3_5GatedDeltaNet._verify_fused
 
     def _gate_params(self, a: torch.Tensor, b: torch.Tensor):
         beta = b.sigmoid()
