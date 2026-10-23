@@ -564,6 +564,84 @@ def test_mtp_draft_chain_stops_when_no_request_can_extend(monkeypatch, first_con
     assert (drafts is None) if steps_run == 0 else drafts.shape == (1, steps_run)
 
 
+class _ChainGraphs:
+    """The GraphRunner side of a captured chained step: one replay per draft, the drafts kept in its own buffer."""
+
+    def __init__(self, replayable=True, confs=None):
+        self.replayable, self.confs = replayable, confs
+        self.started, self.replayed, self.finished = None, [], None
+
+    def can_replay_chain(self, spec):
+        return self.replayable and spec.num_reqs == 1
+
+    def begin_chain(self, state, token):
+        self.started = (state.clone(), token.clone())
+
+    def replay_chain_step(self, step):
+        self.replayed.append((step.positions.tolist(), step.out_loc.tolist(), step.active_table_idx.tolist(), step.metadata_prepared))
+        return None if self.confs is None else torch.tensor([self.confs[len(self.replayed) - 1]])
+
+    def finish_chain(self, token_pool, req, steps):
+        self.finished = (req.table_idx, steps)
+        token_pool[req.table_idx, req.cached_len + 2 : req.cached_len + 2 + steps] = 40 + torch.arange(steps, dtype=torch.int32)
+        return torch.arange(steps, dtype=torch.int32).view(1, steps)
+
+
+def test_mtp_draft_chain_replays_one_captured_step_per_draft(monkeypatch):
+    drafter, steps, context, backend = _chain_drafter(monkeypatch, [])
+    drafter.logits = lambda out: pytest.fail("the eager head ran")
+    drafter.store = torch.tensor([[10.0], [0.0], [0.0], [0.0]])
+    backend.prepare_metadata = lambda batch: setattr(batch, "metadata_prepared", True)
+    req = SimpleNamespace(table_idx=0, pending_slot=0, cached_len=5)
+    spec = SimpleNamespace(k=3, reqs=[req], first_drafts=[2], num_reqs=1)
+    graphs = _ChainGraphs()
+    token_pool = torch.zeros((1, 12), dtype=torch.int32)
+
+    drafts = drafter.draft_chain(SimpleNamespace(spec=spec), token_pool, context, backend, mrope=False, graphs=graphs)
+
+    assert drafts.tolist() == [[0, 1]] and graphs.finished == (0, 2)
+    assert token_pool[0, 7:9].tolist() == [40, 41]
+    torch.testing.assert_close(graphs.started[0], torch.tensor([[10.0]]))
+    assert graphs.started[1].tolist() == [2]
+    assert graphs.replayed == [([5], [5], [0], True), ([6], [6], [0], True)]
+
+
+def test_mtp_draft_chain_keeps_the_adaptive_depth_when_it_replays(monkeypatch):
+    from freetoken.env import ENV
+
+    drafter, steps, context, backend = _chain_drafter(monkeypatch, [])
+    drafter.logits = lambda out: pytest.fail("the eager head ran")
+    monkeypatch.setattr(ENV.SPEC_DRAFT_MIN_P, "value", 0.5)
+    backend.prepare_metadata = lambda batch: setattr(batch, "metadata_prepared", True)
+    req = SimpleNamespace(table_idx=0, pending_slot=0, cached_len=5)
+
+    def run(first_conf, confs):
+        spec = SimpleNamespace(k=4, reqs=[req], first_drafts=[2], first_conf=[first_conf], num_reqs=1)
+        graphs = _ChainGraphs(confs=confs)
+        out = drafter.draft_chain(SimpleNamespace(spec=spec), torch.zeros((1, 12), dtype=torch.int32), context, backend, mrope=False, graphs=graphs)
+        return out, graphs
+
+    out, graphs = run(0.2, [0.9, 0.9, 0.9])
+    assert out is None and graphs.replayed == [] and graphs.finished is None, "an unsure first draft runs no chain step"
+    out, graphs = run(0.9, [0.9, 0.2, 0.9])
+    assert out.shape == (1, 2) and len(graphs.replayed) == 2, "the step that gives an unsure draft still runs, the next does not"
+    out, graphs = run(0.9, [0.9, 0.9, 0.9])
+    assert out.shape == (1, 3)
+
+
+def test_mtp_draft_chain_runs_eagerly_where_no_chain_graph_applies(monkeypatch):
+    drafter, steps, context, backend = _chain_drafter(monkeypatch, [torch.tensor([[0.0, 0.0, 9.0]])])
+    req = SimpleNamespace(table_idx=0, pending_slot=0, cached_len=5)
+    spec = SimpleNamespace(k=2, reqs=[req], first_drafts=[2], num_reqs=1)
+    graphs = _ChainGraphs(replayable=False)
+    token_pool = torch.zeros((1, 12), dtype=torch.int32)
+
+    drafts = drafter.draft_chain(SimpleNamespace(spec=spec), token_pool, context, backend, mrope=False, graphs=graphs)
+
+    assert drafts.tolist() == [[2]] and token_pool[0, 7].item() == 2 and len(steps) == 1
+    assert graphs.started is None and graphs.replayed == []
+
+
 def test_mtp_draft_chain_confidence_is_the_softmax_max_and_a_mixed_batch_runs_on(monkeypatch):
     from freetoken.env import ENV
 
@@ -577,3 +655,13 @@ def test_mtp_draft_chain_confidence_is_the_softmax_max_and_a_mixed_batch_runs_on
     drafter._page_table = lambda: torch.arange(40, dtype=torch.int32).reshape(2, 20)
     drafts = drafter.draft_chain(SimpleNamespace(spec=spec), torch.zeros((2, 12), dtype=torch.int32), context, backend, mrope=False)
     assert len(steps) == 2 and drafts.shape == (2, 2)
+
+
+def test_the_qwen3_5_adapter_is_an_mtp_adapter_whose_head_keeps_the_targets_config():
+    """MtpDrafter asks every adapter for head_config; the in-checkpoint Qwen3.5/3.6 head shares the target's."""
+    from freetoken.models.qwen3_5_moe.mtp import QWEN3_5_MTP
+    from freetoken.speculative.mtp import MtpAdapter
+
+    assert isinstance(QWEN3_5_MTP, MtpAdapter)
+    config = SimpleNamespace(num_experts=8)
+    assert QWEN3_5_MTP.head_config(config, source=None) is config

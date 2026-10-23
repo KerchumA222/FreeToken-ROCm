@@ -5,7 +5,8 @@
     exactly the causal prefix and the layer output must match ``TorchDenseQSAReference`` (fp32)
     and a flashinfer dense run over the same pool;
 (b) chunked prefill at unaligned cut points equals one-shot prefill (the dual-source compress);
-(c) a captured decode replay equals the eager decode step.
+(c) a captured decode replay equals the eager decode step;
+(d) so does a captured MTP verify (one request, 1 + depth decode rows) at each depth.
 """
 
 from __future__ import annotations
@@ -201,6 +202,72 @@ def test_decode_graph_replay_matches_eager():
         replayed = captured_out.clone()
         eager = attn.forward(x, fixture.batch(reqs, "decode"))
         assert torch.equal(replayed, eager), f"graph replay diverged at decode step {step}"
+
+
+@requires_cuda
+def test_verify_graph_replay_matches_eager_at_each_depth():
+    """A verify is a decode batch of 1 + depth rows of one request, each row compressing against the ring its
+    predecessors filled. Captured per depth on the static buffers and restaged per step, it equals the eager run."""
+    config = parsed_config()
+    fixture = Fixture(config, num_pages=256)
+    attn = fixture.layer(QSA_LAYER)
+    depths, length = (1, 2, 3), 300
+    inputs = _inputs(fixture, [length], extra=16)[0]
+    prefill = fixture.req(0, 0, length)
+    attn.forward(inputs[:length], fixture.batch([prefill], "prefill"))
+    fixture.backend.init_capture_graph(max_seq_len=fixture.page_table.shape[1], bs_list=[k + 1 for k in depths])
+    dummy = SimpleNamespace(table_idx=fixture.num_req_slots - 1, cached_len=1, device_len=2, extend_len=1)
+
+    def rows(table_idx, cached_len, k):
+        fixture.allocate(table_idx, cached_len, cached_len + k + 1)
+        return [
+            SimpleNamespace(table_idx=table_idx, cached_len=cached_len + s, device_len=cached_len + s + 1, extend_len=1)
+            for s in range(k + 1)
+        ]
+
+    def batch_of(reqs):
+        batch = fixture.batch(reqs, "decode")
+        batch.spec = SimpleNamespace(num_reqs=1)
+        return batch
+
+    graphs = {}
+    for k in depths:
+        static = {
+            "x": torch.zeros(k + 1, config.hidden_size, device=fixture.device, dtype=fixture.dtype),
+            "positions": torch.zeros(k + 1, dtype=torch.int32, device=fixture.device),
+            "out_loc": torch.zeros(k + 1, dtype=torch.int32, device=fixture.device),
+        }
+        capture_batch = SimpleNamespace(
+            padded_reqs=[dummy] * (k + 1), reqs=[dummy] * (k + 1), phase="decode", size=k + 1, padded_size=k + 1,
+            is_prefill=False, is_decode=True, positions=static["positions"], get_attn_positions=lambda p=static["positions"]: p,
+            out_loc=static["out_loc"], attn_metadata=None, active_table_idx=None, spec=SimpleNamespace(num_reqs=1),
+        )
+        fixture.backend.prepare_for_capture(capture_batch)
+        attn.forward(static["x"], capture_batch)  # warmup, same metadata object as the capture
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out = attn.forward(static["x"], capture_batch)
+        torch.cuda.synchronize()
+        graphs[k] = (graph, static, out)
+
+    cached = length
+    for step, k in enumerate((3, 1, 2, 3)):
+        x = inputs[cached : cached + k + 1] * (1 + 0.1 * step)
+        live = rows(0, cached, k)
+        batch = batch_of(live)
+        graph, static, captured = graphs[k]
+        static["x"].copy_(x)
+        static["positions"].copy_(batch.positions)
+        static["out_loc"].copy_(batch.out_loc)
+        fixture.backend.prepare_for_replay(batch)
+        assert batch.attn_metadata.block_table.data_ptr() == fixture.backend._graph["block_table"].data_ptr()
+        graph.replay()
+        torch.cuda.synchronize()
+        replayed = captured.clone()
+        eager = attn.forward(x, batch_of(live))
+        assert torch.equal(replayed, eager), f"graph replay diverged at verify step {step} (depth {k})"
+        cached += 2  # a partial accept: the next verify starts two positions on
 
 
 @requires_cuda

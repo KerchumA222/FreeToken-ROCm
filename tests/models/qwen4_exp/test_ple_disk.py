@@ -350,3 +350,45 @@ def test_graph_sync_protocol(tmp_path, monkeypatch):
     gated, _, _ = _make_table(tmp_path)
     assert not gated._wait_sync
     assert gated.host_fill_batch(_decode_batch([3, 4], 5), use_graph=True) is None
+
+
+@requires_cuda
+def test_verify_rows_fill_the_staging_of_the_path_that_will_run(tmp_path):
+    """A verify's hook stages every row's window (committed context from the n-gram state, then the drafts); a graph
+    replay reads the graph staging and an eager lookup the eager one."""
+    from .common import fresh_ctx
+
+    disk, oracle, args = _make_table(tmp_path)
+    emb = _embedding()
+    context, tokens = [41, EOS], [7, 9, 13, 5]
+    rows = len(tokens)
+    state = torch.zeros(3, 2, dtype=torch.int64, device="cuda")
+    state[1] = torch.tensor(context)
+    fresh_ctx(linear_state_pool=SimpleNamespace(slot_state=lambda name: state))
+    req = SimpleNamespace(table_idx=1, linear_slot_idx=1)
+    batch = SimpleNamespace(
+        is_decode=True,
+        spec=SimpleNamespace(num_reqs=1, reqs=[req]),
+        input_ids=torch.tensor(tokens, dtype=torch.int32, device="cuda"),
+    )
+    window = context + tokens
+    ids = torch.cat([emb.row_ids(_meta([[window[s + 2]]], [window[s : s + 2]], decode=True)) for s in range(rows)]).cuda()
+    want = oracle.lookup(ids)
+
+    out = torch.empty((rows, args.num_ngram_heads * disk.head_dim), dtype=disk.dtype, device="cuda")
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            disk.lookup(torch.zeros_like(ids), out)
+    torch.cuda.current_stream().wait_stream(stream)
+
+    with disk.forward_host_ctx(batch, use_graph=True):
+        graph.replay()
+    torch.cuda.synchronize()
+    assert _bitwise_equal(out, want), "graph replay"
+
+    with disk.forward_host_ctx(batch, use_graph=False):
+        eager = disk.lookup(ids)
+    assert _bitwise_equal(eager, want), "eager lookup"

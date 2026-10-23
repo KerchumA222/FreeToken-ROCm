@@ -29,6 +29,7 @@ import torch
 
 from freetoken.layers import BaseOP, GemmaRMSNorm
 from freetoken.layers.linear import LinearReplicated
+from freetoken.speculative.mtp import MtpAdapter
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
@@ -129,7 +130,7 @@ def iter_gguf_mtp_weights(model_path: str, prefix: str = "mtp", config: "ModelCo
     yield from _iter(model_path, prefix, config)
 
 
-class Qwen3_5MTP:
+class Qwen3_5MTP(MtpAdapter):
     """``--speculative-algorithm mtp`` for qwen35 / qwen35moe GGUFs: the nextn block of the checkpoint
     itself, or of a draft-head-only GGUF (``mtp-*.gguf``, ``<arch>.mtp.draft_only``) beside it."""
 

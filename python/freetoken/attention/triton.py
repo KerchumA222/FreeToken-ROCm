@@ -92,6 +92,8 @@ _MAX_AUTO_SPLITS = 64
 
 
 class TritonAttentionBackend(BaseAttnBackend):
+    supports_verify_graph = True
+
     def __init__(self, config: ModelConfig):
         self.config = config
         self.kvcache = get_global_ctx().kv_cache

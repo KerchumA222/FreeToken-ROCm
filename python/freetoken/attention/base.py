@@ -55,6 +55,10 @@ class BaseAttnMetadata(ABC):
 
 
 class BaseAttnBackend(ABC):
+    # The decode rows of a speculative verify (several per request, each its own query) capture and replay through
+    # prepare_for_capture / prepare_for_replay like a decode batch of that many requests.
+    supports_verify_graph: bool = False
+
     @abstractmethod
     def forward(
         self,
@@ -99,6 +103,10 @@ class HybridBackend(BaseAttnBackend):
     ) -> None:
         self.prefill_backend = prefill_backend
         self.decode_backend = decode_backend
+
+    @property
+    def supports_verify_graph(self) -> bool:
+        return self.decode_backend.supports_verify_graph
 
     def forward(
         self,

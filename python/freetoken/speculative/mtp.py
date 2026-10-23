@@ -254,6 +254,12 @@ class MtpDrafter:
         out = self.head.forward(hidden, embed)
         return out, out
 
+    def chain_step(self, state: torch.Tensor, token: torch.Tensor, with_conf: bool):
+        """One chained draft step on a previous step's head state: (next state, draft token, its confidence or None)."""
+        out, state = self._head(state, token)
+        token, conf = self._draft(out, with_conf)
+        return state, token, conf
+
     def head_pass(self, batch: "Batch", sampled: torch.Tensor) -> torch.Tensor:
         """Run the head over this forward's rows (inside its batch context) and draft at the plan's rows."""
         plan = batch.mtp_plan
@@ -280,7 +286,9 @@ class MtpDrafter:
         token, batch.draft_conf = self._draft(out, ENV.SPEC_DRAFT_MIN_P.value is not None)
         return token
 
-    def draft_chain(self, batch: "Batch", token_pool: torch.Tensor, ctx, attn_backend, mrope: bool) -> torch.Tensor | None:
+    def draft_chain(
+        self, batch: "Batch", token_pool: torch.Tensor, ctx, attn_backend, mrope: bool, graphs=None
+    ) -> torch.Tensor | None:
         """Drafts ``2..k`` of a verify step, chained from each request's stored head state.
 
         Step ``j`` runs the head at position ``cached_len + j - 2`` on the previous step's state and the
@@ -288,7 +296,9 @@ class MtpDrafter:
         overwrites. The drafts go into the token pool where the verify reads them; returns ``[B, k - 1]``.
 
         With FREETOKEN_SPEC_DRAFT_MIN_P the chain stops once no request would verify a further draft,
-        and returns ``[B, depth - 1]`` for the deepest request's depth (None if that is 1)."""
+        and returns ``[B, depth - 1]`` for the deepest request's depth (None if that is 1).
+
+        ``graphs`` (the GraphRunner) replays one captured chain step per draft for a single request."""
         from freetoken.core import Batch, VerifyRow
         from freetoken.speculative.accept import batch_draft_depth
 
@@ -308,6 +318,10 @@ class MtpDrafter:
         page_table = self._page_table()
         drafts = []
         min_p = ENV.SPEC_DRAFT_MIN_P.value
+        replay = graphs is not None and graphs.can_replay_chain(spec)
+        replayed = 0
+        if replay:
+            graphs.begin_chain(state, token)
         confs = [[c] for c in (spec.first_conf or [1.0] * len(reqs))] if min_p is not None else None
         for j in range(2, spec.k + 1):
             if min_p is not None and batch_draft_depth(confs, min_p, spec.k) < j:
@@ -325,14 +339,20 @@ class MtpDrafter:
             step.out_loc = page_table[tbl, pos64]
             step.input_ids = token
             attn_backend.prepare_metadata(step)
-            with ctx.forward_batch(step):
-                out, state = self._head(state, token)
-                token, conf = self._draft(out, min_p is not None)
-            token_pool[tbl, pos64 + 2] = token
-            drafts.append(token)
+            if replay:
+                step.active_table_idx = tbl
+                conf = graphs.replay_chain_step(step)
+                replayed += 1
+            else:
+                with ctx.forward_batch(step):
+                    state, token, conf = self.chain_step(state, token, min_p is not None)
+                token_pool[tbl, pos64 + 2] = token
+                drafts.append(token)
             if min_p is not None:
                 for row, c in zip(confs, conf.tolist()):
                     row.append(c)
+        if replay:
+            return graphs.finish_chain(token_pool, reqs[0], replayed) if replayed else None
         return torch.stack(drafts, dim=1) if drafts else None
 
 
