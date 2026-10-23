@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from typing import List, Tuple
 
@@ -116,6 +117,24 @@ def _json_object(text: str) -> dict:
     if not isinstance(value, dict):
         raise argparse.ArgumentTypeError("expected a JSON object")
     return value
+
+
+def _gpu_lacks_bf16_hardware() -> bool:
+    """True on a GPU where bf16 exists only in software.
+
+    RDNA1/RDNA2 (gfx10xx) have no bf16 ALU -- no conversion, no dot, no packed math. Nothing
+    announces this: torch reports bf16 as available and every kernel compiles and is correct;
+    the compiler just open-codes each bf16 operation. On an RX 6800 (gfx1030) that cost ~4.8x
+    end to end serving Qwen3.6-35B-A3B (5.1 tok/s in bf16 against 24.1 in fp16) and ~4.4x on
+    Qwen3.8-Flash-Next (4.1 against 18.2). gfx11/gfx12 and gfx90a+ have the instructions.
+    """
+    if getattr(torch.version, "hip", None) is None:
+        return False
+    try:
+        arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+    except Exception:
+        return False
+    return re.fullmatch(r"gfx10\d\d", arch) is not None
 
 
 def parse_args(
@@ -1055,6 +1074,14 @@ def parse_args(
             cfg.get("torch_dtype") or cfg.get("dtype")
             or text_cfg.get("torch_dtype") or text_cfg.get("dtype") or "bfloat16"
         )
+        # Only "auto" is redirected: an explicit --dtype bfloat16 is still honored, the escape
+        # hatch for a checkpoint that needs bf16's exponent range.
+        if dtype_str == "bfloat16" and _gpu_lacks_bf16_hardware():
+            init_logger(__name__).warning(
+                "This GPU has no bf16 hardware, so bf16 would run emulated (~4-5x slower). "
+                "Resolving --dtype auto to float16; pass --dtype bfloat16 to override."
+            )
+            dtype_str = "float16"
 
     DTYPE_MAP = {
         "float16": torch.float16,
