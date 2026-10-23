@@ -112,7 +112,7 @@ Laguna support is opt-in and defaults off. Set `FREETOKEN_ENABLE_LAGUNA_HF=1` fo
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--speculative-algorithm` | off | `mtp`: greedy speculative decoding using a Qwen3.5/3.6 GGUF's MTP (nextn) draft head; currently single-GPU only and runs without CUDA graphs |
+| `--speculative-algorithm` | off | `mtp`: speculative decoding using a Qwen3.5/3.6 or Qwen3.8-Flash-Next GGUF's MTP (nextn) draft head; currently single-GPU only and runs without CUDA graphs |
 | `--speculative-num-draft-tokens` | 1 | Drafts per verify step; values above 1 chain the draft head on its own output |
 | `--speculative-draft-model-path` | — | GGUF containing the MTP `nextn` tensors when they are not embedded in the model checkpoint; for a GGUF-converted FTW target, pass its original source GGUF here |
 

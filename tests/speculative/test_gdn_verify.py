@@ -21,15 +21,28 @@ def _single_rank_tp():
         set_tp_info(rank=0, size=1)
 
 
-def _op_and_pool(num_reqs: int, k: int):
+@pytest.fixture(params=["qwen3_5_moe", "qwen4_exp"])
+def family(request):
+    """The two families whose GatedDeltaNet runs a verify; Qwen3.8-Flash-Next reuses Qwen3.5's."""
+    return request.param
+
+
+def _op_cls(family: str):
+    import importlib
+
+    module = importlib.import_module(f"freetoken.models.{family}.gdn")
+    return getattr(module, "Qwen3_5GatedDeltaNet" if family == "qwen3_5_moe" else "Qwen4ExpGatedDeltaNet")
+
+
+def _op_and_pool(num_reqs: int, k: int, family: str = "qwen3_5_moe"):
     from freetoken.kvcache.linear_state_pool import LinearStatePool
     from freetoken.models.config import LinearGatedDeltaGroupConfig
-    from freetoken.models.qwen3_5_moe.gdn import Qwen3_5GatedDeltaNet
     from freetoken.utils import torch_dtype
+
 
     torch.manual_seed(0)
     with torch.device("cuda"), torch_dtype(torch.bfloat16):
-        op = Qwen3_5GatedDeltaNet(HIDDEN, NK, NV, D, D, KERNEL, 1e-6, layer_id=0)
+        op = _op_cls(family)(HIDDEN, NK, NV, D, D, KERNEL, 1e-6, layer_id=0)
     for name, t in op.state_dict().items():
         scale = 0.2 if "conv1d" in name else (1.0 if name.endswith(("norm.weight", "A_log", "dt_bias")) else 0.05)
         t.copy_(torch.randn_like(t, dtype=torch.float32).to(t.dtype) * scale + (1.0 if name.endswith("norm.weight") else 0.0))
@@ -63,8 +76,8 @@ def _states(pool):
 
 
 @pytest.mark.parametrize("num_reqs, k", [(1, 1), (1, 3), (3, 2)])
-def test_verify_steps_match_decode_and_snapshot_every_step(num_reqs, k):
-    op, pool = _op_and_pool(num_reqs, k)
+def test_verify_steps_match_decode_and_snapshot_every_step(family, num_reqs, k):
+    op, pool = _op_and_pool(num_reqs, k, family)
     live = torch.arange(1, num_reqs + 1, dtype=torch.int32, device="cuda")
     rows = num_reqs * (k + 1)
     torch.manual_seed(1)
@@ -105,16 +118,16 @@ def test_verify_steps_match_decode_and_snapshot_every_step(num_reqs, k):
         assert torch.equal(conv[:, slot], ref_states[s][1][:, slot])
 
 
-def test_one_step_of_a_sequential_verify_is_a_decode_step(monkeypatch):
+def test_one_step_of_a_sequential_verify_is_a_decode_step(family, monkeypatch):
     """FREETOKEN_SPEC_SEQUENTIAL_VERIFY runs each verify step as its own forward: the op's whole
     forward (projections included) is then the same computation as a plain decode step."""
     num_reqs, k = 2, 2
-    op, pool = _op_and_pool(num_reqs, k)
+    op, pool = _op_and_pool(num_reqs, k, family)
     live = torch.tensor([1, 2], dtype=torch.int32, device="cuda")
     x = torch.randn(num_reqs, HIDDEN, device="cuda", dtype=torch.bfloat16)
     start = _states(pool)
     ctx = SimpleNamespace(linear_state_pool=pool, batch=None)
-    monkeypatch.setattr("freetoken.models.qwen3_5_moe.gdn.get_global_ctx", lambda: ctx)
+    monkeypatch.setattr(f"freetoken.models.{family}.gdn.get_global_ctx", lambda: ctx)
 
     ctx.batch = SimpleNamespace(is_decode=True, spec=None, fla_metadata=_fla(num_reqs, live))
     plain = op.forward(x)

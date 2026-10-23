@@ -296,7 +296,8 @@ class QSASparseAttnBackend(BaseAttnBackend):
             # cached plan would bake the warmup's addresses into the graph.
             self._plan_index_writes(md, batch)
 
-        self._update_index_cache(index, md, slot)
+        spec = getattr(batch, "spec", None)
+        self._update_index_cache(index, md, slot, 1 if spec is None else q.shape[0] // spec.num_reqs)
         indices = self._select(index, md, slot)
         return qsa_sparse_paged_attention(
             q,
@@ -342,8 +343,11 @@ class QSASparseAttnBackend(BaseAttnBackend):
             torch.int32
         )
 
-    def _update_index_cache(self, index, md: QSASparseMetadata, slot: int) -> None:
-        """Compress each closing group into the slab, then refresh the pending ring."""
+    def _update_index_cache(self, index, md: QSASparseMetadata, slot: int, steps: int = 1) -> None:
+        """Compress each closing group into the slab, then refresh the pending ring.
+
+        A verify lists ``steps`` decode rows per request, step-major: each step compresses against the
+        ring its predecessors just filled, as ``steps`` plain decode forwards would."""
         from freetoken.kernel.triton.qsa import (
             qsa_compress_groups,
             qsa_index_norm_rope,
@@ -354,17 +358,18 @@ class QSASparseAttnBackend(BaseAttnBackend):
         ring = self.kvcache.pending_ring(slot)
         pooled = self._scratch("pooled", rows, self.index_head_dim, dtype=self.dtype)
         first = self._scratch("first_pos", rows, dtype=torch.int32)
-        qsa_compress_groups(
-            index.k,
-            ring,
-            md.ring_slots,
-            md.token_to_req,
-            md.cu_seqlens,
-            md.positions,
-            self.ratio,
-            pooled,
-            first,
-        )
+        if steps == 1:
+            qsa_compress_groups(
+                index.k, ring, md.ring_slots, md.token_to_req, md.cu_seqlens, md.positions, self.ratio, pooled, first
+            )
+        else:
+            n = rows // steps
+            for part in (slice(i * n, (i + 1) * n) for i in range(steps)):
+                qsa_compress_groups(
+                    index.k[part], ring, md.ring_slots[part], md.token_to_req[:n], md.cu_seqlens[: n + 1],
+                    md.positions[part], self.ratio, pooled[part], first[part],
+                )
+                qsa_store_rows(ring, md.ring_rows[part], index.k[part])
         if md.k_rope_cache is None:
             rope_positions, rope_cache = first, self._index_rope_cache()
         else:
@@ -380,7 +385,8 @@ class QSASparseAttnBackend(BaseAttnBackend):
         )
         # After the compression read: the ring rows this forward overwrites are exactly the
         # ones a straddling group just consumed.
-        qsa_store_rows(ring, md.ring_rows, index.k)
+        if steps == 1:
+            qsa_store_rows(ring, md.ring_rows, index.k)
 
     def _select(self, index, md: QSASparseMetadata, slot: int) -> torch.Tensor:
         """Score complete visible blocks, take the top-k, expand them to token indices."""

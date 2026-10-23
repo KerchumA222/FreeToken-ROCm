@@ -19,7 +19,7 @@ gathers rows over UVA, optionally started early on a side stream (``PLELayer.sta
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, List, Protocol, Sequence, Tuple
 
 import torch
@@ -32,7 +32,7 @@ from .config import PLE_CONV_STATE, PLE_NGRAM_STATE
 from .hc import GroupedPlusOneRMSNorm
 
 if TYPE_CHECKING:
-    from freetoken.core import Batch
+    from freetoken.core import Batch, SpecVerify
     from freetoken.models.config import ModelConfig
 
     from .config import Qwen4ExpArgs
@@ -285,6 +285,7 @@ class PLEMetadata:
                      ``Req.table_idx``); keys every PLE slot state
       fresh_slots    [B] bool device or None -- request starts a new sequence, so read a zero state
       is_decode      one token per request (the batched 4-tap path)
+      spec           the speculative verify this batch is (rows step-major, ``spec.num_reqs`` per step), else None
     """
 
     input_ids: torch.Tensor
@@ -294,6 +295,16 @@ class PLEMetadata:
     state_slots: torch.Tensor
     fresh_slots: torch.Tensor | None
     is_decode: bool
+    spec: SpecVerify | None = None
+
+
+def _verify_contexts(context: torch.Tensor, ids: torch.Tensor, num_reqs: int) -> torch.Tensor:
+    """The n-gram context of every row of a step-major verify: the request's committed context
+    ``context[:num_reqs]``, then the tokens of the rows before it. Returns [rows, ctx_len]."""
+    ctx_len = context.shape[1]
+    steps = ids.numel() // num_reqs
+    full = torch.cat([context[:num_reqs], ids.long().view(steps, num_reqs).t()], dim=1)
+    return full.unfold(1, ctx_len, 1)[:, :steps].transpose(0, 1).reshape(-1, ctx_len)
 
 
 def _state_slot(req) -> int:
@@ -342,14 +353,19 @@ def build_ple_metadata(
     if batch.is_decode and slots_dev is not None:
         slots = slots_dev.long()
         bs = slots.numel()
+        context = context_pool.index_select(0, slots).long()
+        spec = getattr(batch, "spec", None)
+        if spec is not None:
+            context = _verify_contexts(context, input_ids, spec.num_reqs)
         return PLEMetadata(
             input_ids=input_ids,
             cu_seqlens=torch.arange(bs + 1, dtype=torch.int32, device=device),
             seq_lens=(1,) * bs,
-            ngram_context=context_pool.index_select(0, slots).long(),
+            ngram_context=context,
             state_slots=slots,
             fresh_slots=None,
             is_decode=True,
+            spec=spec,
         )
 
     lens = [r.extend_len for r in reqs]
@@ -389,6 +405,9 @@ def commit_ngram_context(meta: PLEMetadata, fla, context_pool: torch.Tensor | No
     steps = torch.arange(ctx_len, device=ids.device)
     if meta.is_decode:
         nxt = torch.cat([meta.ngram_context[:, 1:], ids.view(-1, 1)], dim=1)
+        if meta.spec is not None:
+            _commit_verify_contexts(meta, nxt.to(context_pool.dtype), context_pool)
+            return
     else:
         cu = meta.cu_seqlens.long()
         cand = cu[1:].unsqueeze(1) - ctx_len + steps
@@ -402,6 +421,20 @@ def commit_ngram_context(meta: PLEMetadata, fla, context_pool: torch.Tensor | No
     if fla is not None and fla.track_boundary_row is not None:
         win = ids[fla.track_boundary_row.unsqueeze(1) - ctx_len + steps]
         context_pool.index_copy_(0, fla.track_dst, win.to(context_pool.dtype))
+
+
+def _commit_verify_contexts(meta: PLEMetadata, nxt: torch.Tensor, context_pool: torch.Tensor) -> None:
+    """A verify's rolled contexts ``nxt`` [rows, ctx_len], step-major: the last step's become the live
+    slot's and each earlier step's the snapshot a partial accept rolls back to."""
+    spec = meta.spec
+    num_reqs = spec.num_reqs
+    steps = nxt.shape[0] // num_reqs
+    first = 0 if spec.step is None else spec.step
+    for j in range(steps):
+        rows = slice(j * num_reqs, (j + 1) * num_reqs)
+        if first + j < spec.k:
+            context_pool.index_copy_(0, spec.snap_slots[first + j], nxt[rows])
+    context_pool.index_copy_(0, meta.state_slots[-num_reqs:], nxt[-num_reqs:])
 
 
 class NGramEmbedding(BaseOP):
@@ -649,9 +682,28 @@ class PLELayer(BaseOP):
         self, x: torch.Tensor, meta: PLEMetadata, states: torch.Tensor
     ) -> torch.Tensor:
         """silu of the dilated depthwise conv over [state | x], and roll the per-request state."""
+        if meta.spec is not None:
+            return self._verify_conv(x, meta, states)
         if meta.is_decode:
             return self._decode_conv(x, meta, states)
         return self._prefill_conv(x, meta, states)
+
+    def _verify_conv(
+        self, x: torch.Tensor, meta: PLEMetadata, states: torch.Tensor
+    ) -> torch.Tensor:
+        """A speculative verify: each step is a decode step on the state its predecessor left, and the
+        state after every step but the last is copied to that step's snapshot slots."""
+        spec = meta.spec
+        num_reqs = spec.num_reqs
+        outs = []
+        for j in range(x.shape[0] // num_reqs):
+            rows = slice(j * num_reqs, (j + 1) * num_reqs)
+            slots = meta.state_slots[rows]
+            outs.append(self._decode_conv(x[rows], replace(meta, state_slots=slots), states))
+            step = j if spec.step is None else spec.step
+            if step < spec.k:
+                states.index_copy_(0, spec.snap_slots[step], states.index_select(0, slots))
+        return outs[0] if len(outs) == 1 else torch.cat(outs, dim=0)
 
     def _decode_conv(
         self, x: torch.Tensor, meta: PLEMetadata, states: torch.Tensor

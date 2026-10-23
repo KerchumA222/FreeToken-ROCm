@@ -220,7 +220,7 @@ def test_mtp_drafter_loads_one_sided_token_override_and_borrows_other(
     from contextlib import nullcontext
 
     from freetoken.speculative import mtp
-    from freetoken.speculative.mtp import MtpSource
+    from freetoken.speculative.mtp import MtpAdapter, MtpSource
 
     class FakeModule:
         def __init__(self, weights):
@@ -250,7 +250,7 @@ def test_mtp_drafter_loads_one_sided_token_override_and_borrows_other(
     token_weights = ((f"{token_prefix}.weight", override_weight),)
     finalized = []
 
-    class Adapter:
+    class Adapter(MtpAdapter):
         def build_head(self, _config, _layer_id):
             return head
 

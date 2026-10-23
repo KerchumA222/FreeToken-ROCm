@@ -164,6 +164,7 @@ class QSAKVCache(MHAKVCache):
         from freetoken.attention import AttnType
 
         num_req_slots = config.max_running_req + 1
+        num_spec = 0 if getattr(config, "speculative_algorithm", None) is None else int(config.speculative_num_draft_tokens)
         per_token = 0
         fixed = 0
         for spec in config.model_config.kv_cache_group_specs():
@@ -173,7 +174,7 @@ class QSAKVCache(MHAKVCache):
             if spec.attn_type is AttnType.QSA:
                 # One index-key row = all index layers at one position.
                 row = spec.index_head_dim * spec.num_index_layers * _INDEX_DTYPE_BYTES
-                fixed += num_req_slots * row * (cls.ring_capacity_for(spec.index_ratio) + 1)
+                fixed += num_req_slots * row * (cls.ring_capacity_for(spec.index_ratio, num_spec) + 1)
                 if config.model_config.model_is_mrope:
                     per_token += _ROPE_POS_BYTES
         return per_token * config.page_size, fixed, config.page_size, 0

@@ -6,7 +6,8 @@ from freetoken.core import get_global_ctx
 from freetoken.kernel.causal_conv1d import causal_conv1d_decode, causal_conv1d_varlen
 from freetoken.layers import BaseOP, GatedRMSNorm, LinearColParallelMerged, LinearReplicated
 from freetoken.layers.quantization import QuantConfig
-from freetoken.models.qwen3_5_moe.gdn_kernels import gdn_decode_fla, gdn_prefill_chunk_fla
+from freetoken.models.qwen3_5_moe.gdn import Qwen3_5GatedDeltaNet
+from freetoken.models.qwen3_5_moe.gdn_kernels import gdn_prefill_chunk_fla
 
 
 class _DepthwiseConv1d(BaseOP):
@@ -85,6 +86,10 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
             quant_config=quant_config, prefix=f"{prefix}.out_proj",
         )
 
+    # Same kernels and state layout as Qwen3.5's, so the same decode step and speculative verify
+    _decode_rows = Qwen3_5GatedDeltaNet._decode_rows
+    _verify = Qwen3_5GatedDeltaNet._verify
+
     def _gate_params(self, a: torch.Tensor, b: torch.Tensor):
         beta = b.sigmoid()
         g = -self.A_log.exp() * F.softplus(a.float() + self.dt_bias)
@@ -152,21 +157,11 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
         z = z.reshape(total, self.num_v_heads, self.head_v_dim)
         li = pool.local_index(self.layer_id)
 
-        if batch.is_decode:
-            # Fused fla decode kernel: gating + in-kernel l2norm + recurrent update +
-            # per-request state read/write-by-index, all in one kernel (no gather/scatter,
-            # no clone, no external l2norm). q/k stay at num_k_heads (kernel handles GQA).
-            mixed = self._conv_decode(conv_in, fla.cache_indices, pool)  # [B, conv_dim]
-            B = mixed.shape[0]
-            qf, kf, vf = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
-            q = qf.reshape(1, B, self.num_k_heads, self.head_k_dim).to(dtype)
-            k = kf.reshape(1, B, self.num_k_heads, self.head_k_dim).to(dtype)
-            v = vf.reshape(1, B, self.num_v_heads, self.head_v_dim).to(dtype)
-            core_out = gdn_decode_fla(
-                q, k, v, a, b, A_log=self.A_log, dt_bias=self.dt_bias,
-                state_source=pool.recurrent_states[li], indices=fla.cache_indices,
-                cu_seqlens=fla.cu_seqlens, scale=self.head_k_dim ** -0.5,
-            )
+        spec = getattr(batch, "spec", None)
+        if spec is not None:
+            core_out = self._verify(conv_in, a, b, pool, li, fla, spec, dtype)
+        elif batch.is_decode:
+            core_out = self._decode_rows(conv_in, a, b, fla.cache_indices, pool, li, fla.cu_seqlens, dtype)
         else:
             mixed = self._conv_prefill(
                 conv_in, pool, fla.cu_seqlens, fla.cache_indices, fla.has_initial_state)
