@@ -553,12 +553,26 @@ class Scheduler(SchedulerIOMixin):
         stats = self.spec_stats
         stats["rounds"] += 1
         stats["drafted"] += k
-        stats["accepted"] += min(len(tokens) - 1, m)  # finishing early can truncate the accepted run
+        accepted = min(len(tokens) - 1, m)  # finishing early can truncate the accepted run
+        stats["accepted"] += accepted
+        # per draft position: how often it was verified, and accepted (which needs every draft before it accepted)
+        at = getattr(self, "spec_position_stats", None)
+        if at is None:
+            at = self.spec_position_stats = {"drafted": [], "accepted": []}
+        for j in range(k):
+            if j == len(at["drafted"]):
+                at["drafted"].append(0)
+                at["accepted"].append(0)
+            at["drafted"][j] += 1
+            at["accepted"][j] += j < accepted
         if stats["rounds"] % 256 == 0:
+            # draft j's acceptance given drafts 1..j-1 were accepted
+            cond = [a / (at["accepted"][j - 1] if j else d) for j, (d, a) in enumerate(zip(at["drafted"], at["accepted"])) if (at["accepted"][j - 1] if j else d)]
             logger.info_rank0(
                 f"MTP: {stats['rounds']} verify steps, {stats['accepted'] / stats['drafted']:.3f} of drafts accepted, "
                 f"{1 + stats['accepted'] / stats['rounds']:.2f} tokens per step"
                 + (f", mean depth {stats['drafted'] / stats['rounds']:.2f}" if ENV.SPEC_DRAFT_MIN_P.value is not None else "")
+                + ", draft j accepted after j-1: " + "/".join(f"{c:.2f}" for c in cond)
             )
         for token, j in judged:
             self._settle_token(batch, req, token, j, reply, new_finished_reqs)
