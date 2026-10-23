@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List
 
 import torch
+from freetoken.env import ENV
 from freetoken.utils import is_sm90_supported, nvtx_annotate
 
 if TYPE_CHECKING:
@@ -17,14 +18,41 @@ class BatchSamplingArgs:
     top_p: torch.Tensor | None = None
     greedy_mask: torch.Tensor | None = None
     penalties: list[tuple[int, torch.Tensor, float, float]] = field(default_factory=list)
+    # the largest top_k over the sampled rows when every one of them sets it, else None (host int: FREETOKEN_TOPK_SAMPLER)
+    max_top_k: int | None = None
 
     def first_rows(self, n: int) -> "BatchSamplingArgs":
         """The args of the first ``n`` rows of the batch."""
         cut = lambda t: None if t is None else t[:n]
         return BatchSamplingArgs(
             cut(self.temperatures), cut(self.top_k), cut(self.top_p), cut(self.greedy_mask),
-            [p for p in self.penalties if p[0] < n],
+            [p for p in self.penalties if p[0] < n], self.max_top_k,
         )
+
+
+# FREETOKEN_TOPK_SAMPLER takes the candidates with torch.topk up to this k; larger falls back to the fused kernels
+_TOPK_SAMPLER_MAX_K = 256
+
+
+def sample_top_k_first(
+    logits: torch.Tensor, temperatures: torch.Tensor, top_k: torch.Tensor | None, top_p: torch.Tensor | None, k: int,
+) -> torch.Tensor:
+    """Sample from each row's top ``top_k`` (then top ``top_p``) tokens at its temperature, reading the full vocabulary
+    once with ``torch.topk``. The same distribution as the fused top-k-first kernels, without their cooperative
+    launch: on ROCm a cooperative kernel waits for every other stream's work, ~2 ms a decode step in a server."""
+    vals, idx = torch.topk(logits, k, dim=-1)  # sorted, largest first
+    scaled = vals.float() / temperatures[:, None]
+    if top_k is not None:
+        rank = torch.arange(k, device=logits.device)[None, :]
+        scaled = scaled.masked_fill(rank >= top_k[:, None], float("-inf"))
+    probs = torch.softmax(scaled, dim=-1)
+    if top_p is not None:
+        # keep the smallest prefix whose mass reaches top_p: drop a token once the mass before it already does
+        before = probs.cumsum(dim=-1) - probs
+        probs = probs.masked_fill(before >= top_p[:, None], 0.0)
+    # exponential race: argmax(p / Exp(1)) draws from p (unnormalized is fine), with no host sync
+    choice = torch.argmax(probs / torch.empty_like(probs).exponential_(), dim=-1, keepdim=True)
+    return idx.gather(1, choice).squeeze(1)
 
 
 def make_device_tensor(data: List, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
@@ -121,8 +149,11 @@ class Sampler:
         greedy_mask = (
             make_device_tensor(is_greedy, torch.bool, self.device) if any(is_greedy) else None
         )
+        sampled_ks = [k for k, g in zip(top_ks, is_greedy) if not g]
+        max_top_k = max(sampled_ks) if all(k < self.vocab_size for k in sampled_ks) else None
         return BatchSamplingArgs(
-            temperatures, top_k=top_k, top_p=top_p, greedy_mask=greedy_mask, penalties=penalties
+            temperatures, top_k=top_k, top_p=top_p, greedy_mask=greedy_mask, penalties=penalties,
+            max_top_k=max_top_k,
         )
 
     @nvtx_annotate("Sampler")
@@ -135,7 +166,10 @@ class Sampler:
             if args.temperatures is None:  # greedy sampling
                 tokens = torch.argmax(logits, dim=-1)
             else:
-                tokens = sample_impl(logits.float(), args.temperatures, args.top_k, args.top_p)
+                if ENV.TOPK_SAMPLER and args.max_top_k is not None and args.max_top_k <= _TOPK_SAMPLER_MAX_K:
+                    tokens = sample_top_k_first(logits.float(), args.temperatures, args.top_k, args.top_p, args.max_top_k)
+                else:
+                    tokens = sample_impl(logits.float(), args.temperatures, args.top_k, args.top_p)
                 if args.greedy_mask is not None:
                     # Mixed batches still run probability sampling for all rows, but
                     # greedy rows must follow argmax's deterministic tie-breaking.
