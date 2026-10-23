@@ -11,6 +11,7 @@ import os
 import struct
 import subprocess
 import sys
+import time
 
 import numpy as np
 import pytest
@@ -393,6 +394,188 @@ def test_disk_tier_config_turns_off_graphs_and_prefill_overlap(expert_gguf):
     for bad in (config(moe_strategy="cpu"), config(moe_cpu_layers="4"), config(moe_strategy="fused"), config(model_path=os.path.dirname(path))):
         with pytest.raises(ValueError, match="disk-tier"):
             _adjust_disk_tier_config(bad, override(bad))
+
+
+def _graph_cache(path: str, layers: int, host_bytes: int):
+    """A cache with graph admission on, or a skip when this GPU cannot record the stream waits."""
+    cache = _cache(path, layers, host_bytes, torch.device("cuda"), E + 2)
+    reason = cache.enable_graph_admission()
+    if reason is not None:
+        pytest.skip(reason)
+    return cache
+
+
+class _Probe:
+    """One decode step over every layer, eager or captured: the route bias of each layer, then ensure + copy, then the rows the slots hold."""
+
+    def __init__(self, cache, graph: bool):
+        from types import SimpleNamespace
+
+        self.cache, self.layers = cache, cache.num_layers
+        self.experts = torch.arange(TOP_K, dtype=torch.int32, device="cuda").repeat(self.layers, 1)
+        self.slots = torch.zeros_like(self.experts)
+        self.bias = torch.zeros(self.layers, E, dtype=torch.float32, device="cuda")
+        views = [cache.pool_bank_views(layer) for layer in range(self.layers)]
+        self.rows = [[torch.zeros(TOP_K, *v.shape[1:], dtype=v.dtype, device="cuda") for v in vs] for vs in views]
+        self.stubs = [SimpleNamespace(offload_cache=cache, layer_id=layer) for layer in range(self.layers)]
+        self.graph = None
+        self.step()  # warm the kernels outside capture
+        if graph:
+            self.graph = torch.cuda.CUDAGraph()
+            torch.cuda.synchronize()
+            with torch.cuda.graph(self.graph):
+                self.step()
+
+    def step(self) -> None:
+        from freetoken.moe.route_bias import selection_bias
+
+        for layer in range(self.layers):
+            if (bias := selection_bias(self.stubs[layer], 1, self.experts.device)) is not None:
+                self.bias[layer].copy_(bias)
+            self.slots[layer].copy_(self.experts[layer])
+            self.cache.ensure_experts(layer, self.slots[layer])
+            self.cache.copy_missing()
+            for dst, view in zip(self.rows[layer], self.cache.pool_bank_views(layer)):
+                dst.copy_(view[self.slots[layer].long()])
+
+    def run(self, ids: np.ndarray) -> None:
+        self.experts.copy_(torch.from_numpy(ids))
+        if self.graph is None:
+            self.step()
+            torch.cuda.synchronize()
+            return
+        self.graph.replay()
+        done = torch.cuda.Event()
+        done.record()
+        deadline = time.monotonic() + 60
+        while not done.query():
+            assert time.monotonic() < deadline, "the replay never returned from its host call"
+            time.sleep(0.001)
+        self.cache.raise_admission_error()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.parametrize("host_bytes", [1, 1 << 30], ids=["tiny-host-cache", "whole-model-host-cache"])
+def test_graph_admission_matches_eager_admission(expert_gguf, monkeypatch, host_bytes):
+    """Replays that miss the GPU slots, the host pool and the file give the eager path's slots, rows, host-tier state and route bias."""
+    from freetoken.moe import route_bias
+
+    monkeypatch.setattr(route_bias, "_ROUTE_BIAS", 1.0)
+    monkeypatch.setattr(route_bias, "_HOST_BIAS", 0.5)
+    path, layers = expert_gguf
+    ref = _resident(path, layers).sources
+    eager = _Probe(_cache(path, layers, host_bytes, torch.device("cuda"), E + 2), graph=False)
+    graphed = _Probe(_graph_cache(path, layers, host_bytes), graph=True)
+    for p in (eager, graphed):
+        p.cache.reset()
+    rng = np.random.default_rng(5)
+    for step in range(60):
+        ids = np.stack([rng.choice(E, TOP_K, replace=False) for _ in range(layers)]).astype(np.int32)
+        eager.run(ids)
+        graphed.run(ids)
+        assert torch.equal(graphed.slots, eager.slots), step
+        assert torch.equal(graphed.bias, eager.bias), step
+        for layer in range(layers):
+            for bank, got in zip(("gate_up", "down"), graphed.rows[layer]):
+                for k, e in enumerate(ids[layer].tolist()):
+                    assert torch.equal(got[k].cpu(), ref[bank][layer][e]), (step, layer, e, bank)
+    te, tg = eager.cache.host_tier, graphed.cache.host_tier
+    assert (tg.hits, tg.misses) == (te.hits, te.misses)
+    assert torch.equal(tg.resident, te.resident)
+    assert torch.equal(graphed.cache.slot_for_id, eager.cache.slot_for_id)
+    assert tg.misses > 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_graph_admission_failure_releases_the_stream_and_raises(expert_gguf, monkeypatch):
+    path, layers = expert_gguf
+    probe = _Probe(_graph_cache(path, layers, 1 << 30), graph=True)
+    probe.cache.reset()
+
+    def broken(layer, experts):
+        raise OSError("disk gone")
+
+    monkeypatch.setattr(probe.cache.host_tier, "ensure", broken)
+    probe.experts.copy_(torch.tensor([[0, 1, 2]] * layers, dtype=torch.int32))
+    probe.graph.replay()
+    done = torch.cuda.Event()
+    done.record()
+    deadline = time.monotonic() + 60
+    while not done.query():
+        assert time.monotonic() < deadline, "a failed admission left the stream waiting"
+        time.sleep(0.001)
+    with pytest.raises(RuntimeError, match="disk gone"):
+        probe.cache.raise_admission_error()
+    probe.cache.raise_admission_error()  # reported once
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_graph_steps_feed_the_decode_stats(expert_gguf, monkeypatch):
+    path, layers = expert_gguf
+    cache = _graph_cache(path, layers, 1 << 30)
+    monkeypatch.setattr(cache, "stats_every", 3)
+    logged = []
+    monkeypatch.setattr(cache, "_log_decode_stats", lambda: logged.append(cache._stats_steps))
+    for _ in range(7):
+        cache.note_graph_step()
+    assert logged == [3, 6]
+
+
+def test_graph_admission_serves_a_layer_and_parks_a_failure():
+    from freetoken.moe.graph_admit import GraphAdmission
+
+    class Tier:
+        def ensure(self, layer, experts):
+            if layer == 2:
+                raise OSError("disk gone")
+            return [e + 100 * layer for e in experts]
+
+    adm = object.__new__(GraphAdmission)
+    adm.tier, adm.error = Tier(), None
+    adm._n = np.zeros(1, dtype=np.int64)
+    adm._ids = np.array([5, 6, 7, 8], dtype=np.int32)
+    adm._slots = np.full(4, -1, dtype=np.int32)
+    adm._n[0] = 3
+    adm._serve(2)  # layer 1
+    assert adm._slots.tolist() == [105, 106, 107, -1] and adm.error is None
+    adm._serve(3)  # layer 2 fails: zero slots (a valid pool row for the copy), error parked
+    assert adm._slots.tolist() == [0, 0, 0, -1] and isinstance(adm.error, OSError)
+    assert isinstance(adm.take_error(), OSError) and adm.take_error() is None
+
+
+def test_disk_tier_graph_flag_keeps_the_graphs(expert_gguf, monkeypatch):
+    from types import SimpleNamespace
+
+    from freetoken.engine.engine import _adjust_disk_tier_config
+    from freetoken.env import ENV
+
+    path, _ = expert_gguf
+    cfg = SimpleNamespace(model_path=path, moe_strategy="offload", moe_cpu_layers=None, moe_prefill_overlap=True, moe_prefill_hit_d2d=True, cuda_graph_bs=[1], cuda_graph_max_bs=1)
+    monkeypatch.setattr(ENV.DISK_TIER_GRAPH, "value", True)
+    _adjust_disk_tier_config(cfg, lambda name, value: setattr(cfg, name, value))
+    assert (cfg.moe_prefill_overlap, cfg.moe_prefill_hit_d2d, cfg.cuda_graph_bs, cfg.cuda_graph_max_bs) == (False, False, [1], 1)
+
+
+def test_graph_admission_stays_off_with_a_reason(expert_gguf, monkeypatch):
+    from freetoken.kernel import host_call
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    assert OffloadMoeCache(num_layers=1, num_experts=E, cache_size=2 * E, device=torch.device("cpu"), quant_format="gguf").enable_graph_admission() == "no disk tier is attached"
+    path, layers = expert_gguf
+    cache = _cache(path, layers, 1 << 30, torch.device("cpu"), E + 2)
+    monkeypatch.setattr(host_call, "probe", lambda device: "the runtime does not record stream memory operations in a captured graph")
+    assert "stream memory operations" in cache.enable_graph_admission()
+    assert cache._graph_admit is None and not cache.host_tier.resident.is_pinned()
+
+
+def test_capturing_without_graph_admission_names_the_flag(expert_gguf, monkeypatch):
+    path, layers = expert_gguf
+    cache = _cache(path, layers, 1 << 30, torch.device("cpu"), E + 2)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    with pytest.raises(RuntimeError, match="FREETOKEN_DISK_TIER_GRAPH"):
+        cache._admit_from_disk(0, 3)
 
 
 _QWEN36 = os.path.expanduser("~/models/Qwen3.6-35B-A3B-MTP-GGUF/Qwen3.6-35B-A3B-MTP-Q4exp.gguf")

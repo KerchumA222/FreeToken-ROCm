@@ -61,6 +61,7 @@ def _setup():
         eos_token_ids=set(),
         toolcall_anchor_id=None,
         config=SimpleNamespace(page_size=1),
+        engine=SimpleNamespace(raise_if_admission_failed=lambda: None),
         status_reporter=SimpleNamespace(report_batch=lambda *_, **__: None),
         send_result=sent.extend,
         _kv_usage_pages=cm.page_usage,

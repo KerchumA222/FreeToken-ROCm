@@ -182,6 +182,10 @@ class GraphRunner:
         self.device = device
         self._capture_graphs(max_seq_len, vocab_size, model)
 
+    def _note_step(self) -> None:
+        if self.moe_offload_cache is not None:
+            self.moe_offload_cache.note_graph_step()
+
     def _reset_moe_offload_cache(self) -> None:
         if self.moe_offload_cache is not None:
             self.moe_offload_cache.reset()
@@ -398,6 +402,7 @@ class GraphRunner:
         self.v_store_idx[:rows].copy_(batch.mtp_plan.store_idx)
         self.attn_backend.prepare_for_replay(batch)
         graph.forward.replay()
+        self._note_step()
         batch.hidden_states = graph.hidden
         if not with_tail:
             return self.vbuffer.logits[:rows], None
@@ -417,6 +422,7 @@ class GraphRunner:
         g = self.graph_map[batch.padded_size]
         self.attn_backend.prepare_for_replay(batch)
         g.replay()
+        self._note_step()
         return self.buffer.logits[: batch.size]
 
     def pad_batch(self, batch: Batch) -> None:
