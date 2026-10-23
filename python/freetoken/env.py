@@ -92,6 +92,8 @@ class EnvClassSingleton:
     # Resolve simultaneous stop-string matches by earliest output position; off preserves upstream list order.
     EARLIEST_STOP_MATCH = EnvBool(False)
     QWEN35_ROUTER_GEMV = EnvBool(False)
+    # Opt-in: on HIP, decode-sized (<= 4 rows) Qwen3.5/3.6 and Flash-Next MoE layers compute the router logits and the shared-expert gate in one Triton GEMV launch.
+    FUSED_ROUTER = EnvBool(False)
 
     def __new__(cls):
         # single instance
