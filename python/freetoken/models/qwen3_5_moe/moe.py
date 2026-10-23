@@ -31,6 +31,27 @@ def _router_linear(gate: LinearReplicated, x: torch.Tensor) -> torch.Tensor:
     return gate.forward(x)
 
 
+def _fused_router(
+    moe: Qwen3_5MoE, x: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Router logits and ``sigmoid(shared_expert_gate(x))`` (fp32 ``[rows]``) in one small-M
+    GEMV launch, or None to use the separate linears. Graph-capturable: no host sync."""
+    if not ENV.FUSED_ROUTER or torch.version.hip is None or not x.is_cuda or x.dim() != 2:
+        return None
+    from freetoken.kernel.triton.small_gemv import MAX_ROWS, flash_next_gemv_config, small_gemv
+
+    w, gate_w = moe.gate.weight, moe.shared_expert_gate.weight.view(-1)
+    rows = x.shape[0]
+    if (rows == 0 or rows > MAX_ROWS or w.dtype != x.dtype or gate_w.dtype != x.dtype
+            or w.dim() != 2 or w.stride(1) != 1 or gate_w.stride(0) != 1):
+        return None
+    block_n, block_k, num_warps = flash_next_gemv_config(rows, w.shape[0], w.shape[1], x.device.index)
+    gate = torch.empty(rows, dtype=torch.float32, device=x.device)
+    logits = small_gemv(x.contiguous(), w, block_n=block_n, block_k=block_k, num_warps=num_warps,
+                        side_weight=gate_w, side_output=gate)
+    return logits, gate
+
+
 class _SharedExpert(BaseOP):
     """Always-present shared SwiGLU expert of width ``shared_expert_intermediate_size``."""
 
@@ -90,9 +111,15 @@ class Qwen3_5MoE(BaseOP):
         # Compute the router + shared expert BEFORE the routed experts: the fused MoE
         # kernel may write into ``hidden_states`` in place, which would corrupt the
         # shared expert's input (HF also evaluates the shared expert first).
-        router_logits = _router_linear(self.gate, hidden_states)
-        shared = self.shared_expert.forward(hidden_states)
-        shared = shared * torch.sigmoid(_router_linear(self.shared_expert_gate, hidden_states))
+        fused = _fused_router(self, hidden_states)
+        if fused is not None:
+            router_logits, gate = fused
+            shared = self.shared_expert.forward(hidden_states)
+            shared = shared * gate.unsqueeze(1).to(shared.dtype)
+        else:
+            router_logits = _router_linear(self.gate, hidden_states)
+            shared = self.shared_expert.forward(hidden_states)
+            shared = shared * torch.sigmoid(_router_linear(self.shared_expert_gate, hidden_states))
         routed = self.experts.forward(hidden_states=hidden_states, router_logits=router_logits)
         return (routed + shared).view(num_tokens, hidden_dim)
 
