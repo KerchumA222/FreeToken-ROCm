@@ -37,6 +37,11 @@ def selection_bias(experts, num_rows: int, device: torch.device) -> torch.Tensor
         bias = (slot_for_id[layer_id] >= 0).to(device=device, dtype=torch.float32) * margin
     host_tier = getattr(cache, "host_tier", None)
     if host_margin and host_tier is not None:
-        host = host_tier.resident[layer_id].to(device=device, dtype=torch.float32) * host_margin
+        resident = host_tier.resident[layer_id]
+        if resident.is_pinned():
+            # pinned residency is the graph disk tier's: the copy is a graph node that reads it at replay, after the earlier layers' admissions
+            host = resident.to(device, non_blocking=True).to(torch.float32) * host_margin
+        else:
+            host = resident.to(device=device, dtype=torch.float32) * host_margin
         bias = host if bias is None else bias + host
     return bias

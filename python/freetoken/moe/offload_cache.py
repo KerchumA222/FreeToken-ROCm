@@ -351,6 +351,8 @@ class OffloadMoeCache:
         self.host_tier = None
         self._tier_seen = (0, 0)
         self._disk_tier_args: tuple | None = None
+        # FREETOKEN_DISK_TIER_GRAPH: admission recorded into captured graphs (enable_graph_admission)
+        self._graph_admit = None
         self._slice_pools()
 
     def _pool_layout(self, pool: int) -> int:
@@ -489,6 +491,35 @@ class OffloadMoeCache:
             f"MoE disk tier: {sum(caps)} host slots in {len(caps)} pools ({self.host_tier.host_bytes / 2**30:.2f} GiB pinned incl. the prefill stage), "
             f"{store.io_mode} reads from {store.model_path}"
         )
+
+    def enable_graph_admission(self) -> str | None:
+        """Let decode graphs admit the disk tier's expert misses (:mod:`freetoken.moe.graph_admit`); None on success, else why the graphs must stay off.
+
+        Call after :meth:`set_bank_sources`."""
+        if self.host_tier is None:
+            return "no disk tier is attached"
+        from freetoken.kernel import host_call
+        from freetoken.moe.graph_admit import GraphAdmission
+
+        if self._graph_admit is not None:
+            return None
+        reason = host_call.probe(self.device)
+        if reason is not None:
+            return reason
+        # the host-tier route bias reads residency from inside the graph, by a copy that must be able to read what the host thread just wrote
+        self.host_tier.pin_resident()
+        self._graph_admit = GraphAdmission(self.host_tier, len(self.src_indices), self.device)
+        return None
+
+    def note_graph_step(self) -> None:
+        """One decode step ran as a graph replay, which does not run :meth:`ensure_experts`: count it for ``FT_MOE_STATS_EVERY``."""
+        if self.stats_every and self._graph_admit is not None:
+            self._count_stats_step()
+
+    def raise_admission_error(self) -> None:
+        """Raise the failure of a graph's host-side admission, parked by the host thread (an exception cannot unwind into a replay)."""
+        if self._graph_admit is not None and (exc := self._graph_admit.take_error()) is not None:
+            raise RuntimeError(f"MoE disk tier: admitting experts inside a CUDA graph failed: {exc!r}") from exc
 
     def set_bank_sources(
         self,
@@ -766,6 +797,8 @@ class OffloadMoeCache:
         plan_slots = max(self.num_experts, cache_size)
         self.evict_slots = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
         self.src_indices = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
+        if self._graph_admit is not None:
+            self._graph_admit.resize(plan_slots)  # graphs are recaptured after a rebuild
         self.step.zero_()
         self.active_mask.zero_()
         self.num_indices.zero_()
@@ -1119,11 +1152,15 @@ class OffloadMoeCache:
         self._pending_whole_layer = False
         ensure_experts(self, layer_id, expert_ids)
         if self.host_tier is not None:
-            self._admit_from_disk(layer_id)
-        if self.stats_every and layer_id == 0:
-            self._stats_steps += 1
-            if self._stats_steps % self.stats_every == 0:
-                self._log_decode_stats()
+            self._admit_from_disk(layer_id, min(expert_ids.numel(), self.src_indices.numel()))
+        # a graph replay skips this; GraphRunner calls note_graph_step for it
+        if self.stats_every and layer_id == 0 and not (self._graph_admit is not None and torch.cuda.is_current_stream_capturing()):
+            self._count_stats_step()
+
+    def _count_stats_step(self) -> None:
+        self._stats_steps += 1
+        if self._stats_steps % self.stats_every == 0:
+            self._log_decode_stats()
 
     def _log_decode_stats(self) -> None:
         """Log and reset the decode hit rates of the last ``stats_every`` steps (``FT_MOE_STATS_EVERY``)."""
@@ -1138,15 +1175,19 @@ class OffloadMoeCache:
         logger.info(line)
         self.reset_stats()
 
-    def _admit_from_disk(self, layer_id: int) -> None:
+    def _admit_from_disk(self, layer_id: int, width: int) -> None:
         """Make the GPU misses ``ensure_experts`` staged resident in the host tier and point ``src_indices`` at their pool slots.
 
-        Reading the count back drains the stream, so every earlier copy out of a pool slot has landed before ``ensure`` may evict it."""
+        Reading the count back drains the stream, so every earlier copy out of a pool slot has landed before ``ensure`` may evict it.
+        Under capture the same happens on the stream (:mod:`freetoken.moe.graph_admit`), where the wait for the host orders it alike."""
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            if self._graph_admit is None:
+                raise RuntimeError("the MoE disk tier reads the misses back on the host and cannot run under CUDA graph capture (FREETOKEN_DISK_TIER_GRAPH=1 enables graphs)")
+            self._graph_admit.record(layer_id, self.num_indices, self.src_indices, width)
+            return
         n = int(self.num_indices.item())
         if n == 0:
             return
-        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("the MoE disk tier reads the misses back on the host and cannot run under CUDA graph capture")
         try:
             slots = self.host_tier.ensure(layer_id, self.src_indices[:n].tolist())
         except BaseException:

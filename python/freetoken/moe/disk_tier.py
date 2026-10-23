@@ -244,6 +244,15 @@ class HostExpertTier:
         self.hits = self.misses = self.prefill_reads = 0
         self.host_bytes = sum(t.numel() * t.element_size() for pools in self.pools for t in pools) + sum(s.numel() for s in self._stage)
 
+    def pin_resident(self) -> None:
+        """Hold ``resident`` in pinned memory, which a captured copy can read at replay (the host thread updates it between layers)."""
+        from freetoken.kernel.pinned import alloc_pinned_tensor
+
+        pinned = alloc_pinned_tensor(*self.resident.shape, dtype=torch.bool)
+        pinned.copy_(self.resident)
+        self.resident = pinned
+        self._resident_flat = pinned.view(-1)
+
     def pool(self, layer: int, bank: int) -> torch.Tensor:
         return self.pools[self.layer_layout[layer]][bank]
 

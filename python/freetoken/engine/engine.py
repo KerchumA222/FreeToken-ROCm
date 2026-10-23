@@ -455,6 +455,8 @@ class ForwardOutput(NamedTuple):
 
 
 class Engine:
+    moe_offload_cache: OffloadMoeCache | None = None
+
     def __init__(self, config: EngineConfig):
         assert not torch.cuda.is_initialized()
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
@@ -970,6 +972,12 @@ class Engine:
             self._attach_disk_tier(config, cache)
         cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency, layer_tags=layer_tags, row_tail_bytes=banks.row_tail_bytes)
         cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
+        if banks.on_disk and ENV.DISK_TIER_GRAPH.value:
+            reason = cache.enable_graph_admission()
+            if reason is not None:
+                logger.warning(f"FREETOKEN_DISK_TIER_GRAPH: decode stays eager, {reason}")
+                object.__setattr__(config, "cuda_graph_bs", [])
+                object.__setattr__(config, "cuda_graph_max_bs", 0)
         # Must be set before CUDA graph capture so the (device-side) accumulation ops are
         # captured and re-run on every decode replay.
         cache.collect_stats = config.moe_collect_stats or cache.stats_every > 0
@@ -1430,8 +1438,14 @@ class Engine:
             **self._verify_graph_args(config),
         )
 
+    def raise_if_admission_failed(self) -> None:
+        """Surface a disk-tier admission that failed on the host thread inside a graph replay."""
+        if self.moe_offload_cache is not None:
+            self.moe_offload_cache.raise_admission_error()
+
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs, chain_tokens: torch.Tensor | None = None) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
+        self.raise_if_admission_failed()
         if batch.mm_gather_plan:
             self._run_mm_encoder(batch)
         use_graph = self.graph_runner.can_use_cuda_graph(batch)
@@ -1486,7 +1500,7 @@ class Engine:
         if self.mtp is None or not ENV.SPEC_VERIFY_GRAPH.value:
             return {}
         reason = (
-            "CUDA graphs are off (--cuda-graph-max-bs 0 or --moe-disk-tier)" if config.cuda_graph_max_bs == 0
+            "CUDA graphs are off (--cuda-graph-max-bs 0, or --moe-disk-tier without FREETOKEN_DISK_TIER_GRAPH)" if config.cuda_graph_max_bs == 0
             else "FREETOKEN_SPEC_SEQUENTIAL_VERIFY runs the rows one forward at a time" if ENV.SPEC_SEQUENTIAL_VERIFY
             else f"the {type(self.attn_backend).__name__} attention backend does not capture a verify" if not self.attn_backend.supports_verify_graph
             else None
@@ -2091,7 +2105,7 @@ def _adjust_speculative_config(config: EngineConfig, override) -> None:
 
 
 def _adjust_disk_tier_config(config: EngineConfig, override) -> None:
-    """--moe-disk-tier: GPU offload decode of a GGUF's experts, eager decode (the miss count is read back per layer) and routed-only prefill staging."""
+    """--moe-disk-tier: GPU offload decode of a GGUF's experts, eager decode unless FREETOKEN_DISK_TIER_GRAPH (the miss count is read back per layer) and routed-only prefill staging."""
     from freetoken.models.gguf.reader import is_gguf_path
 
     if not is_gguf_path(config.model_path):
@@ -2104,7 +2118,9 @@ def _adjust_disk_tier_config(config: EngineConfig, override) -> None:
     for name, value in (("moe_prefill_overlap", False), ("moe_prefill_hit_d2d", False)):
         if getattr(config, name) != value:
             override(name, value)
-    if config.cuda_graph_max_bs != 0 or config.cuda_graph_bs:
+    if ENV.DISK_TIER_GRAPH.value:
+        logger.info_rank0("--moe-disk-tier: FREETOKEN_DISK_TIER_GRAPH admits each MoE layer's expert misses from inside the CUDA graphs")
+    elif config.cuda_graph_max_bs != 0 or config.cuda_graph_bs:
         logger.info_rank0("--moe-disk-tier: decode runs without CUDA graphs (each MoE layer reads its expert misses back to the host)")
         override("cuda_graph_bs", [])
         override("cuda_graph_max_bs", 0)

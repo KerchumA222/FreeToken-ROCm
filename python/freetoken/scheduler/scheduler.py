@@ -340,6 +340,7 @@ class Scheduler(SchedulerIOMixin):
         batch, output = last_data[0].batch, last_data[1]
         next_tokens_cpu, copy_done = output[1], output[2]
         copy_done.synchronize()
+        self.engine.raise_if_admission_failed()
         draft_tokens_cpu = getattr(output, "draft_tokens_cpu", None)
         spec = getattr(batch, "spec", None)
         reply: List[DetokenizeMsg] = []
