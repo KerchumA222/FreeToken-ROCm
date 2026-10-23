@@ -291,8 +291,9 @@ class DiskRowTable:
                 raise RuntimeError("PLE disk table failed; recreate the engine before dispatch")
         eos = self.eos_token_id
         if batch.is_decode and getattr(batch, "spec", None) is not None:
-            # a verify's drafts sit on the device only, and the committed context rides the n-gram state slot
-            self.fill(self._verify_runs(batch), graph=False)
+            # a verify's drafts sit on the device only, and the committed context rides the n-gram state slot;
+            # the runs are read back before the launch, so a graph's rows are filled then too (the fill waits for the previous graph)
+            self.fill(self._verify_runs(batch), graph=use_graph)
             return None
         if batch.is_decode:
             reqs = list(batch.reqs)

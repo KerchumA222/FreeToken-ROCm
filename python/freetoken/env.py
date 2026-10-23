@@ -85,6 +85,8 @@ class EnvClassSingleton:
     SPEC_ACCEPT_MIN_P = EnvFloat(None)
     # Opt-in adaptive draft depth: a chain stops growing after the first draft the head gave less than this probability.
     SPEC_DRAFT_MIN_P = EnvFloat(None)
+    # Opt-in: capture the MTP verify (forward, greedy sample, draft head) into CUDA graphs per draft depth; batch size 1, else eager.
+    SPEC_VERIFY_GRAPH = EnvBool(False)
     # Opt-in: on HIP, decode-sized (<= 4 rows) dense linears run as a Triton GEMV instead of rocBLAS GEMM tiles.
     SMALL_GEMV = EnvBool(False)
     # Resolve simultaneous stop-string matches by earliest output position; off preserves upstream list order.

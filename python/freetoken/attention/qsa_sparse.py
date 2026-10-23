@@ -99,6 +99,8 @@ class QSASparseMetadata(BaseAttnMetadata):
 
 
 class QSASparseAttnBackend(BaseAttnBackend):
+    supports_verify_graph = True
+
     def __init__(self, config: ModelConfig) -> None:
         from freetoken.kvcache.qsa_pool import QSAKVCache
 

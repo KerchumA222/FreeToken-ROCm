@@ -923,3 +923,80 @@ def test_triton_metadata_keeps_full_indices_and_optional_swa_indices(monkeypatch
     assert metadata.indices.tolist() == [10, 11, 20, 21, 22]
     assert metadata.swa_indices is not None
     assert metadata.swa_indices.tolist() == [110, 111, 120, 121, 122]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton attention needs CUDA")
+def test_verify_rows_replay_as_a_decode_graph_at_each_depth(monkeypatch):
+    """The rows of an MTP verify are decode rows of one request (row s attends to its first cached_len + s + 1
+    positions): captured at bs = 1 + depth and restaged per step, the graph's attention equals the eager one."""
+    from freetoken.attention import AttentionSpec
+    from freetoken.attention.triton import TritonAttentionBackend
+    from freetoken.core import VerifyRow
+
+    class FakeKVCache:
+        def __init__(self, k, v):
+            self.device, self.dtype, self.k, self.v = k.device, k.dtype, k, v
+
+        def store_kv(self, k, v, out_loc, layer_id):
+            self.k[out_loc.to(torch.long)] = k.view(k.shape[0], self.k.shape[1], -1)
+            self.v[out_loc.to(torch.long)] = v.view(v.shape[0], self.v.shape[1], -1)
+
+        def k_cache(self, layer_id):
+            return self.k
+
+        def v_cache(self, layer_id):
+            return self.v
+
+    torch.manual_seed(3)
+    device = torch.device("cuda")
+    q_heads, kv_heads, dim, width = 8, 2, 128, 1500
+    pool = 4000
+    page_table = torch.zeros(2, width, dtype=torch.int32, device=device)
+    page_table[0] = torch.randperm(pool, device=device)[:width].to(torch.int32)
+    gen = torch.Generator().manual_seed(4)
+    kv = FakeKVCache(
+        torch.randn(pool, kv_heads, dim, generator=gen).to(device, torch.bfloat16),
+        torch.randn(pool, kv_heads, dim, generator=gen).to(device, torch.bfloat16),
+    )
+    monkeypatch.setattr("freetoken.attention.triton.get_global_ctx", lambda: SimpleNamespace(kv_cache=kv, page_table=page_table))
+    backend = TritonAttentionBackend(SimpleNamespace(num_qo_heads=q_heads, head_dim=dim))
+    spec = AttentionSpec(sm_scale=dim**-0.5)
+    depths = (1, 2, 3)
+    backend.init_capture_graph(max_seq_len=width, bs_list=[k + 1 for k in depths])
+
+    def live(k, cached_len):
+        req = SimpleNamespace(cached_len=cached_len, table_idx=0)
+        rows = [VerifyRow(req, s) for s in range(k + 1)]
+        positions = torch.arange(cached_len, cached_len + k + 1, device=device, dtype=torch.int32)
+        batch = SimpleNamespace(padded_reqs=rows, positions=positions, out_loc=page_table[0, positions.long()], padded_size=k + 1, size=k + 1)
+        backend.prepare_metadata(batch)
+        return batch
+
+    inputs = {}
+    graphs = {}
+    for k in depths:
+        q = torch.randn(k + 1, q_heads, dim, device=device, dtype=torch.bfloat16)
+        k_new = torch.randn(k + 1, kv_heads * dim, device=device, dtype=torch.bfloat16)
+        inputs[k] = (q, k_new, torch.randn_like(k_new))
+        static = SimpleNamespace(size=k + 1, padded_size=k + 1, out_loc=torch.zeros(k + 1, dtype=torch.int32, device=device))
+        backend.prepare_for_capture(static)
+        graph = torch.cuda.CUDAGraph()
+        backend.forward(*inputs[k], layer_id=0, batch=static, attn_spec=spec)  # warmup
+        torch.cuda.synchronize()
+        with torch.cuda.graph(graph):
+            captured = backend.forward(*inputs[k], layer_id=0, batch=static, attn_spec=spec)
+        graphs[k] = (graph, captured, static)
+
+    for k, cached_len in [(3, 700), (1, 701), (2, 1200), (3, 900)]:
+        eager_batch = live(k, cached_len)
+        assert eager_batch.attn_metadata.is_decode and eager_batch.attn_metadata.indptr.diff().tolist() == [cached_len + 1 + s for s in range(k + 1)]
+        eager = backend.forward(*inputs[k], layer_id=0, batch=eager_batch, attn_spec=spec)
+
+        graph, captured, static = graphs[k]
+        batch = live(k, cached_len)
+        static.out_loc.copy_(batch.out_loc)
+        backend.prepare_for_replay(batch)
+        assert batch.attn_metadata.indptr.data_ptr() == backend.capture.cu_seqlens_k.data_ptr()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(captured, eager), f"depth {k} at {cached_len}"

@@ -73,6 +73,8 @@ _TURBOQUANT_DECODE = os.environ.get("FT_TURBOQUANT_DECODE", "split")
 
 
 class TritonAttentionBackend(BaseAttnBackend):
+    supports_verify_graph = True
+
     def __init__(self, config: ModelConfig):
         self.config = config
         self.kvcache = get_global_ctx().kv_cache

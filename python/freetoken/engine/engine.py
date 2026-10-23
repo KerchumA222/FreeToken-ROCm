@@ -632,6 +632,7 @@ class Engine:
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
             mrope=config.model_config.model_is_mrope,
+            **self._verify_graph_args(config),
         )
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
@@ -1426,6 +1427,7 @@ class Engine:
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
             mrope=config.model_config.model_is_mrope,
+            **self._verify_graph_args(config),
         )
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs, chain_tokens: torch.Tensor | None = None) -> ForwardOutput:
@@ -1434,7 +1436,17 @@ class Engine:
             self._run_mm_encoder(batch)
         use_graph = self.graph_runner.can_use_cuda_graph(batch)
         next_tokens_gpu = draft_tokens_gpu = None
-        if batch.spec is not None and ENV.SPEC_SEQUENTIAL_VERIFY:
+        if batch.spec is not None and self.graph_runner.can_replay_verify(batch):
+            with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, True):
+                # a sampled verify keeps the sampler (random draws) and the draft head eager
+                greedy = args.temperatures is None and not args.penalties
+                logits, tail = self.graph_runner.replay_verify(batch, greedy)
+                if tail is not None:
+                    next_tokens_gpu, draft_tokens_gpu = tail[0], tail[1]
+                else:
+                    next_tokens_gpu = self._sample_verify(batch, logits[: batch.size], args)
+                    draft_tokens_gpu = self.mtp.head_pass(batch, next_tokens_gpu)
+        elif batch.spec is not None and ENV.SPEC_SEQUENTIAL_VERIFY:
             logits = self._verify_sequential(batch)
             with self.ctx.forward_batch(batch):
                 next_tokens_gpu = self._sample_verify(batch, logits[: batch.size], args)
@@ -1466,6 +1478,31 @@ class Engine:
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event, draft_tokens_cpu, chain_tokens_cpu, draft_conf_cpu)
+
+    def _verify_graph_args(self, config: EngineConfig) -> dict:
+        """GraphRunner arguments for the MTP verify graphs (FREETOKEN_SPEC_VERIFY_GRAPH); none when off.
+
+        Adaptive depth and a short remaining budget truncate a verify to any depth 1..k, so each is captured."""
+        if self.mtp is None or not ENV.SPEC_VERIFY_GRAPH.value:
+            return {}
+        reason = (
+            "CUDA graphs are off (--cuda-graph-max-bs 0 or --moe-disk-tier)" if config.cuda_graph_max_bs == 0
+            else "FREETOKEN_SPEC_SEQUENTIAL_VERIFY runs the rows one forward at a time" if ENV.SPEC_SEQUENTIAL_VERIFY
+            else f"the {type(self.attn_backend).__name__} attention backend does not capture a verify" if not self.attn_backend.supports_verify_graph
+            else None
+        )
+        if reason is not None:
+            logger.info_rank0(f"FREETOKEN_SPEC_VERIFY_GRAPH: the verify stays eager, {reason}")
+            return {}
+        return dict(
+            verify_depths=range(1, int(config.speculative_num_draft_tokens) + 1), verify_tail=self._verify_tail, mtp=self.mtp
+        )
+
+    def _verify_tail(self, batch: Batch, logits: torch.Tensor) -> tuple:
+        """The greedy sample and draft head of a verify, as captured after its forward (greedy rows only)."""
+        tokens = self._sample_verify(batch, logits, BatchSamplingArgs(temperatures=None))
+        drafts = self.mtp.head_pass(batch, tokens)
+        return tokens, drafts, batch.draft_conf
 
     def _sample_verify(self, batch: Batch, logits: torch.Tensor, args: BatchSamplingArgs) -> torch.Tensor:
         """Sample a forward the draft head follows; a verify can keep likely drafts (FREETOKEN_SPEC_ACCEPT_MIN_P)."""
@@ -1521,7 +1558,7 @@ class Engine:
     def draft_chain(self, batch: Batch, token_pool: torch.Tensor) -> torch.Tensor | None:
         """A verify's drafts 2..k, written into ``token_pool`` before its input ids are gathered."""
         return self.mtp.draft_chain(
-            batch, token_pool, self.ctx, self.attn_backend, self.config.model_config.model_is_mrope
+            batch, token_pool, self.ctx, self.attn_backend, self.config.model_config.model_is_mrope, graphs=self.graph_runner
         )
 
     @torch.inference_mode()
@@ -2043,7 +2080,10 @@ def _adjust_speculative_config(config: EngineConfig, override) -> None:
         raise ValueError("--speculative-algorithm mtp runs with tensor parallelism 1 only")
     if config.model_config.is_moe and not is_offload_moe_strategy(config.moe_strategy):
         raise ValueError(f"--speculative-algorithm mtp serves a MoE draft head's experts from the offload cache; use --moe-strategy offload (got {config.moe_strategy!r})")
-    if config.cuda_graph_max_bs != 0 or config.cuda_graph_bs:
+    if ENV.SPEC_VERIFY_GRAPH.value and config.cuda_graph_max_bs != 0:
+        logger.info_rank0("--speculative-algorithm mtp: the verify step runs under CUDA graphs, other decode steps without")
+        override("cuda_graph_bs", [])
+    elif config.cuda_graph_max_bs != 0 or config.cuda_graph_bs:
         logger.info_rank0("--speculative-algorithm mtp: decode runs without CUDA graphs (the draft head runs after every forward)")
         override("cuda_graph_bs", [])
         override("cuda_graph_max_bs", 0)
