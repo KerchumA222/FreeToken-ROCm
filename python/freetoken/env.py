@@ -99,6 +99,9 @@ class EnvClassSingleton:
     # Opt-in: a single-request MTP verify runs each GDN layer's rows through one multi-token conv update and one
     # recurrent kernel that writes the rollback snapshots itself, instead of a decode step and two copies per row.
     GDN_FUSED_VERIFY = EnvBool(False)
+    # Opt-in: requests that all set a top_k (<= 256) sample over torch.topk's candidates instead of the fused
+    # cooperative-launch kernels, which on ROCm wait for every other stream's work (~10% of a decode step).
+    TOPK_SAMPLER = EnvBool(False)
 
     def __new__(cls):
         # single instance
