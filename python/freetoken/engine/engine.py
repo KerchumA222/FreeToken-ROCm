@@ -2266,24 +2266,33 @@ def _adjust_config(config: EngineConfig):
         if config.dtype not in (torch.float16, torch.bfloat16):
             raise ValueError("TurboQuant KV cache requires float16 or bfloat16 model compute")
         # FULL, or FULL + SWA through the hybrid pool (its SWA group keeps the model dtype); hybrid-linear models
-        # page only their FULL layers, so their recurrent layers need no KV format
-        if (
-            AttnType.FULL not in required_attn_types
-            or not required_attn_types <= {AttnType.FULL, AttnType.SWA}
+        # page only their FULL layers, so their recurrent layers need no KV format. QSA (Flash-Next) is the one
+        # sparse group covered: its K/V pages are stored like FULL ones, the index tiers stay in the model dtype.
+        qsa = AttnType.QSA in required_attn_types
+        if (qsa and required_attn_types != frozenset({AttnType.QSA})) or (
+            not qsa
+            and (
+                AttnType.FULL not in required_attn_types
+                or not required_attn_types <= {AttnType.FULL, AttnType.SWA}
+            )
         ):
-            raise ValueError("TurboQuant KV cache currently supports FULL attention, optionally mixed with SWA, only")
+            raise ValueError("TurboQuant KV cache currently supports FULL attention, optionally mixed with SWA, and QSA only")
         from freetoken.kvcache.hybrid_swa_pool import HybridSWAKVCache
         from freetoken.kvcache.mha_pool import MHAKVCache
+        from freetoken.kvcache.qsa_pool import QSAKVCache
 
-        if resolve_pool_class(model_config) not in (MHAKVCache, HybridSWAKVCache):
-            raise ValueError("TurboQuant KV cache currently supports the MHA and hybrid SWA cache pools only")
+        if resolve_pool_class(model_config) not in (MHAKVCache, HybridSWAKVCache, QSAKVCache):
+            raise ValueError("TurboQuant KV cache currently supports the MHA, hybrid SWA and QSA cache pools only")
         specs = [spec for spec in model_config.kv_cache_group_specs() if spec.num_layers and not spec.is_swa]
         if len(specs) != 1:
             raise ValueError("TurboQuant currently requires one uniform FULL-attention KV group")
         head_dim = specs[0].head_dim
         if head_dim < 2 or head_dim & (head_dim - 1):
             raise ValueError(f"TurboQuant requires an even power-of-two head_dim, got {head_dim}")
-        if config.attention_backend == "auto":
+        if qsa:
+            if config.attention_backend not in ("auto", "qsa_sparse"):
+                raise ValueError("TurboQuant KV cache on QSA models requires --attention-backend qsa_sparse")
+        elif config.attention_backend == "auto":
             override("attention_backend", "triton")
         elif config.attention_backend != "triton":
             raise ValueError("TurboQuant KV cache requires --attention-backend triton")

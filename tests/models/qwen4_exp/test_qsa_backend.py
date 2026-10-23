@@ -19,6 +19,7 @@ import torch
 from .common import Fixture, requires_cuda, parsed_config, selection_spy
 
 QSA_LAYER = 3
+KV_DTYPES = ["model", "turboquant_4bit_nc"]
 
 
 def _inputs(fixture: Fixture, lengths, extra: int = 0, seed: int = 11):
@@ -106,6 +107,87 @@ def test_decode_is_dense_below_the_budget(monkeypatch):
 
 
 @requires_cuda
+def test_turboquant_layer_tracks_the_dense_oracle_through_prefill_and_decode():
+    """Below the budget QSA is dense attention, so a TurboQuant pool must stay within quantization noise of the
+    fp32 oracle (which holds unquantized K/V): prefill, then decode steps reading earlier steps' stored codes."""
+    config = parsed_config()
+    fixture = Fixture(config, num_pages=128, kv_cache_dtype="turboquant_4bit_nc")
+    attn = fixture.layer(QSA_LAYER)
+    lengths, steps = [300, 411, 64], 4
+    inputs = _inputs(fixture, lengths, extra=steps)
+    oracle = _dense_oracle(fixture)
+    reqs = [fixture.req(i, 0, n) for i, n in enumerate(lengths)]
+    xs = [torch.cat([row[:n] for row, n in zip(inputs, lengths)])]
+    xs += [torch.stack([row[n + step] for row, n in zip(inputs, lengths)]) for step in range(steps)]
+    for step, x in enumerate(xs):
+        if step:
+            for req in reqs:
+                fixture.step(req)
+        batch = fixture.batch(reqs, "prefill" if step == 0 else "decode")
+        fixture.ctx.attn_backend = fixture.backend
+        got = attn.forward(x, batch).float()
+        fixture.ctx.attn_backend = oracle
+        reference = attn.forward(x, batch).float()
+        relative = (got - reference).norm() / reference.norm()
+        # random V is uncorrelated, so 4-bit V noise (~0.12 of its spread) passes through the averaging undiminished
+        assert relative < 0.2, f"step {step}: relative error {relative:.3f}"
+        assert relative > 0, "TurboQuant output identical to the dense oracle: codes were not read"
+
+
+@requires_cuda
+def test_turboquant_verify_rows_equal_sequential_decode_steps():
+    """A verify (1 + depth decode rows of one request) must see exactly what the same rows run one decode
+    step at a time see: each row attends to the rows before it through the stored codes."""
+    config = parsed_config()
+    depth, length = 3, 300
+    inputs = _inputs(Fixture(config, num_pages=8), [length], extra=depth + 1)[0]
+
+    def run(sequential: bool):
+        fixture = Fixture(config, num_pages=64, kv_cache_dtype="turboquant_4bit_nc", num_speculative_tokens=depth)
+        attn = fixture.layer(QSA_LAYER)
+        attn.forward(inputs[:length], fixture.batch([fixture.req(0, 0, length)], "prefill"))
+        rows = [
+            SimpleNamespace(table_idx=0, cached_len=length + s, device_len=length + s + 1, extend_len=1)
+            for s in range(depth + 1)
+        ]
+        fixture.allocate(0, length, length + depth + 1)
+        x = inputs[length : length + depth + 1]
+        if sequential:
+            return torch.cat([attn.forward(x[s : s + 1], fixture.batch([rows[s]], "decode")) for s in range(depth + 1)])
+        batch = fixture.batch(rows, "decode")
+        batch.spec = SimpleNamespace(num_reqs=1)
+        return attn.forward(x, batch)
+
+    torch.testing.assert_close(run(False).float(), run(True).float(), rtol=1e-2, atol=1e-2)
+
+
+@requires_cuda
+def test_gemm_prefill_flag_matches_the_per_row_kernel(monkeypatch):
+    """FREETOKEN_QSA_GEMM_PREFILL routes a long prefill through the tiled GEMMs, model dtype and TurboQuant;
+    the layer output is the same attention."""
+    from freetoken.env import ENV
+
+    config = parsed_config()
+    length = 700
+    for kv_cache_dtype in KV_DTYPES:
+        fixture = Fixture(config, num_pages=64, kv_cache_dtype=kv_cache_dtype)
+        attn = fixture.layer(QSA_LAYER)
+        x = _inputs(fixture, [length])[0]
+        monkeypatch.setattr(ENV.QSA_GEMM_PREFILL, "value", False)
+        reference = attn.forward(x, fixture.batch([fixture.req(0, 0, length)], "prefill"))
+        monkeypatch.setattr(ENV.QSA_GEMM_PREFILL, "value", True)
+        calls = []
+        import freetoken.kernel.triton.qsa as qsa
+
+        original = qsa.qsa_gemm_attention
+        monkeypatch.setattr(qsa, "qsa_gemm_attention", lambda *a, **k: calls.append(1) or original(*a, **k))
+        got = attn.forward(x, fixture.batch([fixture.req(1, 0, length)], "prefill"))
+        monkeypatch.setattr(qsa, "qsa_gemm_attention", original)
+        assert calls, "the flag did not route the prefill through the GEMM path"
+        torch.testing.assert_close(got.float(), reference.float(), rtol=3e-2, atol=3e-2)
+
+
+@requires_cuda
 def test_flashinfer_dense_matches_the_sparse_path():
     """The engine's dense FULL backend over the same pool, as an independent oracle."""
     pytest.importorskip("flashinfer")
@@ -150,9 +232,10 @@ def test_chunked_prefill_matches_one_shot(cut: int):
 
 
 @requires_cuda
-def test_decode_graph_replay_matches_eager():
+@pytest.mark.parametrize("kv_cache_dtype", KV_DTYPES)
+def test_decode_graph_replay_matches_eager(kv_cache_dtype):
     config = parsed_config()
-    fixture = Fixture(config, num_pages=256)
+    fixture = Fixture(config, num_pages=256, kv_cache_dtype=kv_cache_dtype)
     attn = fixture.layer(QSA_LAYER)
     lengths, steps = [300, 411], 4
     bs = len(lengths)
@@ -205,11 +288,12 @@ def test_decode_graph_replay_matches_eager():
 
 
 @requires_cuda
-def test_verify_graph_replay_matches_eager_at_each_depth():
+@pytest.mark.parametrize("kv_cache_dtype", KV_DTYPES)
+def test_verify_graph_replay_matches_eager_at_each_depth(kv_cache_dtype):
     """A verify is a decode batch of 1 + depth rows of one request, each row compressing against the ring its
     predecessors filled. Captured per depth on the static buffers and restaged per step, it equals the eager run."""
     config = parsed_config()
-    fixture = Fixture(config, num_pages=256)
+    fixture = Fixture(config, num_pages=256, kv_cache_dtype=kv_cache_dtype)
     attn = fixture.layer(QSA_LAYER)
     depths, length = (1, 2, 3), 300
     inputs = _inputs(fixture, [length], extra=16)[0]

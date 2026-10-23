@@ -184,6 +184,29 @@ def test_turboquant_requires_triton_and_supported_full_attention(monkeypatch):
     assert config.attention_backend == "triton"
 
 
+def test_turboquant_accepts_qsa_on_the_qsa_backend_only(monkeypatch):
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_env(monkeypatch)
+    config = _config("qsa", kv_cache_dtype="turboquant_4bit_nc", attention_backend="auto")
+    _adjust_config(config)
+    assert config.attention_backend == "qsa_sparse"
+
+    for backend in ("qsa_sparse", "triton"):
+        config = _config("qsa", kv_cache_dtype="turboquant_4bit_nc", attention_backend=backend)
+        if backend == "qsa_sparse":
+            _adjust_config(config)
+        else:
+            with pytest.raises(ValueError, match="qsa_sparse"):
+                _adjust_config(config)
+
+    # block-sparse BSA and latent KV stay unsupported
+    for kind in ("bsa", "mla"):
+        config = _config(kind, kv_cache_dtype="turboquant_4bit_nc", attention_backend="auto")
+        with pytest.raises(ValueError, match="TurboQuant"):
+            _adjust_config(config)
+
+
 def test_turboquant_accepts_mixed_full_and_swa_attention(monkeypatch):
     from freetoken.engine.engine import _adjust_config
 

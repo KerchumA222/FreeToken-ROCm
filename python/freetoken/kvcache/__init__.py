@@ -95,8 +95,9 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
     if kv_cache_dtype in ("q8_0", "turboquant_4bit_nc"):
         from .hybrid_swa_pool import HybridSWAKVCache
         from .mha_pool import MHAKVCache
+        from .qsa_pool import QSAKVCache
 
-        allowed = (MHAKVCache, HybridSWAKVCache) if kv_cache_dtype == "turboquant_4bit_nc" else (MHAKVCache,)
+        allowed = (MHAKVCache, HybridSWAKVCache, QSAKVCache) if kv_cache_dtype == "turboquant_4bit_nc" else (MHAKVCache,)
         if (
             (model_config.has_swa_attention and kv_cache_dtype != "turboquant_4bit_nc")
             # hybrid-linear models page only their FULL layers (one group, mapped by layer_ids); TurboQuant covers that group
@@ -221,7 +222,11 @@ def create_kvcache_pool(
     # the budget can never disagree.
     from freetoken.attention import AttnType as _AttnType
 
-    if kv_cache_dtype in ("q8_0", "turboquant_4bit_nc") and any(
+    # QSA is the one sparse group TurboQuant covers (its K/V pages are an ordinary GQA slab)
+    turbo_qsa = kv_cache_dtype == "turboquant_4bit_nc" and all(
+        spec.attn_type == _AttnType.QSA for spec in kv_specs
+    )
+    if kv_cache_dtype in ("q8_0", "turboquant_4bit_nc") and not turbo_qsa and any(
         spec.attn_type != _AttnType.FULL or spec.mla for spec in kv_specs
     ):
         raise ValueError(
@@ -276,6 +281,7 @@ def create_kvcache_pool(
             ring_capacity=QSAKVCache.ring_capacity_for(spec.index_ratio, num_speculative_tokens),
             layer_ids=spec.layer_ids,
             mrope=model_config.model_is_mrope,
+            kv_cache_dtype=kv_cache_dtype,
         )
 
     if len(kv_specs) == 1 and kv_specs[0].mla:

@@ -66,7 +66,10 @@ class QSAKVCache(MHAKVCache):
         ring_capacity: int | None = None,
         layer_ids: Sequence[int] | None = None,
         mrope: bool = False,
+        kv_cache_dtype: str = "model",
     ) -> None:
+        if kv_cache_dtype not in ("model", "turboquant_4bit_nc"):
+            raise ValueError(f"QSA KV cache supports the model dtype or turboquant_4bit_nc, got {kv_cache_dtype!r}")
         if index_ratio < 1 or page_size % index_ratio != 0:
             # slot // index_ratio only names one group when a group never straddles a page.
             raise ValueError(
@@ -102,6 +105,7 @@ class QSAKVCache(MHAKVCache):
             dtype=dtype,
             device=device,
             layer_ids=layer_ids,
+            kv_cache_dtype=kv_cache_dtype,
         )
         self._zero_kv_slabs()
         self._alloc_index_tiers(num_pages)
@@ -110,7 +114,13 @@ class QSAKVCache(MHAKVCache):
         # Defense-in-depth: the attend kernels pos-mask every K/V load (the real fix for
         # torch.empty's recycled NaN/Inf bit patterns), but a zeroed slab keeps any future
         # unmasked read finite instead of model-poisoning. One memset per (re)allocation.
-        self._kv_buffer.zero_()
+        # TurboQuant has no fused slab: its code and metadata buffers are zeroed instead.
+        if self._kv_buffer is not None:
+            self._kv_buffer.zero_()
+            return
+        for buffer in (self._k_buffer, self._v_buffer, self._k_scale, self._v_scale, self._v_zero):
+            if buffer is not None:
+                buffer.zero_()
 
     def _alloc_index_tiers(self, num_pages: int) -> None:
         # ZERO-initialized: the score kernel reads whole rows of blocks unmasked and relies on
@@ -156,6 +166,7 @@ class QSAKVCache(MHAKVCache):
             self._kv_buffer = None
             self._k_buffer = None
             self._v_buffer = None
+            self._k_scale = self._v_scale = self._v_zero = None
             raise
 
     @classmethod
@@ -177,13 +188,17 @@ class QSAKVCache(MHAKVCache):
                 fixed += num_req_slots * row * (cls.ring_capacity_for(spec.index_ratio, num_spec) + 1)
                 if config.model_config.model_is_mrope:
                     per_token += _ROPE_POS_BYTES
+        if getattr(config, "kv_cache_dtype", "model") == "turboquant_4bit_nc":
+            # One fixed Hadamard matrix, Gaussian codebook and centroid boundaries per pool (as MHAKVCache.kv_cost).
+            head_dim = next(s.head_dim for s in config.model_config.kv_cache_group_specs() if not s.is_swa)
+            fixed += (head_dim * head_dim + 16 + 15) * 4
         return per_token * config.page_size, fixed, config.page_size, 0
 
     def unit_bytes(self) -> tuple[int, int]:
         # Only the shadow slab scales with pages, and only its non-scratch rows; the ring and
         # the scratch rows are the fixed term kv_cost reports separately.
         kv, swa = super().unit_bytes()
-        tokens = int(self._kv_buffer.shape[2]) * int(self._kv_buffer.shape[3])
+        tokens = self._num_pages * self._page_size
         slab = (
             self._num_index_layers
             * self._cmp_scratch_base

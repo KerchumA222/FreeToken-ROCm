@@ -102,6 +102,9 @@ class EnvClassSingleton:
     # Opt-in: requests that all set a top_k (<= 256) sample over torch.topk's candidates instead of the fused
     # cooperative-launch kernels, which on ROCm wait for every other stream's work (~10% of a decode step).
     TOPK_SAMPLER = EnvBool(False)
+    # Opt-in: QSA prefill (>= 256 rows) runs as tiled batched GEMMs over the union of each tile's selected pages instead of
+    # one sparse-kernel program per row; same attention, ~3x faster on RDNA2, with a byte-capped scratch.
+    QSA_GEMM_PREFILL = EnvBool(False)
 
     def __new__(cls):
         # single instance
