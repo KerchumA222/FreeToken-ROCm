@@ -1320,7 +1320,7 @@ class Engine:
         if batch.spec is not None and self.graph_runner.can_replay_verify(batch):
             with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, True):
                 # a sampled verify keeps the sampler (random draws) and the draft head eager
-                greedy = args.temperatures is None and not args.penalties
+                greedy = args.temperatures is None and not args.penalties and not args.think_biases
                 logits, tail = self.graph_runner.replay_verify(batch, greedy)
                 if tail is not None:
                     next_tokens_gpu, draft_tokens_gpu = tail[0], tail[1]
@@ -1387,6 +1387,14 @@ class Engine:
 
     def _sample_verify(self, batch: Batch, logits: torch.Tensor, args: BatchSamplingArgs) -> torch.Tensor:
         """Sample a forward the draft head follows; a verify can keep likely drafts (FREETOKEN_SPEC_ACCEPT_MIN_P)."""
+        if args.think_biases:
+            # biased before both the sample and the draft check, so a kept draft cannot slip past the pressure
+            from dataclasses import replace
+
+            from freetoken.engine.think_budget import apply_biases
+
+            logits = apply_biases(logits, args.think_biases, args.think_end_id)
+            args = replace(args, think_biases=[])
         tokens = self.sampler.sample(logits, args).to(torch.int32)
         min_p = ENV.SPEC_ACCEPT_MIN_P.value
         if batch.spec is not None and min_p:

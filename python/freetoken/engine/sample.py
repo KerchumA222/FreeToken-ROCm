@@ -9,6 +9,7 @@ from freetoken.utils import is_sm90_supported, nvtx_annotate
 
 if TYPE_CHECKING:
     from freetoken.core import Batch
+    from freetoken.engine.think_budget import ThinkBudget
 
 
 @dataclass
@@ -20,6 +21,9 @@ class BatchSamplingArgs:
     penalties: list[tuple[int, torch.Tensor, float, float]] = field(default_factory=list)
     # the largest top_k over the sampled rows when every one of them sets it, else None (host int: FREETOKEN_TOPK_SAMPLER)
     max_top_k: int | None = None
+    # FREETOKEN_THINKING_BUDGET: (row, bias) added to the </think> logit (token think_end_id)
+    think_biases: list[tuple[int, float]] = field(default_factory=list)
+    think_end_id: int = -1
 
     def first_rows(self, n: int) -> "BatchSamplingArgs":
         """The args of the first ``n`` rows of the batch."""
@@ -27,6 +31,7 @@ class BatchSamplingArgs:
         return BatchSamplingArgs(
             cut(self.temperatures), cut(self.top_k), cut(self.top_p), cut(self.greedy_mask),
             [p for p in self.penalties if p[0] < n], self.max_top_k,
+            [b for b in self.think_biases if b[0] < n], self.think_end_id,
         )
 
 
@@ -109,8 +114,17 @@ def keep_likely_drafts(
 class Sampler:
     device: torch.device
     vocab_size: int
+    # FREETOKEN_THINKING_BUDGET (set by the scheduler, which has the tokenizer)
+    think_budget: "ThinkBudget | None" = None
 
     def prepare(self, batch: Batch) -> BatchSamplingArgs:
+        args = self._prepare(batch)
+        if self.think_budget is not None:
+            args.think_biases = self.think_budget.row_biases(batch.reqs)
+            args.think_end_id = self.think_budget.end_id
+        return args
+
+    def _prepare(self, batch: Batch) -> BatchSamplingArgs:
         params = [r.sampling_params for r in batch.reqs]
         is_greedy = [p.is_greedy for p in params]
         penalties = []
@@ -159,6 +173,10 @@ class Sampler:
     @nvtx_annotate("Sampler")
     def sample(self, logits: torch.Tensor, args: BatchSamplingArgs) -> torch.Tensor:
         with torch.cuda.nvtx.range("Sampler"):
+            if args.think_biases:
+                from freetoken.engine.think_budget import apply_biases
+
+                logits = apply_biases(logits, args.think_biases, args.think_end_id)
             if args.penalties:
                 logits = logits.float().clone()
                 for row, counts, presence, frequency in args.penalties:

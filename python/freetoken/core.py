@@ -26,6 +26,8 @@ class SamplingParams:
     stop_strs: list[str] = field(default_factory=list)
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
+    # tokens of thinking this request allows (Anthropic thinking.budget_tokens); enforced only under FREETOKEN_THINKING_BUDGET
+    thinking_budget: int | None = None
 
     @property
     def is_greedy(self) -> bool:
