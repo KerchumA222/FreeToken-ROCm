@@ -117,6 +117,12 @@ class EnvClassSingleton:
     # Opt-in: a --moe-disk-tier prefill chunk that routes to most experts reads and copies the next MoE layer's experts
     # (on a worker thread and a side stream) while the current layer computes, instead of staging each layer synchronously.
     DISK_TIER_PREFILL_AHEAD = EnvBool(False)
+    # Opt-in thinking budget (tokens; 0 = off): past FREETOKEN_THINKING_BUDGET_RAMP of it the </think> logit gets a bias
+    # growing quadratically to FREETOKEN_THINKING_BUDGET_BIAS, and at the budget </think> is forced. A request's own
+    # smaller budget (Anthropic thinking.budget_tokens) wins.
+    THINKING_BUDGET = EnvInt(0)
+    THINKING_BUDGET_RAMP = EnvFloat(0.75)
+    THINKING_BUDGET_BIAS = EnvFloat(10.0)
 
     def __new__(cls):
         # single instance

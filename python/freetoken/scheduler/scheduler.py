@@ -138,6 +138,17 @@ class Scheduler(SchedulerIOMixin):
                 toolcall_opener_for(getattr(config, "tool_call_parser", "")),
             )
         self.token_pool = self.table_manager.token_pool
+        if ENV.THINKING_BUDGET.value > 0:
+            from freetoken.engine.think_budget import ThinkBudget
+
+            tb = ThinkBudget.from_tokenizer(
+                self.tokenizer, ENV.THINKING_BUDGET.value, ENV.THINKING_BUDGET_RAMP.value, ENV.THINKING_BUDGET_BIAS.value
+            )
+            if tb is None:
+                logger.warning("FREETOKEN_THINKING_BUDGET: the vocabulary has no single <think>/</think> tokens; no budget")
+            else:
+                self.engine.sampler.think_budget = tb
+                logger.info(f"FREETOKEN_THINKING_BUDGET: {tb.budget} tokens, pressure on </think> from {tb.ramp:.0%} up to +{tb.max_bias:g}")
         # Floor the prefill chunk by the cache manager's cap (DSV4: ~half the window pool) so a
         # sliding-window cache chunks long prompts and frees out-of-window pages between chunks
         # instead of OOMing _alloc_window on a prompt longer than the window pool.
@@ -920,6 +931,9 @@ class Scheduler(SchedulerIOMixin):
         self.cache_manager.cache_req(req, finished=True)
         self.table_manager.free(req.table_idx)
         req.table_idx = -1
+        think_budget = getattr(getattr(self.engine, "sampler", None), "think_budget", None)
+        if think_budget is not None:
+            think_budget.forget(req.uid)
 
     def _reply_rebuild(self, request_id: str, status: str, error: str | None = None) -> None:
         # Single source of truth with the rollback snapshot (_current_cache_geometry): mamba is

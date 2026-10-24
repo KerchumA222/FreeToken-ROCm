@@ -315,6 +315,13 @@ def convert_anthropic_prompt(
     return render_messages(messages), template_tools, parser_tools, ctk
 
 
+def _thinking_budget(req: AnthropicMessagesRequest) -> int | None:
+    """``thinking.budget_tokens`` of an enabled thinking block (enforced only under FREETOKEN_THINKING_BUDGET)."""
+    t = req.thinking or {}
+    budget = t.get("budget_tokens")
+    return int(budget) if t.get("type") == "enabled" and isinstance(budget, int) and budget > 0 else None
+
+
 def convert_anthropic_to_genspec(
     req: AnthropicMessagesRequest,
     model_sampling: dict[str, Any],
@@ -336,6 +343,7 @@ def convert_anthropic_to_genspec(
             model_sampling=model_sampling,
             stop=req.stop_sequences,
             default_max_tokens=default_max_tokens,
+            thinking_budget=_thinking_budget(req),
         ),
         chat_template_kwargs=ctk,
         template_tools=template_tools,

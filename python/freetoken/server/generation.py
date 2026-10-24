@@ -171,6 +171,7 @@ def resolve_sampling(
     default_max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
     presence_penalty: float = 0.0,
     frequency_penalty: float = 0.0,
+    thinking_budget: int | None = None,
 ) -> SamplingParams:
     """Map a protocol's sampling fields onto the engine's neutral SamplingParams,
     filling unspecified fields from the checkpoint's recommended defaults."""
@@ -194,6 +195,7 @@ def resolve_sampling(
         stop_strs=[s for s in stop_list if s],  # drop empty strings (would match everything)
         presence_penalty=presence_penalty,
         frequency_penalty=frequency_penalty,
+        thinking_budget=thinking_budget,
     )
 
 
