@@ -679,3 +679,20 @@ def test_prefill_look_ahead_stages_every_expert_between_decode_steps(expert_gguf
         mode.__exit__(None, None, None)
         assert not cache._ahead_pending
     assert cache.prefill_total_rows == 3 * layers * E
+
+
+def test_look_ahead_stage_comes_out_of_the_host_budget(expert_gguf, monkeypatch):
+    """The second pinned stage is allocated at startup and paid for from --moe-host-cache-mem, so turning the
+    look-ahead on does not grow the pinned total (beyond rounding to whole pool slots)."""
+    from freetoken.env import ENV
+
+    path, layers = expert_gguf
+    budget = 120_000  # below the whole model, so the pools are what the stage comes out of
+    sizes = {}
+    for on in (False, True):
+        monkeypatch.setattr(ENV.DISK_TIER_PREFILL_AHEAD, "value", on)
+        cache = _cache(path, layers, budget, torch.device("cpu"), 2 * E + 2)
+        sizes[on] = cache.host_tier.host_bytes
+        assert (cache.host_tier._stage_views_2 is not None) == on
+    slot = max(sum(rows) for rows in cache._row_bytes)
+    assert sizes[True] <= sizes[False] + len(cache.host_tier.capacities) * slot

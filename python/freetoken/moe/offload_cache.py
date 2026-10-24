@@ -460,10 +460,20 @@ class OffloadMoeCache:
     def _build_host_tier(self) -> None:
         from freetoken.moe.disk_tier import HostExpertTier, split_host_capacity
 
+        from freetoken.env import ENV
+
         store, host_bytes, min_slots = self._disk_tier_args
         slot_bytes = [sum(rows) for rows in self._row_bytes]
+        # FREETOKEN_DISK_TIER_PREFILL_AHEAD reads into a second pinned stage: it comes out of the host budget (allocated
+        # mid-serve on top of it, it pushed a 38 GB host into swap and the OOM killer)
+        second_stage = self.num_layers > 1 and bool(ENV.DISK_TIER_PREFILL_AHEAD)
+        if second_stage:
+            stage_bytes = sum(self.num_experts * max(rows[k] for rows in self._row_bytes) for k in range(len(self.bank_schema)))
+            host_bytes = max(host_bytes - stage_bytes, 1)
         caps = split_host_capacity(host_bytes, self.layer_layout, slot_bytes, self.num_experts, min_slots)
         self.host_tier = HostExpertTier(store, self.num_experts, self.bank_schema, self.layouts, self.layer_layout, caps, pin=self.device.type == "cuda")
+        if second_stage:
+            self.host_tier.stage(0, 0, 1)  # allocate it now, accounted in host_bytes below
         # a layer's source is its layout's pool, indexed by pool slot instead of expert id
         for k, name in enumerate(self.bank_schema):
             self.bank_sources[name] = [self.host_tier.pool(layer, k) for layer in range(self.num_layers)]
