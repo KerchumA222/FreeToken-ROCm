@@ -1255,8 +1255,13 @@ class OffloadMoeCache:
         stream = self._ahead_stream
         ctx = torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext()
         with ctx:
-            if stream is not None and self._ahead_used[buffer_id]:
-                stream.wait_event(self._ahead_release[buffer_id])
+            if stream is not None:
+                if self._ahead_used[buffer_id]:
+                    stream.wait_event(self._ahead_release[buffer_id])
+                else:
+                    # a buffer's first use in a forward: the slots it borrows were last read by work on the compute stream
+                    # (decode steps, the previous forward's last layers), which no release event covers
+                    stream.wait_stream(torch.cuda.current_stream(self.device))
             self._invalidate_prefill_buffer(buffer_id, layer_id)
             for rows, source in ((hits, lambda k: tier.pool(layer_id, k)), ([(e, e) for e in staged], lambda k: tier.stage(layer_id, k, buffer_id))):
                 if not rows:
