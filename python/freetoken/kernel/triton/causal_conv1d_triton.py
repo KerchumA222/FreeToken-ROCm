@@ -102,6 +102,7 @@ def _causal_conv1d_fwd_tiled_kernel(
     NP2_STATELEN: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    CHANNEL_LAST: tl.constexpr = False,
 ):
     conv_states_ptr = initial_states_ptr
     conv_state_indices_ptr = cache_indices_ptr
@@ -115,8 +116,14 @@ def _causal_conv1d_fwd_tiled_kernel(
     idx_feats = tl.program_id(2) * BLOCK_N + tl.arange(0, BLOCK_N)
     # int64 feature offsets: idx_feats * (dim-stride == total tokens) passes 2^31
     # once dim * total_tokens does (~262k tokens at dim 8192).
-    feat_x = idx_feats.to(tl.int64) * stride_x_dim
-    feat_o = idx_feats.to(tl.int64) * stride_o_dim
+    if CHANNEL_LAST:
+        # token-major rows (dim strides 1): plain feature offsets keep the loads vectorized, and the
+        # row offsets carry the int64 instead
+        feat_x = idx_feats
+        feat_o = idx_feats
+    else:
+        feat_x = idx_feats.to(tl.int64) * stride_x_dim
+        feat_o = idx_feats.to(tl.int64) * stride_o_dim
 
     if idx_seq == pad_slot_id:
         return
@@ -185,6 +192,8 @@ def _causal_conv1d_fwd_tiled_kernel(
             w_j = w_col3
         src_local = local_out - state_len + j            # [BLOCK_M]
         gx = sequence_start_index + src_local
+        if CHANNEL_LAST:
+            gx = gx.to(tl.int64)
         x_ptrs = (
             x_ptr
             + (gx * stride_x_token)[:, None]
@@ -215,9 +224,12 @@ def _causal_conv1d_fwd_tiled_kernel(
         # polynomial tl.exp) and matches the CUDA op's -use_fast_math __expf within tol.
         acc = acc / (1.0 + tl.exp2(-acc * 1.4426950408889634))
 
+    out_row = sequence_start_index + local_out
+    if CHANNEL_LAST:
+        out_row = out_row.to(tl.int64)
     o_ptrs = (
         o_ptr
-        + ((sequence_start_index + local_out) * stride_o_token)[:, None]
+        + (out_row * stride_o_token)[:, None]
         + feat_o[None, :]
     )
     mask_o = (local_out < seqlen)[:, None] & mfc
@@ -229,18 +241,24 @@ def _causal_conv1d_fwd_tiled_kernel(
         idx_tok = tl.arange(0, NP2_STATELEN)
         if state_len <= seqlen:
             idx_last = (seqlen - state_len) + idx_tok
+            last_row = sequence_start_index + idx_last
+            if CHANNEL_LAST:
+                last_row = last_row.to(tl.int64)
             xw_ptrs = (
                 x_ptr
-                + ((sequence_start_index + idx_last) * stride_x_token)[:, None]
+                + (last_row * stride_x_token)[:, None]
                 + feat_x[None, :]
             )
             mask_xw = (idx_last >= 0)[:, None] & (idx_last < seqlen)[:, None] & mfc
             new_cs = tl.load(xw_ptrs, mask_xw, 0.0)
         else:
             VAL = state_len - seqlen
+            first_row = sequence_start_index
+            if CHANNEL_LAST:
+                first_row = first_row.to(tl.int64)
             xw_ptrs = (
                 x_ptr
-                + (sequence_start_index * stride_x_token)
+                + (first_row * stride_x_token)
                 + feat_x[None, :]
                 + ((idx_tok - VAL) * stride_x_token)[:, None]
             )
@@ -447,6 +465,10 @@ def _causal_conv1d_update_kernel(
 # ---------------------------------------------------------------------------
 # Tuned entrypoints (mirror the vendored op's varlen / decode split)
 # ---------------------------------------------------------------------------
+# (BLOCK_M, BLOCK_N, num_warps) for token-major input: features are the contiguous axis
+_CHANNEL_LAST_TILE = (8, 512, 4)  # RX 6800 sweep: 1.6 ms vs 5.4 ms at (16, 64, 2) for 4096 x 12288
+
+
 def causal_conv1d_varlen(
     x: torch.Tensor,            # [conv_dim, total_tokens]
     weight: torch.Tensor,       # [conv_dim, kernel]
@@ -459,14 +481,16 @@ def causal_conv1d_varlen(
     max_seq_len: Optional[int] = None,
     batch: Optional[int] = None,
 ) -> torch.Tensor:
-    if x.stride(-1) != 1:
+    # channel-last (x.stride(0) == 1, a transposed view of token-major rows) is read in place and written the same way
+    channel_last = x.stride(0) == 1 and x.shape[0] > 1
+    if x.stride(-1) != 1 and not channel_last:
         x = x.contiguous()
     cu_seqlens = cu_seqlens.to(torch.int32)
     cache_indices = cache_indices.to(torch.int32)
     if isinstance(activation, bool) and activation:
         activation = "silu"
 
-    out = torch.empty_like(x)
+    out = torch.empty(x.shape[1], x.shape[0], dtype=x.dtype, device=x.device).t() if channel_last else torch.empty_like(x)
     dim, cu_seqlen = x.shape
     _, width = weight.shape
     # The tap chains below are unrolled for widths 2..4 only (wider taps would
@@ -538,10 +562,11 @@ def causal_conv1d_varlen(
         NP2_STATELEN=np2_statelen,
         # Fixed via H100 sweep (108-config grid; BM16/BN64/w2/s3 won or tied within
         # 5% at every T 128..8192 for dim=8192; upstream vLLM likewise hardcodes).
-        BLOCK_M=16,
-        BLOCK_N=64,
-        num_warps=2,
+        BLOCK_M=_CHANNEL_LAST_TILE[0] if channel_last else 16,
+        BLOCK_N=_CHANNEL_LAST_TILE[1] if channel_last else 64,
+        num_warps=_CHANNEL_LAST_TILE[2] if channel_last else 2,
         num_stages=3,
+        CHANNEL_LAST=channel_last,
     )
     return out
 

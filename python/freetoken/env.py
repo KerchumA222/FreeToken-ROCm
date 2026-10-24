@@ -105,6 +105,9 @@ class EnvClassSingleton:
     # Opt-in: QSA prefill (>= 256 rows) runs as tiled batched GEMMs over the union of each tile's selected pages instead of
     # one sparse-kernel program per row; same attention, ~3x faster on RDNA2, with a byte-capped scratch.
     QSA_GEMM_PREFILL = EnvBool(False)
+    # Opt-in: the GDN prefill conv reads its input and writes its output token-major (a strided view) instead of
+    # transposing [total, conv_dim] to channels-first and back; the transposed copies ran at ~2.5 GB/s on RDNA2.
+    GDN_CONV_CHANNEL_LAST = EnvBool(False)
 
     def __new__(cls):
         # single instance

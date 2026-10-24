@@ -26,6 +26,11 @@ _TILE_GROUP = 8
 # Cap on one batched GEMM's scores + probabilities + gathered K/V (an uncapped 8-tile group
 # OOMed a 16 GB card at ~69k context).
 _GEMM_BYTES = 128 << 20
+# A tile's union grows toward the whole visible context as the context grows, while each row still
+# selects only ``indices.shape[1]`` tokens: past this many selections' worth of union the GEMMs
+# do more work than the per-row kernel saves (RX 6800, Flash-Next: the union is ~1x the selection
+# in a first 4k chunk and ~6.6x by 15k).
+_MAX_UNION_RATIO = 3.0
 
 
 def _tiles(cu_seqlens_host: list[int], rows: int):
@@ -185,6 +190,7 @@ def qsa_gemm_attention(
     centroids: torch.Tensor | None = None,
     rotation: torch.Tensor | None = None,
     gemm_bytes: int | None = None,
+    max_union_ratio: float | None = None,
 ) -> torch.Tensor:
     """Prefill QSA over tiles of consecutive rows (see the module docstring).
 
@@ -202,6 +208,8 @@ def qsa_gemm_attention(
     if turboquant and any(x is None for x in (v_scales, v_zeros, centroids, rotation)):
         raise ValueError("TurboQuant QSA GEMM requires all quantization metadata")
     budget = _GEMM_BYTES if gemm_bytes is None else gemm_bytes
+    ratio = _MAX_UNION_RATIO if max_union_ratio is None else max_union_ratio
+    max_union = ratio * indices.shape[1] if ratio > 0 else float("inf")
     if out is None:
         out = torch.empty_like(q)
     quant = dict(k_norms=k_norms, v_scales=v_scales, v_zeros=v_zeros, centroids=centroids)
@@ -223,7 +231,7 @@ def qsa_gemm_attention(
         u_max = max(1, int(union_count.max().item()))
         length = u_max * BLOCK_TOKENS
         tile_bytes = _tile_bytes(length, group, dim, q.element_size(), turboquant)
-        if tile_bytes > budget:
+        if tile_bytes > budget or length > max_union:
             pending = (f[0], f[-1] + n[-1]) if pending is None else (pending[0], f[-1] + n[-1])
             continue
         if pending is not None:
@@ -285,9 +293,9 @@ def _gemm_tiles(q, k_cache, v_cache, out, pages, mask, row_ids, kvh, group, leng
             BLOCK=triton.next_power_of_2(length), num_warps=8,
         )
         del s
-        # Small normalized weights can underflow in fp16 where their value contribution is
-        # still representable, so the quantized path multiplies in fp32.
-        o = torch.bmm(p, vg.float()).to(out.dtype) if turboquant else torch.bmm(p, vg)
+        # The quantized path accumulates PV in fp32 (fp16 operands: an fp32 GEMM runs at a fraction
+        # of the fp16 rate on RDNA2); weights below fp16's subnormal range contribute nothing visible.
+        o = torch.bmm(p.to(vg.dtype), vg, out_dtype=torch.float32).to(out.dtype) if turboquant else torch.bmm(p, vg)
         out.view(t * hq, dim).index_copy_(0, flat, o.view(-1, dim))
 
 
