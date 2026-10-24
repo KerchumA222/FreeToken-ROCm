@@ -117,6 +117,13 @@ def flash_next_gemv_config(rows: int, n: int, k: int, device_index: int | None =
 _DENSE_MAX_ELEMS = 64 << 20
 
 
+def _pick_orientation(x: torch.Tensor, w: torch.Tensor) -> bool:
+    from freetoken.env import ENV
+
+    return (ENV.PREFILL_GEMM_PICK and x.is_cuda and w.dim() == 2 and w.dtype == x.dtype
+            and not torch.cuda.is_current_stream_capturing())
+
+
 def dense_linear(x: torch.Tensor, w: torch.Tensor, b: torch.Tensor | None = None) -> torch.Tensor:
     """``F.linear`` for a dense weight, through :func:`small_gemv` at decode sizes on HIP.
 
@@ -124,6 +131,14 @@ def dense_linear(x: torch.Tensor, w: torch.Tensor, b: torch.Tensor | None = None
     a few MB wide (Qwen3.8-Flash-Next's QSA indexer, a dense GDN out_proj). This reads
     the weight once in a few us."""
     rows = x.numel() // x.shape[-1] if x.dim() else 0
+    if rows > MAX_ROWS and _pick_orientation(x, w):
+        from freetoken.kernel.gemm_pick import flipped_linear, pick, row_bucket
+
+        x2 = x.reshape(rows, -1)
+        out = pick(("dense", row_bucket(rows), w.shape[0], w.shape[1], w.dtype),
+                   (lambda: torch.nn.functional.linear(x2, w), lambda: flipped_linear(x2, w)))
+        out = out.reshape(*x.shape[:-1], w.shape[0])
+        return out + b.to(out.dtype) if b is not None else out
     if (torch.version.hip is None or not x.is_cuda or rows == 0 or rows > MAX_ROWS
             or w.dim() != 2 or w.dtype != x.dtype or w.stride(1) != 1
             or w.numel() > _DENSE_MAX_ELEMS):

@@ -108,6 +108,9 @@ class EnvClassSingleton:
     # Opt-in: the GDN prefill conv reads its input and writes its output token-major (a strided view) instead of
     # transposing [total, conv_dim] to channels-first and back; the transposed copies ran at ~2.5 GB/s on RDNA2.
     GDN_CONV_CHANNEL_LAST = EnvBool(False)
+    # Opt-in: prefill-sized dense linears time x @ W^T against (W @ x^T)^T once per shape, and GGUF linears from 256
+    # rows also try dequantize-then-GEMM against MMQ; each shape keeps the fastest (rocBLAS tiles vary ~5x on RDNA2).
+    PREFILL_GEMM_PICK = EnvBool(False)
 
     def __new__(cls):
         # single instance
