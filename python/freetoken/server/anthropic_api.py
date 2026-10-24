@@ -295,17 +295,22 @@ def convert_anthropic_prompt(
         selected = req.tool_choice.name if (req.tool_choice and req.tool_choice.type == "tool") else None
         template_tools, parser_tools = split_tool_lists(raw_tools, selected)
 
-    # Native extended-thinking toggle -> template kwargs, broadcast in every
-    # spelling the ecosystem's templates read (a bare enable_thinking bool is
-    # inert for templates that read a different knob, e.g. M3's thinking_mode).
-    from .model_meta import thinking_toggle_kwargs
+    # Native extended-thinking toggle and effort (output_config.effort) -> template kwargs,
+    # broadcast in every spelling the ecosystem's templates read (a bare enable_thinking bool is
+    # inert for templates that read a different knob, e.g. M3's thinking_mode). An explicit
+    # chat_template_kwargs thinking key wins over both; FREETOKEN_ANTHROPIC_DEFAULT_EFFORT stands
+    # in for a request that names no effort (a reasoning template otherwise runs at its default).
+    from freetoken.env import ENV
 
-    ctk: dict[str, Any] = {}
-    if req.thinking:
-        if req.thinking.get("type") == "enabled":
-            ctk = thinking_toggle_kwargs(True)
-        elif req.thinking.get("type") == "disabled":
-            ctk = thinking_toggle_kwargs(False)
+    from .model_meta import effort_toggle_kwargs
+
+    thinking_type = (req.thinking or {}).get("type")
+    if thinking_type not in ("enabled", "disabled"):
+        thinking_type = None
+    effort = (req.output_config or {}).get("effort") or ENV.ANTHROPIC_DEFAULT_EFFORT.value or None
+    ctk: dict[str, Any] = dict(req.chat_template_kwargs or {})
+    if thinking_type or effort:
+        ctk = effort_toggle_kwargs(effort, req.chat_template_kwargs, thinking_type)
 
     return render_messages(messages), template_tools, parser_tools, ctk
 

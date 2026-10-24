@@ -1063,3 +1063,40 @@ def test_image_only_tool_result_keeps_an_empty_tool_message():
         "role": "user",
         "content": [{"type": "image", "freetoken_ref": {"kind": "b64", "data": "aGk="}}],
     }
+
+
+def _ctk(extra):
+    req = AnthropicMessagesRequest.model_validate(
+        {"model": "claude-x", "max_tokens": 64, "messages": [{"role": "user", "content": "hi"}], **extra}
+    )
+    return A.convert_anthropic_to_genspec(req, {}).chat_template_kwargs
+
+
+def test_output_config_effort_reaches_the_template():
+    ctk = _ctk({"thinking": {"type": "enabled"}, "output_config": {"effort": "medium"}})
+    assert ctk["reasoning_effort"] == "medium"
+    assert ctk["enable_thinking"] is True
+
+
+def test_chat_template_kwargs_effort_wins_over_output_config():
+    ctk = _ctk({
+        "thinking": {"type": "enabled"},
+        "output_config": {"effort": "high"},
+        "chat_template_kwargs": {"reasoning_effort": "medium"},
+    })
+    assert ctk == {"reasoning_effort": "medium"}
+
+
+def test_no_thinking_fields_leave_the_template_kwargs_alone():
+    assert _ctk({}) == {}
+    assert _ctk({"chat_template_kwargs": {"foo": 1}}) == {"foo": 1}
+
+
+def test_default_effort_applies_only_when_the_request_names_none(monkeypatch):
+    from freetoken.env import ENV
+
+    monkeypatch.setattr(ENV.ANTHROPIC_DEFAULT_EFFORT, "value", "medium")
+    assert _ctk({})["reasoning_effort"] == "medium"
+    assert _ctk({"output_config": {"effort": "high"}})["reasoning_effort"] == "high"
+    assert _ctk({"thinking": {"type": "disabled"}})["enable_thinking"] is False
+    assert _ctk({"chat_template_kwargs": {"reasoning_effort": "low"}}) == {"reasoning_effort": "low"}
