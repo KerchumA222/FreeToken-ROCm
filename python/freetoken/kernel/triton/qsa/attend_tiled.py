@@ -29,8 +29,8 @@ _GEMM_BYTES = 128 << 20
 # A tile's union grows toward the whole visible context as the context grows, while each row still
 # selects only ``indices.shape[1]`` tokens: past this many selections' worth of union the GEMMs
 # do more work than the per-row kernel saves (RX 6800, Flash-Next: the union is ~1x the selection
-# in a first 4k chunk and ~6.6x by 15k).
-_MAX_UNION_RATIO = 3.0
+# in a first 4k chunk and ~6.6x by 15k; a cap of 5 beat 2 and 3 and tied 8 and no cap to 16k).
+_MAX_UNION_RATIO = 5.0
 
 
 def _tiles(cu_seqlens_host: list[int], rows: int):

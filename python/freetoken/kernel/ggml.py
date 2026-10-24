@@ -75,8 +75,45 @@ def mul_mat(w: torch.Tensor, ggml_type: int, x: torch.Tensor, *, out: torch.Tens
             # no matrix kernel for this type (IQ1_M): llama.cpp's fallback, dequantize and run a dense GEMM
             return torch.mm(x, dequantize(w.contiguous(), ggml_type, k, x.dtype).t(), out=out)
         _check_mmq_tail(w, ggml_type, k)
+        if m >= _PICK_MIN_ROWS and _pick_enabled():
+            return _mul_mat_pick(w, ggml_type, x, out)
     _module().mul_mat(w, ggml_type, x.contiguous(), out, xq)
     return out
+
+
+# FREETOKEN_PREFILL_GEMM_PICK: from this many rows MMQ competes with dequantize + rocBLAS GEMM
+_PICK_MIN_ROWS = 256
+
+
+def _pick_enabled() -> bool:
+    from freetoken.env import ENV
+
+    return ENV.PREFILL_GEMM_PICK and not torch.cuda.is_current_stream_capturing()
+
+
+def _mul_mat_pick(w: torch.Tensor, ggml_type: int, x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    """``mul_mat`` at prefill sizes: MMQ, or the dequantized weight through either GEMM orientation, whichever
+    ran fastest for this shape (:mod:`freetoken.kernel.gemm_pick`)."""
+    from .gemm_pick import flipped_linear, pick, row_bucket
+
+    m, k = x.shape
+    x = x.contiguous()
+
+    def mmq():
+        _module().mul_mat(w, ggml_type, x, out, None)
+        return out
+
+    def dense(flip):
+        def run():
+            wd = dequantize(w.contiguous(), ggml_type, k, x.dtype)
+            if flip:
+                out.copy_(flipped_linear(x, wd))
+            else:
+                torch.mm(x, wd.t(), out=out)
+            return out
+        return run
+
+    return pick(("ggml", ggml_type, row_bucket(m), w.shape[0], k, x.dtype), (mmq, dense(False), dense(True)))
 
 
 def quantize_q8_1(x: torch.Tensor) -> torch.Tensor:

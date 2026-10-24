@@ -23,7 +23,7 @@ class TorchLinearKernel(LinearKernel):
         if w.dtype != x.dtype:
             w = w.to(x.dtype)
             b = b.to(x.dtype) if b is not None else None
-        if ENV.SMALL_GEMV and torch.version.hip is not None and x.is_cuda:
+        if (ENV.SMALL_GEMV or ENV.PREFILL_GEMM_PICK) and torch.version.hip is not None and x.is_cuda:
             from freetoken.kernel.triton.small_gemv import dense_linear
 
             return dense_linear(x, w, b)
