@@ -230,10 +230,14 @@ class HostExpertTier:
         # prefill reads its pool misses here, at row == expert id; one buffer per bank serves every layout (the widest fits)
         stage_bytes = [num_experts * max(int(np.prod(layout[k][1])) * layout[k][0].itemsize for layout in layouts) for k in range(len(self.bank_names))]
         self._stage = [alloc(n, torch.uint8, ()) for n in stage_bytes]
+        self._layouts, self._alloc, self._stage_bytes = layouts, alloc, stage_bytes
         self._stage_views = [
             [s[: num_experts * int(np.prod(shape)) * dtype.itemsize].view(dtype).view(num_experts, *shape) for s, (dtype, shape) in zip(self._stage, layout)]
             for layout in layouts
         ]
+        # a second stage (FREETOKEN_DISK_TIER_PREFILL_AHEAD), allocated on first use: the look-ahead layer is read into one stage
+        # while the other still feeds the current layer's copies
+        self._stage_views_2: list | None = None
         self._lru: list[OrderedDict[int, int]] = [OrderedDict() for _ in layouts]
         self._free: list[list[int]] = [list(range(cap - 1, -1, -1)) for cap in self.capacities]
         # [layer, expert] -> held in a pool slot; read by the opt-in host-tier routing bias (moe.route_bias)
@@ -256,8 +260,17 @@ class HostExpertTier:
     def pool(self, layer: int, bank: int) -> torch.Tensor:
         return self.pools[self.layer_layout[layer]][bank]
 
-    def stage(self, layer: int, bank: int) -> torch.Tensor:
-        return self._stage_views[self.layer_layout[layer]][bank]
+    def stage(self, layer: int, bank: int, index: int = 0) -> torch.Tensor:
+        if index == 0:
+            return self._stage_views[self.layer_layout[layer]][bank]
+        if self._stage_views_2 is None:
+            second = [self._alloc(n, torch.uint8, ()) for n in self._stage_bytes]
+            self.host_bytes += sum(t.numel() for t in second)
+            self._stage_views_2 = [
+                [t[: self.num_experts * int(np.prod(shape)) * dtype.itemsize].view(dtype).view(self.num_experts, *shape) for t, (dtype, shape) in zip(second, layout)]
+                for layout in self._layouts
+            ]
+        return self._stage_views_2[self.layer_layout[layer]][bank]
 
     def _fid(self, layer: int, expert: int) -> int:
         return layer * self.num_experts + expert
@@ -323,7 +336,7 @@ class HostExpertTier:
             self.resident[layer, experts[pos]] = True
         return slots
 
-    def prefill(self, layer: int, experts: list[int]) -> tuple[list[tuple[int, int]], list[int]]:
+    def prefill(self, layer: int, experts: list[int], stage: int = 0) -> tuple[list[tuple[int, int]], list[int]]:
         """Make ``experts`` readable for a prefill: ``(hits, staged)`` where hits are ``(expert, pool slot)`` and staged experts sit in ``stage`` at row == expert id.
 
         Pool residents are reused without touching recency (a prefill scan must not reorder the decode LRU); misses fill free pool slots
@@ -341,7 +354,7 @@ class HostExpertTier:
                 jobs += [(layer, e, k, self.pools[g][k][slot]) for k in range(len(self.bank_names))]
             else:
                 staged.append(e)
-                jobs += [(layer, e, k, self.stage(layer, k)[e]) for k in range(len(self.bank_names))]
+                jobs += [(layer, e, k, self.stage(layer, k, stage)[e]) for k in range(len(self.bank_names))]
         try:
             self._read(jobs)
         except BaseException:

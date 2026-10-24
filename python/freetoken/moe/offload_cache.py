@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+
 import math
 import os
 from dataclasses import dataclass
@@ -328,6 +330,9 @@ class OffloadMoeCache:
         self.host_tier = None
         self._tier_seen = (0, 0)
         self._disk_tier_args: tuple | None = None
+        self._ahead_reader = self._ahead_stream = self._ahead_ready = self._ahead_release = None
+        self._ahead_pending: dict = {}
+        self._ahead_used = [False, False]
         # FREETOKEN_DISK_TIER_GRAPH: admission recorded into captured graphs (enable_graph_admission)
         self._graph_admit = None
         self._slice_pools()
@@ -1196,6 +1201,91 @@ class OffloadMoeCache:
         self.prefill_hit_rows += len(hits)
         self.prefill_total_rows += len(experts)
         return views
+
+    # ------------------------------------------------------------------
+    # Disk-tier prefill look-ahead (FREETOKEN_DISK_TIER_PREFILL_AHEAD): layer L+1's experts are read off disk on a worker
+    # thread and copied on a side stream into staging buffer (L+1) % 2 while layer L computes. The look-ahead layer's
+    # routing is not known yet, so it stages every expert; a chunk of a few hundred tokens routes to nearly all anyway.
+    # ------------------------------------------------------------------
+    def tier_ahead_submit(self, layer_id: int) -> None:
+        """Start staging ``layer_id`` (every expert) into buffer ``layer_id % 2``: the host-pool lookup and disk reads run on a
+        worker thread; :meth:`tier_ahead_wait` queues the copies."""
+        assert self.host_tier is not None
+        if layer_id >= self.num_layers or layer_id in self._ahead_pending:
+            return
+        if self._ahead_reader is None:
+            from concurrent.futures import ThreadPoolExecutor
+
+            self._ahead_reader = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ft-prefill-ahead")
+            self._ahead_stream = torch.cuda.Stream(self.device) if self.device.type == "cuda" else None
+            self._ahead_ready = [torch.cuda.Event() for _ in range(2)] if self._ahead_stream is not None else None
+            self._ahead_release = [torch.cuda.Event() for _ in range(2)] if self._ahead_stream is not None else None
+        buffer_id = layer_id % 2
+        # the host stage this read overwrites still feeds the copies of the layer two back
+        previous = self._ahead_ready[buffer_id] if self._ahead_ready is not None and self._ahead_used[buffer_id] else None
+        tier = self.host_tier
+        inference = torch.is_inference_mode_enabled()  # thread-local: the worker takes the caller's, for the tier's in-place updates
+
+        def read():
+            if previous is not None:
+                previous.synchronize()
+            with torch.inference_mode(inference):
+                return tier.prefill(layer_id, list(range(self.num_experts)), stage=buffer_id)
+
+        self._ahead_pending[layer_id] = self._ahead_reader.submit(read)
+
+    def tier_ahead_wait(self, layer_id: int) -> tuple[torch.Tensor, ...]:
+        """Queue ``layer_id``'s staging copies behind its read and the release of its buffer; the current stream waits for them.
+        Returns the staging views (row == expert id)."""
+        self.tier_ahead_submit(layer_id)
+        hits, staged = self._ahead_pending.pop(layer_id).result()
+        buffer_id = layer_id % 2
+        tier = self.host_tier
+        views = self.stage_views(layer_id, buffer_id)
+        stream = self._ahead_stream
+        ctx = torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext()
+        with ctx:
+            if stream is not None and self._ahead_used[buffer_id]:
+                stream.wait_event(self._ahead_release[buffer_id])
+            self._invalidate_prefill_buffer(buffer_id, layer_id)
+            for rows, source in ((hits, lambda k: tier.pool(layer_id, k)), ([(e, e) for e in staged], lambda k: tier.stage(layer_id, k, buffer_id))):
+                if not rows:
+                    continue
+                for k, view in enumerate(views):
+                    src = source(k)
+                    if self.device.type != "cuda":
+                        view.index_copy_(0, torch.tensor([d for d, _ in rows]), src[torch.tensor([s for _, s in rows])])
+                        continue
+                    for d, s_, n in _runs(rows):
+                        view[d : d + n].copy_(src[s_ : s_ + n], non_blocking=True)
+            if stream is not None:
+                self._ahead_ready[buffer_id].record(stream)
+        if stream is not None:
+            torch.cuda.current_stream(self.device).wait_event(self._ahead_ready[buffer_id])
+        self._ahead_used[buffer_id] = True
+        self.prefill_hit_rows += len(hits)
+        self.prefill_total_rows += self.num_experts
+        return views
+
+    def tier_ahead_release(self, layer_id: int) -> None:
+        """After ``layer_id``'s expert GEMMs are queued: its buffer may be restaged once they ran."""
+        if self._ahead_release is not None:
+            self._ahead_release[layer_id % 2].record(torch.cuda.current_stream(self.device))
+        if layer_id == self.num_layers - 1:
+            self.tier_ahead_end()
+        self.release_prefill_layer(layer_id)
+
+    def tier_ahead_end(self) -> None:
+        """Drain look-ahead reads left by a forward that ended early, and forget the buffers' last users."""
+        for f in self._ahead_pending.values():
+            try:
+                f.result()
+            except BaseException:  # noqa: BLE001 -- the forward that queued it has already failed
+                pass
+        self._ahead_pending.clear()
+        if self._ahead_stream is not None:
+            torch.cuda.current_stream(self.device).wait_stream(self._ahead_stream)
+        self._ahead_used = [False, False]
 
     def ensure_experts_hybrid(
         self, layer_id: int, expert_ids: torch.Tensor, weights: torch.Tensor, clamp: bool = False

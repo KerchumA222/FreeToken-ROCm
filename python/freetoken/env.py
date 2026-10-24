@@ -114,6 +114,9 @@ class EnvClassSingleton:
     # Opt-in: the reasoning effort ("low"/"medium"/"high"/...) a /v1/messages request runs at when it names none
     # (output_config.effort); unset keeps the chat template's own default (xhigh for Qwen3.8-Flash-Next).
     ANTHROPIC_DEFAULT_EFFORT = EnvStr("")
+    # Opt-in: a --moe-disk-tier prefill chunk that routes to most experts reads and copies the next MoE layer's experts
+    # (on a worker thread and a side stream) while the current layer computes, instead of staging each layer synchronously.
+    DISK_TIER_PREFILL_AHEAD = EnvBool(False)
 
     def __new__(cls):
         # single instance

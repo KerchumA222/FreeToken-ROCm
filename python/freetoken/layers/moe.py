@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Iterator, Tuple
 import torch
 from freetoken.core import get_global_ctx
 from freetoken.distributed import DistributedCommunicator, get_tp_info
+from freetoken.env import ENV
 from freetoken.moe import is_offload_moe_strategy
 from freetoken.moe.fused import fused_topk
 from freetoken.moe.offload_cache import OffloadMoeCache
@@ -371,7 +372,17 @@ class OffloadMoELayer(MoELayer):
         cache = self.offload_cache
         assert cache is not None
         if cache.host_tier is not None:
-            views = cache.materialize_routed(self.layer_id, topk_ids)
+            # FREETOKEN_DISK_TIER_PREFILL_AHEAD: a large chunk stages the next layer (every expert) while this one computes.
+            # Below ~48 routes per expert the routed-only synchronous staging reads less and wins (Ornith, top-8 of 256:
+            # 935 tokens 4.9 s routed vs 5.4 s ahead; 1.8k tokens 5.8 s vs 4.5 s).
+            ahead = ENV.DISK_TIER_PREFILL_AHEAD and topk_ids.numel() >= 48 * self.num_experts
+            if ahead:
+                if self.layer_id == 0:
+                    cache.tier_ahead_end()
+                views = cache.tier_ahead_wait(self.layer_id)
+                cache.tier_ahead_submit(self.layer_id + 1)
+            else:
+                views = cache.materialize_routed(self.layer_id, topk_ids)
             out = self._expert_gemm(
                 cache,
                 hidden_states,
@@ -382,7 +393,10 @@ class OffloadMoELayer(MoELayer):
                 alphas=cache.alphas_for_layer(self.layer_id),
                 is_prefill=True,
             )
-            cache.release_prefill_layer(self.layer_id)
+            if ahead:
+                cache.tier_ahead_release(self.layer_id)
+            else:
+                cache.release_prefill_layer(self.layer_id)
             return out
         if cache.prefill_overlap:
             views = self._wait_prefill_overlap(cache)

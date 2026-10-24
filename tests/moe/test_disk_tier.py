@@ -633,3 +633,49 @@ def test_flash_next_greedy_decode_is_the_same_with_the_disk_tier(tmp_path):
     tier = _greedy(tmp_path, "tier", cache | {"moe_disk_tier": True, "moe_host_cache_mem": 1}, _FLASH_NEXT_IQ1_M)
     assert tier["tier"][1] > 0
     assert tier["tokens"] == base["tokens"]
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("host_bytes", [1, 1 << 30], ids=["tiny-host-cache", "whole-model-host-cache"])
+def test_prefill_look_ahead_stages_every_expert_between_decode_steps(expert_gguf, device, host_bytes):
+    """FREETOKEN_DISK_TIER_PREFILL_AHEAD: each layer's buffer holds every expert's exact rows (read while the previous
+    layer is staged), the two buffers alternate without clobbering each other, and decode around it still sees its rows."""
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("needs a GPU")
+    path, layers = expert_gguf
+    ref = _resident(path, layers).sources
+    dev = torch.device(device)
+    cache = _cache(path, layers, host_bytes, dev, 2 * E + 2)
+    rng = np.random.default_rng(5)
+
+    def decode() -> None:
+        for layer in range(layers):
+            ids = torch.from_numpy(rng.choice(E, TOP_K, replace=False)[None]).to(torch.int32).to(dev)
+            want = ids.reshape(-1).tolist()
+            cache.ensure_experts(layer, ids)
+            cache.copy_missing()
+            if dev.type == "cuda":
+                torch.cuda.synchronize()
+            for e, s in zip(want, ids.reshape(-1).tolist()):
+                for bank, view in zip(("gate_up", "down"), cache.pool_bank_views(layer)):
+                    assert torch.equal(view[s].cpu(), ref[bank][layer][e]), ("decode", layer, e)
+
+    for i in range(3):
+        decode() if dev.type == "cuda" else None
+        cache.tier_ahead_end()
+        mode = torch.inference_mode(i == 1)  # the server prefills under inference mode; the worker thread must follow it
+        mode.__enter__()
+        held = []
+        for layer in range(layers):
+            views = cache.tier_ahead_wait(layer)
+            cache.tier_ahead_submit(layer + 1)
+            if dev.type == "cuda":
+                torch.cuda.synchronize()
+            for e in range(E):
+                for bank, view in zip(("gate_up", "down"), views):
+                    assert torch.equal(view[e].cpu(), ref[bank][layer][e]), ("prefill", layer, e, bank)
+            held.append(views)
+            cache.tier_ahead_release(layer)
+        mode.__exit__(None, None, None)
+        assert not cache._ahead_pending
+    assert cache.prefill_total_rows == 3 * layers * E
