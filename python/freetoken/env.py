@@ -111,6 +111,9 @@ class EnvClassSingleton:
     # Opt-in: prefill-sized dense linears time x @ W^T against (W @ x^T)^T once per shape, and GGUF linears from 256
     # rows also try dequantize-then-GEMM against MMQ; each shape keeps the fastest (rocBLAS tiles vary ~5x on RDNA2).
     PREFILL_GEMM_PICK = EnvBool(False)
+    # Opt-in: the reasoning effort ("low"/"medium"/"high"/...) a /v1/messages request runs at when it names none
+    # (output_config.effort); unset keeps the chat template's own default (xhigh for Qwen3.8-Flash-Next).
+    ANTHROPIC_DEFAULT_EFFORT = EnvStr("")
 
     def __new__(cls):
         # single instance
