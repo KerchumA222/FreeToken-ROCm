@@ -165,3 +165,26 @@ def test_causal_conv1d_prefill_and_decode_match_torch(kernel_size):
     ref_d = F.silu((hist * w.float()).sum(-1))
     assert _corr(od[0], ref_d) > 0.999
     assert _rel(od[0], ref_d) < 5e-2
+
+
+def test_causal_conv1d_varlen_channel_last_matches_channels_first():
+    """FREETOKEN_GDN_CONV_CHANNEL_LAST: a transposed view of token-major rows (as the GDN in_proj split yields)
+    gives the same output and conv state as the channels-first copy, with carried-in state and two requests."""
+    from freetoken.kernel.causal_conv1d import causal_conv1d_varlen
+
+    torch.manual_seed(5)
+    d, C, W, T = "cuda", 384, 4, 70
+    proj = torch.randn(T, C + 96, device=d, dtype=torch.float16)  # conv_in is a column slice of a wider projection
+    conv_in = proj[:, :C]
+    w = torch.randn(C, W, device=d, dtype=torch.float16) * 0.3
+    cu = torch.tensor([0, 33, T], device=d, dtype=torch.int32)
+    ci = torch.tensor([2, 0], device=d, dtype=torch.int32)
+    hi = torch.tensor([True, False], device=d)
+    state0 = torch.randn(3, C, W - 1, device=d, dtype=torch.float16)
+
+    s_ref, s_cl = state0.clone(), state0.clone()
+    ref = causal_conv1d_varlen(conv_in.transpose(0, 1).contiguous(), w, s_ref, cu, ci, hi).transpose(0, 1)
+    out = causal_conv1d_varlen(conv_in.t(), w, s_cl, cu, ci, hi).t()
+    assert out.is_contiguous()
+    torch.testing.assert_close(out, ref, rtol=0, atol=0)
+    torch.testing.assert_close(s_cl, s_ref, rtol=0, atol=0)

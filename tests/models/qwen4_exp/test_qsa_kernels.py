@@ -676,7 +676,7 @@ def test_tiled_prefill_matches_the_sparse_kernel(kv_cache_dtype, budget, monkeyp
     monkeypatch.setattr(tiled, "_gemm_tiles", spy)
     got = qsa_gemm_attention(
         q, pool.k_cache(0), pool.v_cache(0), indices, table, token_to_req, [0, 200, 245],
-        gemm_bytes=limit, **meta,
+        gemm_bytes=limit, max_union_ratio=0, **meta,
     )
     expected = qsa_sparse_paged_attention(
         q, pool.k_cache(0), pool.v_cache(0), indices, table, token_to_req, **meta
@@ -690,3 +690,44 @@ def test_tiled_prefill_matches_the_sparse_kernel(kv_cache_dtype, budget, monkeyp
         assert len(calls) > 1
         for tiles, length in calls:
             assert tiles * tiled._tile_bytes(length, group, HEAD_DIM, 2, turbo) <= limit
+
+
+@requires_cuda
+@pytest.mark.parametrize("ratio", [0, 4.0, 20.0])
+def test_tiled_prefill_union_ratio_routes_wide_tiles_to_the_sparse_kernel(ratio, monkeypatch):
+    """A tile whose page union exceeds ``ratio`` selections' worth of tokens runs through the
+    per-row kernel instead (0 disables the cap); either way the attention is the same."""
+    import freetoken.kernel.triton.qsa.attend_tiled as tiled
+    from freetoken.kernel.triton.qsa import qsa_gemm_attention, qsa_sparse_paged_attention
+
+    rows = [(0, 2300 + i) for i in range(200)] + [(1, 900 + i) for i in range(45)]
+    pool, _, _ = _filled_pool("turboquant_4bit_nc", 120)
+    gen = torch.Generator(device="cuda").manual_seed(4)
+    q = torch.randn(len(rows), Q_HEADS, HEAD_DIM, device="cuda", dtype=torch.float16, generator=gen)
+    width = 300
+    indices = _selection(rows, width)
+    table, token_to_req = _paged_batch(rows, 48, 120)
+    meta = _quant_meta(pool)
+
+    lengths = []
+    original = tiled._gemm_tiles
+
+    def spy(q_, k_cache, v_cache, out, pages, mask, row_ids, kvh, group_, length, dim, **kw):
+        lengths.append(length)
+        return original(q_, k_cache, v_cache, out, pages, mask, row_ids, kvh, group_, length, dim, **kw)
+
+    monkeypatch.setattr(tiled, "_gemm_tiles", spy)
+    got = qsa_gemm_attention(
+        q, pool.k_cache(0), pool.v_cache(0), indices, table, token_to_req, [0, 200, 245],
+        max_union_ratio=ratio, **meta,
+    )
+    expected = qsa_sparse_paged_attention(
+        q, pool.k_cache(0), pool.v_cache(0), indices, table, token_to_req, **meta
+    )
+    torch.testing.assert_close(got.float(), expected.float(), rtol=3e-2, atol=3e-3)
+    if ratio == 0:
+        assert lengths
+    else:
+        assert all(length <= ratio * width for length in lengths)
+        # the long request's tiles (unions past 4 selections) run as GEMMs only under the loose cap
+        assert any(length > 4 * width for length in lengths) == (ratio == 20.0)
