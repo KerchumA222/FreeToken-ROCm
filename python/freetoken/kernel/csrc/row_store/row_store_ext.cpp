@@ -89,6 +89,11 @@ torch::Tensor alloc_signal_tensor() {
                           torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
 }
 
+#ifndef hipStreamWriteValueDefault
+// ROCm 7.2's headers name no default write flags (newer ones define this as 0)
+#define hipStreamWriteValueDefault 0x0
+#endif
+
 int memop_write(uintptr_t stream, uintptr_t addr, uint64_t value) {
   return hipStreamWriteValue64(reinterpret_cast<hipStream_t>(stream),
                                reinterpret_cast<void *>(addr), value, hipStreamWriteValueDefault);
