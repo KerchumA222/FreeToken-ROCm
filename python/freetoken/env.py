@@ -123,6 +123,9 @@ class EnvClassSingleton:
     THINKING_BUDGET = EnvInt(0)
     THINKING_BUDGET_RAMP = EnvFloat(0.75)
     THINKING_BUDGET_BIAS = EnvFloat(10.0)
+    # Opt-in: TurboQuant KV decode runs its dot products in fp16 (bf16 is emulated on RDNA2) with 8 warps, ~512 keys per
+    # split, and a speculative verify's rows of one request share each key pass (one dequantization for all rows).
+    TURBOQUANT_DECODE_FAST = EnvBool(False)
 
     def __new__(cls):
         # single instance

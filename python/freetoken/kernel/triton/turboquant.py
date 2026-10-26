@@ -283,6 +283,7 @@ def _turboquant_decode_split_kernel(
     BLOCK_N: tl.constexpr,
     SPLITS: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr,
+    DOT_F16: tl.constexpr = False,
 ):
     """One program per (request, KV head, context split): the GROUP query heads of a KV head read its codes once."""
     req = tl.program_id(0)
@@ -304,7 +305,9 @@ def _turboquant_decode_split_kernel(
     m_i = tl.full((BLOCK_G,), -float("inf"), tl.float32)
     l_i = tl.zeros((BLOCK_G,), tl.float32)
     acc = tl.zeros((BLOCK_G, D), tl.float32)
-    q = q.to(tl.bfloat16)
+    # bf16 operands are emulated on RDNA2 (no bf16 dot); DOT_F16 runs the two products in fp16
+    dot_t = tl.float16 if DOT_F16 else tl.bfloat16
+    q = q.to(dot_t)
     for start in range(lo, hi, BLOCK_N):
         rows = start + tl.arange(0, BLOCK_N)
         active = (rows < hi) & (rows <= qpos)
@@ -318,7 +321,7 @@ def _turboquant_decode_split_kernel(
         knorm = tl.load(k_norms + meta, active, 0).to(tl.float32)
         k = k * (knorm / tl.maximum(tl.sqrt(tl.sum(k * k, axis=1)), 1.0e-12))[:, None]
         # [BLOCK_G, D] x [D, BLOCK_N]: the query group scores the block in one product
-        scores = tl.dot(q, tl.trans(k.to(tl.bfloat16))) * sm_scale
+        scores = tl.dot(q, tl.trans(k.to(dot_t))) * sm_scale
         scores = tl.where(active[None, :], scores, -float("inf"))
         m_new = tl.maximum(m_i, tl.max(scores, axis=1))
         m_safe = tl.where(m_new == -float("inf"), 0.0, m_new)
@@ -326,7 +329,7 @@ def _turboquant_decode_split_kernel(
         p = tl.exp(scores - m_safe[:, None])
         vc = ((tl.load(v_codes + packed, active[:, None], 0).to(tl.uint32) >> shifts[None, :]) & 15).to(tl.float32)
         v = vc * tl.load(v_scales + meta, active, 0).to(tl.float32)[:, None] + tl.load(v_zeros + meta, active, 0).to(tl.float32)[:, None]
-        acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v.to(tl.bfloat16))
+        acc = acc * alpha[:, None] + tl.dot(p.to(dot_t), v.to(dot_t))
         l_i = l_i * alpha + tl.sum(p, axis=1)
         m_i = m_new
     out_row = (req * KV_HEADS * GROUP + q_heads) * SPLITS + split
@@ -334,6 +337,91 @@ def _turboquant_decode_split_kernel(
     # an empty split carries -inf and drops out of the combine
     lse = tl.where(l_i > 0, m_i + tl.log(tl.maximum(l_i, 1.0e-30)), -float("inf"))
     tl.store(part_lse + out_row, lse, mask=mask_g)
+
+
+@triton.jit
+def _turboquant_decode_multirow_kernel(
+    q_ptr,
+    k_codes,
+    v_codes,
+    k_norms,
+    v_scales,
+    v_zeros,
+    centroids,
+    indptr,
+    indices,
+    q_pos,
+    part_o,
+    part_lse,
+    sm_scale,
+    NUM_REQS,
+    KV_HEADS: tl.constexpr,
+    GROUP: tl.constexpr,
+    HEAD_TILE: tl.constexpr,
+    ROWS: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    D: tl.constexpr,
+    HALF_D: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    SPLITS: tl.constexpr,
+    SLIDING_WINDOW: tl.constexpr,
+    DOT_F16: tl.constexpr,
+):
+    """A speculative verify's ROWS rows of one request (step-major: row ``s * NUM_REQS + req``) in one program per (request,
+    KV head, split, head tile): each key block is dequantized once and scored for every row, each row masked to its own
+    position. A row's keys are a prefix of the last row's, so the last row's index list serves them all."""
+    req = tl.program_id(0)
+    kv_head = tl.program_id(1)
+    split = tl.program_id(2) // (GROUP // HEAD_TILE)
+    tile = tl.program_id(2) % (GROUP // HEAD_TILE)
+    last = (ROWS - 1) * NUM_REQS + req
+    kv_start = tl.load(indptr + last)
+    kv_len = tl.load(indptr + last + 1) - kv_start
+    per_split = tl.cdiv(kv_len, SPLITS)
+    lo = split * per_split
+    hi = tl.minimum(lo + per_split, kv_len)
+    # query j: row j // HEAD_TILE, head kv_head * GROUP + tile * HEAD_TILE + j % HEAD_TILE
+    j = tl.arange(0, BLOCK_R * HEAD_TILE)
+    r = j // HEAD_TILE
+    head = kv_head * GROUP + tile * HEAD_TILE + j % HEAD_TILE
+    mask_q = r < ROWS
+    row = r * NUM_REQS + req
+    qpos = tl.load(q_pos + row, mask=mask_q, other=-1)
+    d = tl.arange(0, D)
+    dot_t = tl.float16 if DOT_F16 else tl.bfloat16
+    q = tl.load(q_ptr + (row * KV_HEADS * GROUP + head)[:, None] * D + d[None, :], mask=mask_q[:, None], other=0.0).to(tl.float32).to(dot_t)
+    shifts = ((d % 2) * 4).to(tl.uint32)
+    m_i = tl.full((BLOCK_R * HEAD_TILE,), -float("inf"), tl.float32)
+    l_i = tl.zeros((BLOCK_R * HEAD_TILE,), tl.float32)
+    acc = tl.zeros((BLOCK_R * HEAD_TILE, D), tl.float32)
+    for start in range(lo, hi, BLOCK_N):
+        keys = start + tl.arange(0, BLOCK_N)
+        in_range = keys < hi
+        slots = tl.load(indices + kv_start + keys, in_range, 0).to(tl.int64)
+        packed = (slots * KV_HEADS + kv_head)[:, None] * HALF_D + d[None, :] // 2
+        meta = slots * KV_HEADS + kv_head
+        kc = ((tl.load(k_codes + packed, in_range[:, None], 0).to(tl.uint32) >> shifts[None, :]) & 15).to(tl.int32)
+        k = tl.load(centroids + kc)
+        knorm = tl.load(k_norms + meta, in_range, 0).to(tl.float32)
+        k = k * (knorm / tl.maximum(tl.sqrt(tl.sum(k * k, axis=1)), 1.0e-12))[:, None]
+        active = in_range[None, :] & (keys[None, :] <= qpos[:, None])
+        if SLIDING_WINDOW > 0:
+            active = active & (keys[None, :] + SLIDING_WINDOW > qpos[:, None])
+        scores = tl.dot(q, tl.trans(k.to(dot_t))) * sm_scale
+        scores = tl.where(active, scores, -float("inf"))
+        m_new = tl.maximum(m_i, tl.max(scores, axis=1))
+        m_safe = tl.where(m_new == -float("inf"), 0.0, m_new)
+        alpha = tl.exp(m_i - m_safe)
+        p = tl.exp(scores - m_safe[:, None])
+        vc = ((tl.load(v_codes + packed, in_range[:, None], 0).to(tl.uint32) >> shifts[None, :]) & 15).to(tl.float32)
+        v = vc * tl.load(v_scales + meta, in_range, 0).to(tl.float32)[:, None] + tl.load(v_zeros + meta, in_range, 0).to(tl.float32)[:, None]
+        acc = acc * alpha[:, None] + tl.dot(p.to(dot_t), v.to(dot_t))
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        m_i = m_new
+    out_row = (row * KV_HEADS * GROUP + head) * SPLITS + split
+    tl.store(part_o + out_row[:, None] * D + d[None, :], acc / tl.maximum(l_i, 1.0e-30)[:, None], mask=mask_q[:, None])
+    lse = tl.where(l_i > 0, m_i + tl.log(tl.maximum(l_i, 1.0e-30)), -float("inf"))
+    tl.store(part_lse + out_row, lse, mask=mask_q)
 
 
 def turboquant_4bit_nc_decode(
@@ -353,8 +441,15 @@ def turboquant_4bit_nc_decode(
     sliding_window: int | None = None,
     splits: int | None = None,
     block_n: int = 16,
+    dot_f16: bool = False,
+    verify_rows: int = 1,
+    head_tile: int = 0,
+    num_warps: int = 4,
 ) -> torch.Tensor:
-    """Split-k TurboQuant decode for one query per request (no sinks)."""
+    """Split-k TurboQuant decode for one query per request (no sinks).
+
+    ``verify_rows`` > 1: the batch is a speculative verify of ``batch // verify_rows`` requests, rows step-major; their
+    rows share each request's key pass (:func:`_turboquant_decode_multirow_kernel`, ``head_tile`` query heads a program)."""
     batch, q_heads, dim = q.shape
     kv_heads = k_cache.shape[1]
     if indptr.numel() != batch + 1 or q_positions.numel() != batch:
@@ -368,12 +463,27 @@ def turboquant_4bit_nc_decode(
     q_rot = torch.matmul(q.float(), rotation.T).contiguous()
     part_o = torch.empty((batch, q_heads, splits, dim), device=q.device, dtype=torch.float32)
     part_lse = torch.empty((batch, q_heads, splits), device=q.device, dtype=torch.float32)
-    _turboquant_decode_split_kernel[(batch, kv_heads, splits)](
-        q_rot, k_cache, v_cache, k_norms, v_scales, v_zeros, centroids, indptr, indices.contiguous(),
-        q_positions.contiguous(), part_o, part_lse, sm_scale,
-        KV_HEADS=kv_heads, GROUP=group, BLOCK_G=triton.next_power_of_2(group), D=dim, HALF_D=dim // 2,
-        BLOCK_N=block_n, SPLITS=splits, SLIDING_WINDOW=sliding_window or 0, num_warps=4,
-    )
+    if verify_rows > 1:
+        if batch % verify_rows:
+            raise ValueError(f"a verify of {verify_rows} rows per request cannot have {batch} rows")
+        num_reqs = batch // verify_rows
+        tile = head_tile or min(group, 8)
+        if group % tile:
+            raise ValueError(f"head tile {tile} must divide the {group} query heads of a KV head")
+        _turboquant_decode_multirow_kernel[(num_reqs, kv_heads, splits * (group // tile))](
+            q_rot, k_cache, v_cache, k_norms, v_scales, v_zeros, centroids, indptr, indices.contiguous(),
+            q_positions.contiguous(), part_o, part_lse, sm_scale, num_reqs,
+            KV_HEADS=kv_heads, GROUP=group, HEAD_TILE=tile, ROWS=verify_rows, BLOCK_R=triton.next_power_of_2(verify_rows),
+            D=dim, HALF_D=dim // 2, BLOCK_N=block_n, SPLITS=splits, SLIDING_WINDOW=sliding_window or 0, DOT_F16=dot_f16,
+            num_warps=num_warps,
+        )
+    else:
+        _turboquant_decode_split_kernel[(batch, kv_heads, splits)](
+            q_rot, k_cache, v_cache, k_norms, v_scales, v_zeros, centroids, indptr, indices.contiguous(),
+            q_positions.contiguous(), part_o, part_lse, sm_scale,
+            KV_HEADS=kv_heads, GROUP=group, BLOCK_G=triton.next_power_of_2(group), D=dim, HALF_D=dim // 2,
+            BLOCK_N=block_n, SPLITS=splits, SLIDING_WINDOW=sliding_window or 0, DOT_F16=dot_f16, num_warps=num_warps,
+        )
     lse_max = part_lse.amax(dim=-1, keepdim=True)
     weights = torch.exp(part_lse - torch.where(torch.isinf(lse_max), 0.0, lse_max))
     out = (part_o * weights.unsqueeze(-1)).sum(dim=2) / weights.sum(dim=-1, keepdim=True).clamp_min(1.0e-30)
