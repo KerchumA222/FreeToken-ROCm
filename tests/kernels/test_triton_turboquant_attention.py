@@ -372,3 +372,46 @@ def test_turboquant_split_decode_is_independent_of_the_split_count(splits):
     actual = turboquant_4bit_nc_decode(**args, splits=splits)
     expected = turboquant_4bit_nc_attention(**args, q_to_req=torch.arange(2, device=device, dtype=torch.int32))
     torch.testing.assert_close(actual.float(), expected.float(), atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("window", [None, 40])
+@pytest.mark.parametrize("fast", [dict(dot_f16=True, num_warps=8), dict(dot_f16=True, num_warps=8, head_tile=2), dict(dot_f16=False, num_warps=4)])
+def test_turboquant_verify_rows_share_the_key_pass(window, fast):
+    """FREETOKEN_TURBOQUANT_DECODE_FAST: a verify's rows (step-major, each a prefix of its request's last row) through the
+    multi-row kernel match the fused reference, for two requests of different lengths on scattered pages."""
+    from freetoken.kernel.triton.turboquant import turboquant_4bit_nc_attention, turboquant_4bit_nc_decode
+    from freetoken.kvcache.mha_pool import MHAKVCache
+
+    _init_tp()
+    torch.manual_seed(13)
+    device = torch.device("cuda")
+    dim, kv_heads, q_heads, rows_per_req, lens = 128, 2, 8, 3, [70, 150]
+    pool = MHAKVCache(num_kv_heads=kv_heads, num_layers=1, head_dim=dim, num_pages=400, page_size=1,
+                      dtype=torch.bfloat16, device=device, kv_cache_dtype="turboquant_4bit_nc")
+    total = sum(lens)
+    slots = torch.randperm(400, device=device)[:total].to(torch.int32)
+    k = torch.randn(total, kv_heads * dim, device=device, dtype=torch.bfloat16)
+    pool.store_kv(k, torch.randn_like(k), slots, layer_id=0)
+    per_req = [slots[: lens[0]], slots[lens[0]:]]
+    # step-major rows: row s * B + i is request i at its (len - rows_per_req + 1 + s)-th position
+    row_lens, row_idx, row_pos = [], [], []
+    for s in range(rows_per_req):
+        for i, n in enumerate(lens):
+            m = n - rows_per_req + 1 + s
+            row_lens.append(m)
+            row_idx.append(per_req[i][:m])
+            row_pos.append(m - 1)
+    indptr = torch.tensor([0] + row_lens, device=device).cumsum(0).to(torch.int32)
+    indices = torch.cat(row_idx)
+    q_pos = torch.tensor(row_pos, device=device, dtype=torch.int64)
+    rows = len(row_lens)
+    q = torch.randn(rows, q_heads, dim, device=device, dtype=torch.bfloat16)
+    args = dict(q=q, k_cache=pool.k_cache(0).view(-1, kv_heads, dim // 2), v_cache=pool.v_cache(0).view(-1, kv_heads, dim // 2),
+                k_norms=pool.k_norm_cache(0), v_scales=pool.v_scale_cache(0), v_zeros=pool.v_zero_cache(0),
+                centroids=pool.turboquant_centroids, indptr=indptr, indices=indices, q_positions=q_pos,
+                sm_scale=dim**-0.5, rotation=pool.turboquant_rotation, sliding_window=window)
+    expected = turboquant_4bit_nc_attention(**args, q_to_req=torch.arange(rows, device=device, dtype=torch.int32))
+    actual = turboquant_4bit_nc_decode(**args, splits=5, verify_rows=rows_per_req, **fast)
+    torch.testing.assert_close(actual.float(), expected.float(), atol=1e-2, rtol=1e-2)
+    per_row = turboquant_4bit_nc_decode(**args, splits=5, dot_f16=fast["dot_f16"], num_warps=fast["num_warps"])
+    torch.testing.assert_close(actual.float(), per_row.float(), atol=2e-3, rtol=2e-3)

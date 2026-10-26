@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, List
 
 import torch
 from freetoken.core import Batch, get_global_ctx
+from freetoken.env import ENV
 
 from .base import AttentionSpec, BaseAttnBackend, BaseAttnMetadata
 from .utils import BaseCaptureData
@@ -206,11 +207,21 @@ class TritonAttentionBackend(BaseAttnBackend):
             if metadata.is_decode and _TURBOQUANT_DECODE == "split" and spec.sinks is None and block_ends is None:
                 from freetoken.kernel.triton.turboquant import turboquant_4bit_nc_decode
 
+                fast = {}
+                if ENV.TURBOQUANT_DECODE_FAST:
+                    # RX 6800, Ornith (16 query heads per KV head, D 256), 4 verify rows at 70k keys: 9.5 -> 3.9 ms a layer
+                    rows = q.shape[0]
+                    verify = getattr(batch, "spec", None)
+                    per_req = rows // verify.num_reqs if verify is not None and verify.num_reqs and rows % verify.num_reqs == 0 else 1
+                    keys = indices.numel() // max(rows, 1)  # the host-known width (the whole page table under capture)
+                    fast = dict(dot_f16=True, num_warps=8, splits=max(8, min(128, keys // 512)))
+                    if per_req > 1:
+                        fast.update(verify_rows=per_req, head_tile=4 if (q.shape[1] // kv_heads) % 4 == 0 else 0)
                 return turboquant_4bit_nc_decode(
                     q=q, k_cache=k_raw.view(-1, kv_heads, head_dim // 2), v_cache=v_raw.view(-1, kv_heads, head_dim // 2),
                     k_norms=k_norms, v_scales=v_scales, v_zeros=v_zeros, centroids=centroids, indptr=metadata.indptr,
                     indices=indices, q_positions=metadata.q_positions, sm_scale=scale, rotation=rotation,
-                    sliding_window=spec.sliding_window,
+                    sliding_window=spec.sliding_window, **fast,
                 )
             if not metadata.is_decode or _TURBOQUANT_DECODE == "dequant":
                 return self._turboquant_dense_attention(
