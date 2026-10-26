@@ -731,3 +731,30 @@ def test_tiled_prefill_union_ratio_routes_wide_tiles_to_the_sparse_kernel(ratio,
         assert all(length <= ratio * width for length in lengths)
         # the long request's tiles (unions past 4 selections) run as GEMMs only under the loose cap
         assert any(length > 4 * width for length in lengths) == (ratio == 20.0)
+
+
+@requires_cuda
+@pytest.mark.parametrize("kv_cache_dtype", ["model", "turboquant_4bit_nc"])
+def test_amd_prefill_tuning_is_the_same_attention(kv_cache_dtype, monkeypatch):
+    """FREETOKEN_QSA_AMD_PREFILL_TUNING picks narrow tiles, one split and four warps for a prefill-sized launch (more than 512
+    row-head programs); the output matches the default launch."""
+    from freetoken.env import ENV
+    from freetoken.kernel.triton.qsa import qsa_sparse_paged_attention
+
+    if torch.version.hip is None:
+        pytest.skip("the tuning is HIP-only")
+    rows = [(0, 1500 + i) for i in range(300)]  # 300 rows x 2 KV heads = 600 programs
+    pool, _, _ = _filled_pool(kv_cache_dtype, 40)
+    gen = torch.Generator(device="cuda").manual_seed(8)
+    q = torch.randn(len(rows), Q_HEADS, HEAD_DIM, device="cuda", dtype=torch.float16, generator=gen)
+    indices = _selection(rows, 200)
+    table, token_to_req = _paged_batch(rows, 30, 40)
+    meta = _quant_meta(pool) if kv_cache_dtype == "turboquant_4bit_nc" else {}
+
+    def run():
+        return qsa_sparse_paged_attention(q, pool.k_cache(0), pool.v_cache(0), indices, table, token_to_req, **meta)
+
+    monkeypatch.setattr(ENV.QSA_AMD_PREFILL_TUNING, "value", False)
+    expected = run()
+    monkeypatch.setattr(ENV.QSA_AMD_PREFILL_TUNING, "value", True)
+    torch.testing.assert_close(run().float(), expected.float(), rtol=1e-2, atol=2e-3)

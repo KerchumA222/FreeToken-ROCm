@@ -9,6 +9,8 @@ import torch
 import triton
 import triton.language as tl
 
+from freetoken.env import ENV
+
 
 @triton.jit
 def _qsa_sparse_paged_gqa_splitk_kernel(
@@ -367,6 +369,9 @@ def qsa_sparse_paged_attention(
         block_n, target_splits, partial_warps = 64, 4, 2
     else:
         block_n, target_splits, partial_warps = 64, 1, 2
+        if torch.version.hip is not None and ENV.QSA_AMD_PREFILL_TUNING:
+            # RX 6800, 24 query / 2 KV heads, 2051 keys a row: 41.8 -> 20.1 ms on ROCm 7.1, 65.7 -> 23.3 ms on 7.14 per 512 rows
+            block_n, target_splits, partial_warps = 16, 1, 4
 
     if tuning is not None:
         block_n, target_splits, partial_warps = tuning

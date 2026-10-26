@@ -126,6 +126,9 @@ class EnvClassSingleton:
     # Opt-in: TurboQuant KV decode runs its dot products in fp16 (bf16 is emulated on RDNA2) with 8 warps, ~512 keys per
     # split, and a speculative verify's rows of one request share each key pass (one dequantization for all rows).
     TURBOQUANT_DECODE_FAST = EnvBool(False)
+    # Opt-in: on HIP, the QSA sparse kernel's prefill launch (more than 512 row-head programs) uses narrow 16-key tiles, one split
+    # and four warps instead of the GB300-tuned 64-key tiles; RDNA2 has no matrix units, where that launch is 2-3x slower.
+    QSA_AMD_PREFILL_TUNING = EnvBool(False)
 
     def __new__(cls):
         # single instance
