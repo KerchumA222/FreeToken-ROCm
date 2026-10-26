@@ -31,6 +31,7 @@ def fused_moe_decode_kernel(
     MUL_ROUTED_WEIGHT: tl.constexpr,
     compute_type: tl.constexpr,
     even_Ks: tl.constexpr,
+    FP32_PRODUCTS: tl.constexpr = False,
 ):
     route_id = tl.program_id(0)
     n_block_id = tl.program_id(1)
@@ -59,7 +60,11 @@ def fused_moe_decode_kernel(
             k_mask = offs_k < K - k_start * BLOCK_SIZE_K
             a = tl.load(a_ptrs, mask=k_mask, other=0.0)
             b = tl.load(b_ptrs, mask=k_mask[:, None] & (offs_n[None, :] < N), other=0.0)
-        accumulator += tl.sum(a[:, None] * b, axis=0)
+        if FP32_PRODUCTS:
+            # bf16 on gfx103x: see freetoken.kernel.triton.rdna2
+            accumulator += tl.sum(a.to(tl.float32)[:, None] * b.to(tl.float32), axis=0)
+        else:
+            accumulator += tl.sum(a[:, None] * b, axis=0)
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
 

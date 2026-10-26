@@ -38,18 +38,12 @@ import triton
 import triton.language as tl
 
 
-@functools.cache
 def _fp32_taps() -> bool:
-    """RDNA2 (gfx103x) only: multiply the taps in fp32. Left in bf16, LLVM's AMDGPU backend
-    pairs two products into a bf16 v_dot2_bf16_bf16, which gfx103x lacks, and the kernel fails
-    codegen ("Cannot select: intrinsic %llvm.amdgcn.fdot2.bf16.bf16"). Every other target keeps
-    the bf16 products."""
-    if torch.version.hip is None:
-        return False
-    try:
-        return str(triton.runtime.driver.active.get_current_target().arch).startswith("gfx103")
-    except Exception:
-        return False
+    """RDNA2 (gfx103x) only: multiply the taps in fp32 (see ``freetoken.kernel.triton.rdna2``). Every other target keeps the
+    bf16 products."""
+    from .rdna2 import lacks_bf16_dot2
+
+    return lacks_bf16_dot2()
 
 PAD_SLOT_ID = -1
 

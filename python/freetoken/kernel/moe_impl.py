@@ -343,6 +343,7 @@ def fused_moe_decode_kernel_triton(
     import triton.language as tl
 
     from .triton.decode_moe import fused_moe_decode_kernel
+    from .triton.rdna2 import lacks_bf16_dot2
 
     assert A.is_contiguous()
     assert B.is_contiguous()
@@ -397,6 +398,7 @@ def fused_moe_decode_kernel_triton(
         MUL_ROUTED_WEIGHT=mul_routed_weight,  # type: ignore
         compute_type=dtype,  # type: ignore
         even_Ks=even_Ks,  # type: ignore
+        FP32_PRODUCTS=compute_type == torch.bfloat16 and lacks_bf16_dot2(),  # type: ignore
         num_warps=config.get("num_warps", 4),  # type: ignore
     )
 
