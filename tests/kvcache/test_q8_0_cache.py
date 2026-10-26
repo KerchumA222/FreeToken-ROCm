@@ -317,7 +317,6 @@ def test_q8_0_triton_backend_forwards_scale_caches(monkeypatch, is_decode, num_r
         max_q_len=num_rows,
         attn_logits=torch.empty((1, 1, 8, 64)) if is_decode else None,
         attn_lse=torch.empty((1, 1, 8)) if is_decode else None,
-        num_kv_splits=torch.ones((1,), dtype=torch.int32) if is_decode else None,
     )
     batch = SimpleNamespace(
         attn_metadata=metadata,
@@ -327,7 +326,9 @@ def test_q8_0_triton_backend_forwards_scale_caches(monkeypatch, is_decode, num_r
     backend.kvcache = pool
     backend.device = torch.device("cpu")
     backend.max_head_dim = 64
-    backend.max_kv_splits = 8
+    # the attributes upstream's split cap (_split_cap) reads
+    backend.num_q_heads = 1
+    backend.kv_heads = [2]
     result = object()
     captured = {}
 

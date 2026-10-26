@@ -260,6 +260,12 @@ def iter_gguf_weights(
         yield from iter_mmproj_weights(find_mmproj(model_path))
 
 
+def nextn_block(tensors) -> int | None:
+    """Index of the first ``nextn`` (MTP draft) block a GGUF carries, from its tensor names; None without one."""
+    blocks = [int(m.group(1)) for name in tensors if (m := _NEXTN_RE.match(name))]
+    return min(blocks) if blocks else None
+
+
 def iter_gguf_mtp_token_weights(
     model_path: str, prefix: str = "mtp", config: ModelConfig | None = None
 ) -> Iterator[tuple[str, torch.Tensor]]:

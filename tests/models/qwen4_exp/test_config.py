@@ -110,7 +110,7 @@ def test_moe_dims():
     assert cfg.moe_enabled
 
 
-def test_gguf_config_reconstructs_verified_qwen38_geometry():
+def test_gguf_config_reconstructs_verified_qwen38_geometry(monkeypatch):
     from freetoken.models.qwen4_exp.gguf import parse_gguf_config
 
     metadata = {
@@ -153,7 +153,13 @@ def test_gguf_config_reconstructs_verified_qwen38_geometry():
         vocab_size=248320,
         tie_word_embeddings=False,
         architectures=["Qwen4ExpGGUFForCausalLM"],
+        model_path="metadata-only.gguf",
     )
+    # metadata only: the file checks (scale tensors, decoder tensors present) see an empty tensor table
+    import freetoken.models.qwen4_exp.gguf as qgguf
+
+    monkeypatch.setattr(qgguf, "gguf_tensor_index", lambda path: {})
+    monkeypatch.setattr(qgguf, "check_scales", lambda *a, **k: None)
 
     cfg = parse_gguf_config(shim)
 

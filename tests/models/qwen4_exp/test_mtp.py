@@ -146,7 +146,9 @@ def test_head_modules_map_onto_the_sidecar_tensors():
     assert to_gguf("mtp.hyper_connection_mixer.input_mix_weight_down", tensors) == ("blk.48.nextn.hc_head_down",)
     assert to_gguf("mtp.hyper_connection_mixer.input_mix_weight_up", tensors) == ("blk.48.nextn.hc_head_up",)
     assert to_gguf("mtp.layer.self_attn.q_proj", tensors) == ("blk.48.attn_q",)
-    assert to_gguf("mtp.layer.self_attn.indexer.index_qk_proj", tensors) == ("blk.48.indexer.q_proj", "blk.48.indexer.k_proj")
+    # upstream maps the indexer's halves separately; the packed mapping fuses them into index_qk_proj
+    assert to_gguf("mtp.layer.self_attn.indexer.index_q_proj", tensors) == ("blk.48.indexer.q_proj",)
+    assert to_gguf("mtp.layer.self_attn.indexer.index_k_proj", tensors) == ("blk.48.indexer.k_proj",)
     assert to_gguf("mtp.layer.attn_hyper_connection.block_inject_weight", tensors) == ("blk.48.hc_attn_inject",)
     assert to_gguf("mtp.layer.mlp.experts.0.down_proj", tensors) == ("blk.48.ffn_down_exps",)
     assert to_gguf("mtp.hyper_connection_mixer.hc_norm", tensors) == ()
