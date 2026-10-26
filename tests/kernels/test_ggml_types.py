@@ -60,7 +60,7 @@ def _activation(shape, seed: int) -> torch.Tensor:
 def _device_weight(raw: np.ndarray, k: int, ggml_type: int) -> torch.Tensor:
     """``raw`` on the GPU followed by the zero row(s) MMQ's tail reads land in, as the GGUF loaders lay it out."""
     rows, rb = raw.shape
-    storage = torch.zeros(rows + pad_rows(k), rb, dtype=torch.uint8, device="cuda")
+    storage = torch.zeros(rows + pad_rows(ggml_type, k), rb, dtype=torch.uint8, device="cuda")
     storage[:rows].copy_(torch.from_numpy(raw))
     return storage[:rows]
 
@@ -189,13 +189,13 @@ def test_real_rows_match_cpu_dequant(ggml_type):
 
 
 def test_mmq_tail_fits_in_pad_rows():
-    """The loaders pad a packed matrix with ``pad_rows(K)`` zero rows; MMQ's tail read must fit in them, small K included."""
+    """The loaders pad a packed matrix with ``pad_rows(type, K)`` zero rows; MMQ's tail read must fit in them, small K included."""
     for t in TYPES:
         for k in (32, 64, 160, 192, 320, 640, 1280, 2048, 4096, 6144):
             if k % _block(t)[0] == 0 and k % MATRIX_ROW_PADDING:
                 from freetoken.layers.quantization.ggml_types import mmq_tail_bytes
 
-                assert mmq_tail_bytes(t, k) <= pad_rows(k) * row_bytes(t, k), (type_name(t), k)
+                assert mmq_tail_bytes(t, k) <= pad_rows(t, k) * row_bytes(t, k), (type_name(t), k)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -241,14 +241,14 @@ def _guarded_region() -> int:
     return ptr.value
 
 
-def _at_guard(raw: np.ndarray, k: int) -> torch.Tensor:
-    """``raw`` plus its ``pad_rows(K)`` zero rows, ending (to 16 bytes) at the guard page; returns the ``raw`` rows."""
+def _at_guard(raw: np.ndarray, k: int, ggml_type: int) -> torch.Tensor:
+    """``raw`` plus its ``pad_rows(type, K)`` zero rows, ending (to 16 bytes) at the guard page; returns the ``raw`` rows."""
     rows, rb = raw.shape
-    total = (rows + pad_rows(k)) * rb
+    total = (rows + pad_rows(ggml_type, k)) * rb
     start = (_guarded_region() + _GUARD_BYTES - total) // 16 * 16
 
     class Buf:
-        __cuda_array_interface__ = {"shape": (rows + pad_rows(k), rb), "typestr": "|u1", "data": (start, False), "version": 3}
+        __cuda_array_interface__ = {"shape": (rows + pad_rows(ggml_type, k), rb), "typestr": "|u1", "data": (start, False), "version": 3}
 
     storage = torch.as_tensor(Buf(), device="cuda")
     storage.zero_()
@@ -265,7 +265,7 @@ def _guarded_case(ggml_type: int, k: int) -> None:
     experts, n = 4, 64
     raw = _random_rows(ggml_type, experts * n, k, seed=3)
     ref = torch.from_numpy(dequantize_cpu(raw, ggml_type, k))
-    w = _at_guard(raw, k)
+    w = _at_guard(raw, k, ggml_type)
     for m in (1, 64):
         x = _activation((m, k), seed=m)
         _close(ggml.mul_mat(w, ggml_type, x.cuda()), x @ ref.T, 2e-4, f"guarded mul_mat M={m}")
