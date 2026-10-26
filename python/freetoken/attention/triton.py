@@ -304,8 +304,7 @@ class TritonAttentionBackend(BaseAttnBackend):
             return decode_paged_attention(
                 q=q_rot, k_cache=k_dense, v_cache=v_dense, indptr=metadata.indptr, indices=rows,
                 q_positions=metadata.q_positions, attn_logits=metadata.attn_logits[:bs], attn_lse=metadata.attn_lse[:bs],
-                num_kv_splits=metadata.num_kv_splits[:bs], max_kv_splits=self.max_kv_splits, sm_scale=scale,
-                sliding_window=spec.sliding_window, sinks=spec.sinks,
+                sm_scale=scale, sliding_window=spec.sliding_window, sinks=spec.sinks,
             )
         return extend_paged_attention(
             q=q_rot, k_cache=k_dense, v_cache=v_dense, qo_indptr=metadata.cu_seqlens_q_gpu, kv_indptr=metadata.indptr,

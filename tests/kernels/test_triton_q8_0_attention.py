@@ -38,9 +38,8 @@ def _run_decode(q, k, v, indptr, indices, q_positions, *, k_scale=None, v_scale=
         q_positions,
         torch.empty(batch, num_q_heads, max_splits, head_dim, device=q.device),
         torch.empty(batch, num_q_heads, max_splits, device=q.device),
-        torch.full((batch,), max_splits, dtype=torch.int32, device=q.device),
-        max_splits,
         head_dim**-0.5,
+        max_kv_splits=max_splits,
         k_scale_cache=k_scale,
         v_scale_cache=v_scale,
     )

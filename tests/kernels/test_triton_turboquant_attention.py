@@ -234,7 +234,7 @@ def test_triton_backend_routes_turboquant_decode_to_quantized_attention(monkeypa
     config = SimpleNamespace(
         num_qo_heads=q_heads,
         head_dim=dim,
-        kv_cache_group_specs=lambda: [SimpleNamespace(head_dim=dim)],
+        kv_cache_group_specs=lambda: [SimpleNamespace(head_dim=dim, num_kv_heads=kv_heads)],
     )
     backend = TritonAttentionBackend(config)
     batch = SimpleNamespace(
@@ -286,7 +286,7 @@ def _dense_path_case(monkeypatch, decode_mode, *, decode):
     ctx = SimpleNamespace(kv_cache=pool, page_table=slots[None, :])
     monkeypatch.setattr("freetoken.attention.triton.get_global_ctx", lambda: ctx)
     monkeypatch.setattr(triton_backend, "_TURBOQUANT_DECODE", decode_mode)
-    config = SimpleNamespace(num_qo_heads=q_heads, head_dim=dim, kv_cache_group_specs=lambda: [SimpleNamespace(head_dim=dim)])
+    config = SimpleNamespace(num_qo_heads=q_heads, head_dim=dim, kv_cache_group_specs=lambda: [SimpleNamespace(head_dim=dim, num_kv_heads=kv_heads)])
     backend = TritonAttentionBackend(config)
     batch = SimpleNamespace(
         padded_reqs=[SimpleNamespace(extend_len=new, device_len=ctx_len, cached_len=cached, table_idx=0)],
